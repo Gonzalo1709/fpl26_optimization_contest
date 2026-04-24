@@ -2,3 +2,6 @@ __pycache__
 *.dcp
 *.log
 *.jou
+
+fpl26_contest_benchmarks/*
+*.tar.gz
