@@ -20,6 +20,31 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_ROOT="${SCRIPT_DIR}/batch_logs"
 LOG_DIR="${LOG_ROOT}/run-${TIMESTAMP}"
 
+# ----------------------------------------------------------------------
+# Upload settings
+# ----------------------------------------------------------------------
+# Set this to enable uploads by default, for example:
+#   RCLONE_DEST="gdrive:fpl26-results"
+#
+# You can also override this from the command line with:
+#   --upload-target gdrive:fpl26-results
+#
+# If empty, upload is disabled.
+RCLONE_DEST=""
+
+# Require the rclone destination folder to already exist.
+# Recommended: true
+#
+# This prevents accidentally uploading to a typo path like:
+#   gdrive:fpl26-resutls
+#
+# If you want rclone to create the destination automatically, set this to false.
+REQUIRE_RCLONE_DEST_EXISTS="true"
+
+# Extra rclone flags used during upload.
+# --progress is nice interactively, mildly noisy in CI.
+RCLONE_UPLOAD_FLAGS=(--progress)
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [options]
@@ -27,20 +52,182 @@ Usage: $(basename "$0") [options]
 Run dcp_optimizer.py on every .dcp file in a benchmark directory and save logs.
 
 Options:
-  --bench-dir <path>   Benchmark directory containing .dcp files
-                       (default: ${DEFAULT_BENCH_DIR})
-  --logs-dir <path>    Directory where run logs should be written
-                       (default: ${LOG_DIR})
-  --mode <mode>        Execution mode: test | optimizer (default: test)
-  --max-nets <n>       Max nets for --test mode (default: 5)
-  --python <bin>       Python executable to use (default: python3)
-  -h, --help           Show this help
+  --bench-dir <path>        Benchmark directory containing .dcp files
+                            (default: ${DEFAULT_BENCH_DIR})
+
+  --logs-dir <path>         Directory where run logs should be written
+                            (default: ${LOG_DIR})
+
+  --mode <mode>             Execution mode: test | optimizer
+                            (default: test)
+
+  --max-nets <n>            Max nets for --test mode
+                            (default: 5)
+
+  --python <bin>            Python executable to use
+                            (default: python3)
+
+  --upload-target <target>  Optional rclone destination, e.g.
+                            gdrive:fpl26-results
+
+                            If provided, the script compresses the run logs
+                            into a .tar.gz archive and uploads the archive.
+
+  -h, --help                Show this help
 
 Examples:
   $(basename "$0")
   $(basename "$0") --bench-dir "${SCRIPT_DIR}/../fpl26_contest_benchmarks" --mode test
   $(basename "$0") --mode optimizer --logs-dir "${SCRIPT_DIR}/batch_logs/full_run"
+  $(basename "$0") --mode test --upload-target gdrive:fpl26-results
+  $(basename "$0") --mode optimizer --upload-target gdrive:fpl26-results
 EOF
+}
+
+error_exit() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+join_rclone_path() {
+  local base="$1"
+  local name="$2"
+
+  base="${base%/}"
+
+  if [[ "${base}" == *: ]]; then
+    printf '%s%s\n' "${base}" "${name}"
+  else
+    printf '%s/%s\n' "${base}" "${name}"
+  fi
+}
+
+validate_rclone_destination() {
+  local destination="$1"
+  local remote_name
+  local remote_with_colon
+
+  if [[ -z "${destination}" ]]; then
+    return 0
+  fi
+
+  if ! command -v rclone >/dev/null 2>&1; then
+    cat >&2 <<EOF
+Error: upload target was provided, but rclone is not installed.
+
+Install it with:
+  sudo apt update
+  sudo apt install rclone
+
+Then configure your remote with:
+  rclone config
+
+Example upload target:
+  gdrive:fpl26-results
+EOF
+    exit 1
+  fi
+
+  if [[ "${destination}" != *:* ]]; then
+    cat >&2 <<EOF
+Error: invalid rclone destination: ${destination}
+
+Rclone destinations must look like:
+  remote:path
+
+Example:
+  gdrive:fpl26-results
+EOF
+    exit 1
+  fi
+
+  remote_name="${destination%%:*}"
+  remote_with_colon="${remote_name}:"
+
+  if ! rclone listremotes | grep -Fxq "${remote_with_colon}"; then
+    cat >&2 <<EOF
+Error: rclone remote is not configured: ${remote_with_colon}
+
+Configured remotes are:
+$(rclone listremotes 2>/dev/null || true)
+
+Create the remote with:
+  rclone config
+
+Example:
+  remote name: gdrive
+  upload target: gdrive:fpl26-results
+EOF
+    exit 1
+  fi
+
+  if [[ "${REQUIRE_RCLONE_DEST_EXISTS}" == "true" ]]; then
+    if ! rclone lsf "${destination}" --max-depth 1 >/dev/null 2>&1; then
+      cat >&2 <<EOF
+Error: rclone destination does not exist or is not accessible: ${destination}
+
+Check it with:
+  rclone lsf "${destination}" --max-depth 1
+
+If the folder does not exist, create it with:
+  rclone mkdir "${destination}"
+
+If you are using Google Drive with the restricted drive.file scope,
+make sure the folder was created by rclone, not manually in the browser.
+Because naturally, cloud permissions needed a philosophical subplot.
+EOF
+      exit 1
+    fi
+  fi
+}
+
+upload_results() {
+  local archive_file
+  local archive_name
+  local remote_archive_path
+  local upload_exit_code
+
+  if [[ -z "${RCLONE_DEST}" ]]; then
+    return 0
+  fi
+
+  archive_file="${LOG_DIR}.tar.gz"
+  archive_name="$(basename "${archive_file}")"
+  remote_archive_path="$(join_rclone_path "${RCLONE_DEST}" "${archive_name}")"
+
+  echo "Compressing results"
+  echo "  Source directory: ${LOG_DIR}"
+  echo "  Archive:          ${archive_file}"
+
+  if ! tar -czf "${archive_file}" -C "${LOG_ROOT}" "$(basename "${LOG_DIR}")"; then
+    error_exit "failed to create archive: ${archive_file}"
+  fi
+
+  echo
+  echo "Uploading compressed results"
+  echo "  Source:      ${archive_file}"
+  echo "  Destination: ${remote_archive_path}"
+
+  rclone copyto "${archive_file}" "${remote_archive_path}" "${RCLONE_UPLOAD_FLAGS[@]}"
+  upload_exit_code=$?
+
+  if [[ ${upload_exit_code} -ne 0 ]]; then
+    cat >&2 <<EOF
+Error: rclone upload failed with exit code ${upload_exit_code}
+
+Source:
+  ${archive_file}
+
+Destination:
+  ${remote_archive_path}
+
+Try manually:
+  rclone copyto "${archive_file}" "${remote_archive_path}" --progress
+EOF
+    exit 1
+  fi
+
+  echo "Upload complete"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -51,6 +238,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --logs-dir)
       LOG_DIR="$2"
+      LOG_ROOT="$(dirname "${LOG_DIR}")"
       shift 2
       ;;
     --mode)
@@ -63,6 +251,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --python)
       PYTHON_BIN="$2"
+      shift 2
+      ;;
+    --upload-target)
+      RCLONE_DEST="$2"
       shift 2
       ;;
     -h|--help)
@@ -97,6 +289,10 @@ if [[ "${MODE}" == "optimizer" && -z "${OPENROUTER_API_KEY:-}" ]]; then
   exit 1
 fi
 
+# Validate upload setup before spending potentially hours running benchmarks.
+# Humanity may be doomed, but at least we can fail early.
+validate_rclone_destination "${RCLONE_DEST}"
+
 mkdir -p "${LOG_DIR}"
 
 mapfile -t DCP_FILES < <(find "${BENCH_DIR}" -maxdepth 1 -type f -name "*.dcp" | sort)
@@ -114,6 +310,14 @@ echo "  Mode:           ${MODE}"
 echo "  Benchmark dir:  ${BENCH_DIR}"
 echo "  Log directory:  ${LOG_DIR}"
 echo "  DCP count:      ${#DCP_FILES[@]}"
+
+if [[ -n "${RCLONE_DEST}" ]]; then
+  echo "  Upload target:  ${RCLONE_DEST}"
+  echo "  Upload format:  tar.gz archive"
+else
+  echo "  Upload target:  disabled"
+fi
+
 echo
 
 total=${#DCP_FILES[@]}
@@ -168,6 +372,9 @@ echo "Batch run complete"
 echo "  Passed:   ${ok}"
 echo "  Failed:   ${failed}"
 echo "  Summary:  ${SUMMARY_CSV}"
+echo
+
+upload_results
 
 if [[ ${failed} -gt 0 ]]; then
   exit 1
