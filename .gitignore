@@ -5,3 +5,8 @@ __pycache__
 
 fpl26_contest_benchmarks/*
 *.tar.gz
+
+.venv/
+
+key
+fpl26contest
