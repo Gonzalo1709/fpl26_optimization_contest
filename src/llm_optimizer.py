@@ -3,6 +3,7 @@
 import json
 import logging
 import time
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +54,8 @@ class DCPOptimizer(DCPOptimizerBase):
 
         self.start_time = None
         self.end_time = None
+
+        self.history = []
 
     async def start_servers(self, log_prefix: str = ""):
         """Start and connect to both MCP servers."""
@@ -398,7 +401,6 @@ class DCPOptimizer(DCPOptimizerBase):
             response = self.openai.chat.completions.create(
                 model=self.model,
                 messages=self.messages,
-                tools=self.tools,
                 tool_choice="auto",
                 max_tokens=4096,
                 extra_body={"usage": {"include": True}},
@@ -473,95 +475,81 @@ class DCPOptimizer(DCPOptimizerBase):
                 logger.error(f"Last message: {self.messages[-1]}")
             raise
 
-    async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
+    async def optimize(self, input_dcp: Path, output_dcp: Path):
         self.start_time = time.time()
 
-        try:
-            initial_analysis = await self.perform_initial_analysis(input_dcp)
-        except Exception as e:
-            logger.exception(f"Initial analysis failed: {e}")
-            print(f"\n✗ Initial analysis failed: {e}\n")
-            self.end_time = time.time()
-            return False
+        analysis = await self.perform_initial_analysis(input_dcp)
 
-        if self.initial_wns is not None and self.initial_wns >= 0:
-            print("✓ Design already meets timing! No optimization needed.\n")
-            logger.info("Design already meets timing")
-            await self.call_tool("vivado_write_checkpoint", {
-                "dcp_path": str(output_dcp.resolve()),
-                "force": True,
+        if self.initial_wns >= 0:
+            await self.v("write_checkpoint", {
+                "dcp_path": str(output_dcp),
+                "force": True
             })
-            print(f"Saved design to: {output_dcp}\n")
-
-            self.end_time = time.time()
-            total_runtime = self.end_time - self.start_time
-            print("\n=== No Optimization Required ===")
-            initial_fmax = self.calculate_fmax(self.initial_wns, self.clock_period)
-            if initial_fmax is not None:
-                print(f"Design already meets timing - Fmax: {initial_fmax:.2f} MHz (WNS: {self.initial_wns:.3f} ns)")
-            else:
-                print(f"Design already meets timing (WNS: {self.initial_wns:.3f} ns)")
-            print(f"Total runtime: {total_runtime:.2f} seconds ({total_runtime/60:.2f} minutes)")
-            print("LLM API calls: 0 (analysis performed without LLM)")
-            print("Estimated cost: $0.00")
-            print("=" * 70 + "\n")
             return True
 
-        system_prompt_template = load_system_prompt()
-        system_prompt = system_prompt_template.format(
-            temp_dir=self.temp_dir,
-            input_dcp=input_dcp.resolve(),
-        )
+        best_wns = self.initial_wns
+        stagnation = 0
 
-        self.messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"""Optimize this FPGA design for timing.
-
-PATHS:
-- Input DCP: {input_dcp.resolve()}
-- Output DCP (save final result here): {output_dcp.resolve()}
-- Run directory (for intermediate files): {self.temp_dir}
-
-CURRENT STATE:
-- Vivado has the input design ALREADY OPEN and analyzed
-- RapidWright has the input design ALREADY LOADED (from initial analysis)
-
-INITIAL ANALYSIS RESULTS:
-{initial_analysis}
-
-Proceed with optimization strategy based on the analysis above. Do NOT reload the design in either Vivado or RapidWright - both already have it loaded.""",
-            },
-        ]
-
-        max_iterations = 50
-        print("=== Starting LLM-Driven Optimization ===\n")
-
-        while self.iteration < max_iterations:
+        for i in range(50):
             self.iteration += 1
-            logger.info(f"=== Iteration {self.iteration} ===")
 
-            try:
-                response_text, is_done = await self.get_completion()
-                print(f"\n{response_text}\n")
+            print(f"\n=== Iteration {i+1} ===")
 
-                if is_done:
-                    logger.info("Optimization workflow completed")
-                    self.end_time = time.time()
-                    self._print_optimization_summary()
-                    return True
-            except Exception as e:
-                logger.exception(f"Error during optimization: {e}")
-                self.messages.append({
-                    "role": "user",
-                    "content": f"An error occurred: {e}. Please verify your approach and continue or report if unrecoverable.",
-                })
+            # --- LLM ONLY DECIDES ---
+            action = await self.choose_action_llm(analysis, stagnation)
 
-        logger.warning("Reached maximum iterations")
+            strategy, args = self.sanitize_action(action)
+
+            print(f"Chosen: {strategy} with args {args}")
+
+            # --- DETERMINISTIC EXECUTION ---
+            if strategy == "PBLOCK":
+                result = await self.run_pblock_flow()
+
+            elif strategy == "FANOUT":
+                result = await self.run_fanout_flow(**args)
+
+            elif strategy == "PHYS_OPT":
+                result = await self.run_phys_opt_flow(**args)
+
+            # --- Evaluate ---
+            timing = parse_timing_summary_static(result)
+            current_wns = timing["wns"]
+
+            self.history.append({
+                "iteration": i + 1,
+                "strategy": strategy,
+                "wns": current_wns,
+                "delta_wns": current_wns - best_wns if best_wns is not None else None,
+                "stagnation_count": stagnation
+            })
+
+            print(f"WNS: {current_wns:.3f} ns")
+
+            if current_wns > best_wns:
+                best_wns = current_wns
+                stagnation = 0
+            else:
+                stagnation += 1
+
+            # --- Stop conditions ---
+            if best_wns >= 0:
+                print("Timing met.")
+                break
+
+            if stagnation >= 3:
+                print("No improvement. Stopping.")
+                break
+
+        # Save best result
+        await self.v("write_checkpoint", {
+            "dcp_path": str(output_dcp),
+            "force": True
+        })
+
         self.end_time = time.time()
-        self._print_optimization_summary(max_iterations_reached=True)
-        return False
+        self._print_optimization_summary(max_iterations_reached=False)
+        return True
 
     def save_token_usage_report(self, output_path: Path):
         total_cached = sum(detail.get("cached_tokens", 0) for detail in self.api_call_details)
@@ -734,3 +722,206 @@ Proceed with optimization strategy based on the analysis above. Do NOT reload th
             print(f"Detailed token usage report saved to: {report_path}\n")
         except Exception as e:
             logger.warning(f"Failed to save token usage report: {e}")
+    
+
+    async def v(self, name, args={}):
+        return await self.call_tool(f"vivado_{name}", args)
+
+    async def rw(self, name, args={}):
+        return await self.call_tool(f"rapidwright_{name}", args)
+    
+    async def run_pblock_flow(self):
+        # 1. Get utilization
+        util_report = await self.v("report_utilization_for_pblock")
+
+        util = self.parse_utilization(util_report)
+
+        targets = {
+            "target_lut_count": int(util["lut"] * 1.5),
+            "target_ff_count": int(util["ff"] * 1.5),
+        }
+
+        # 2. Analyze fabric
+        fabric = await self.rw("analyze_fabric_for_pblock", targets)
+
+        fabric_data = json.loads(fabric)
+
+        if "recommended_region" not in fabric_data:
+            raise ValueError(f"No recommended_region in response: {fabric_data}")
+
+        # 3. Convert to pblock
+        region = fabric_data["recommended_region"]
+
+        pblock = await self.rw("convert_fabric_region_to_pblock", {
+            "col_min": region["col_min"],
+            "col_max": region["col_max"],
+            "row_min": region["row_min"],
+            "row_max": region["row_max"],
+            "use_clock_regions": False
+        })
+
+        pblock_ranges = json.loads(pblock)["pblock_ranges"]
+
+        # 4. Apply flow
+        await self.v("run_tcl", {"command": "place_design -unplace"})
+        await self.v("create_and_apply_pblock", {"pblock_ranges": pblock_ranges})
+        await self.v("place_design")
+        await self.v("route_design")
+
+        # 5. Measure
+        return await self.v("report_timing_summary")
+
+    async def run_fanout_flow(self, top_n_nets=5):
+        for net_name, fanout, _ in self.high_fanout_nets[:top_n_nets]:
+            split_factor = max(3, min(8, fanout // 100))
+
+            await self.rw("optimize_fanout", {
+                "net_name": net_name,
+                "split_factor": split_factor
+            })
+
+        temp_dcp = str(Path(self.temp_dir) / "fanout_opt.dcp")
+
+        await self.rw("write_checkpoint", {
+            "dcp_path": temp_dcp,
+            "overwrite": True
+        })
+
+        await self.v("open_checkpoint", {"dcp_path": temp_dcp})
+        await self.v("route_design")
+
+        return await self.v("report_timing_summary")
+
+    async def run_phys_opt_flow(self, directive="Default"):
+        await self.v("phys_opt_design", {
+            "directive": directive
+        })
+
+        return await self.v("report_timing_summary")
+    
+    async def choose_action_llm(self, analysis_summary: str, stagnation: int):
+        recent_history = self.history[-5:]
+
+        decision_input = {
+            "analysis": analysis_summary,
+            "history": recent_history,
+            "best_wns": self.best_wns,
+            "stagnation": stagnation,
+            "available_strategies": {
+                "PBLOCK": {},
+                "FANOUT": {
+                    "top_n_nets": "int (1-10)"
+                },
+                "PHYS_OPT": {
+                    "directive": ["Explore", "AggressiveExplore", "Default"]
+                }
+            }
+        }
+
+        prompt = """
+You are an FPGA optimization planner.
+
+Choose the next optimization action.
+
+Return JSON:
+{
+"strategy": "PBLOCK | FANOUT | PHYS_OPT",
+"args": { ... }
+}
+
+Rules:
+- Avoid repeating strategies that did not improve WNS
+- If stagnation >= 2, switch strategy
+- FANOUT: choose top_n_nets (1-10)
+- PHYS_OPT: choose directive
+- PBLOCK: args can be empty
+
+Return ONLY JSON.
+"""
+
+        response = self.openai.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(decision_input)}
+            ],
+            max_tokens=100,
+        )
+
+        self.llm_call_count += 1
+        
+        usage = getattr(response, "usage", None)
+        if usage:
+            self.total_prompt_tokens += getattr(usage, "prompt_tokens", 0)
+            self.total_completion_tokens += getattr(usage, "completion_tokens", 0)
+            self.total_tokens += getattr(usage, "total_tokens", 0)
+            
+            call_cost = 0.0
+            if hasattr(response.usage, "cost") and response.usage.cost is not None:
+                call_cost = float(response.usage.cost)
+                self.total_cost += call_cost
+            else:
+                logger.warning("OpenRouter did not provide cost information")
+
+        content = response.choices[0].message.content.strip()
+
+        try:
+            return json.loads(content)
+        except Exception:
+            return {"strategy": "PHYS_OPT", "args": {"directive": "Default"}}
+
+    def sanitize_action(self, action):
+        strategy = action.get("strategy", "PHYS_OPT")
+        args = action.get("args", {})
+
+        if strategy == "FANOUT":
+            top_n = int(args.get("top_n_nets", 5))
+            top_n = max(1, min(10, top_n))
+            return strategy, {"top_n_nets": top_n}
+
+        elif strategy == "PHYS_OPT":
+            directive = args.get("directive", "Default")
+            if directive not in ["Explore", "AggressiveExplore", "Default"]:
+                directive = "Default"
+            return strategy, {"directive": directive}
+
+        elif strategy == "PBLOCK":
+            return strategy, {}
+
+        return "PHYS_OPT", {"directive": "Default"}
+
+    def parse_utilization(self, report: str) -> dict:
+        lut = None
+        ff = None
+        in_base_section = False
+
+        for line in report.splitlines():
+            line = line.strip()
+
+            if "Design Resource Utilization" in line:
+                in_base_section = True
+                continue
+
+            if "1.5x Multiplier" in line:
+                break  # stop before scaled values
+
+            if not in_base_section:
+                continue
+
+            if line.startswith("LUTs:"):
+                match = re.search(r"([\d,]+)", line)
+                if match:
+                    lut = int(match.group(1).replace(",", ""))
+
+            elif line.startswith("FFs:"):
+                match = re.search(r"([\d,]+)", line)
+                if match:
+                    ff = int(match.group(1).replace(",", ""))
+
+        if lut is None or ff is None:
+            raise ValueError(f"Could not parse utilization:\n{report[:500]}")
+
+        return {
+            "lut": lut,
+            "ff": ff
+        }
