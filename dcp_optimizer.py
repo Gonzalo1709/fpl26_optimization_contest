@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 from contextlib import AsyncExitStack
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +39,37 @@ logger = logging.getLogger(__name__)
 
 # Default model
 DEFAULT_MODEL = "x-ai/grok-4.1-fast"
+
+
+@dataclass
+class GenerationSearchConfig:
+    """Configuration for branch-and-generation LLM search."""
+
+    enabled: bool = True
+    branch_factor: int = 2
+    beam_width: int = 2
+    max_generations: int = 3
+    max_steps_per_branch: int = 3
+    max_steps_without_improvement: int = 3
+    max_llm_calls: int = 50
+    min_wns_delta: float = 0.001
+    stop_when_timing_met: bool = True
+
+
+@dataclass
+class SearchCandidate:
+    """A saved checkpoint and score in the generation search tree."""
+
+    candidate_id: str
+    dcp_path: Path
+    wns: Optional[float]
+    peak_wns: Optional[float]
+    generation: int
+    parent_id: Optional[str]
+    branch_index: int
+    steps_taken: int
+    steps_since_peak: int
+    summary: str
 
 
 def parse_timing_summary_static(timing_report: str) -> dict:
@@ -562,12 +594,14 @@ class DCPOptimizer(DCPOptimizerBase):
         api_key: str,
         model: str = DEFAULT_MODEL,
         debug: bool = False,
-        run_dir: Optional[Path] = None
+        run_dir: Optional[Path] = None,
+        generation_config: Optional[GenerationSearchConfig] = None
     ):
         super().__init__(debug=debug, run_dir=run_dir)
         
         self.api_key = api_key
         self.model = model
+        self.generation_config = generation_config or GenerationSearchConfig()
         self.tools: list[dict] = []
         self.messages: list[dict] = []
         
@@ -591,6 +625,10 @@ class DCPOptimizer(DCPOptimizerBase):
         
         # Track all tool calls with timing and WNS
         self.tool_call_details = []
+
+        # Track generation-search candidates
+        self.search_candidates: list[SearchCandidate] = []
+        self.best_candidate: Optional[SearchCandidate] = None
         
         # Track total runtime
         self.start_time = None
@@ -1087,6 +1125,146 @@ class DCPOptimizer(DCPOptimizerBase):
             if self.messages:
                 logger.error(f"Last message: {self.messages[-1]}")
             raise
+
+    def _format_search_config_for_prompt(self) -> str:
+        """Return generation-search settings in a compact prompt block."""
+        cfg = self.generation_config
+        return (
+            f"- Branches per parent: {cfg.branch_factor}\n"
+            f"- Beam width kept per generation: {cfg.beam_width}\n"
+            f"- Max generations: {cfg.max_generations}\n"
+            f"- Max LLM steps per branch: {cfg.max_steps_per_branch}\n"
+            f"- Stop a branch after {cfg.max_steps_without_improvement} step(s) without beating its own peak WNS\n"
+            f"- Minimum WNS delta counted as improvement: {cfg.min_wns_delta:.4f} ns\n"
+            f"- Max total LLM calls: {cfg.max_llm_calls}\n"
+        )
+
+    def _build_system_prompt(self, input_dcp: Path, generation_mode: bool) -> str:
+        """Load the base system prompt and optionally add branch-search instructions."""
+        system_prompt_template = load_system_prompt()
+        system_prompt = system_prompt_template.format(
+            temp_dir=self.temp_dir,
+            input_dcp=input_dcp.resolve()
+        )
+
+        if not generation_mode:
+            return system_prompt
+
+        generation_rules = f"""
+
+GENERATION SEARCH CONTROLLER:
+An external controller is running a branch-and-generation search around your tool calls.
+Each branch starts from a checkpoint restored by the controller. Your job in each branch
+step is to make the next concrete optimization move, route/place as needed, and measure
+timing before you return.
+
+SEARCH SETTINGS:
+{self._format_search_config_for_prompt()}
+BRANCH RULES:
+- Temporary WNS regressions are allowed. Do not immediately revert just because one step worsens timing.
+- A branch is stopped by the controller only when it fails to beat its own highest WNS for the configured patience.
+- Keep each step focused enough that the controller can evaluate it, but complete any required place/route/timing measurement.
+- Leave the current candidate design open in Vivado at the end of the step.
+- If you use RapidWright, write the RapidWright checkpoint, open that checkpoint in Vivado, route if needed, then measure timing.
+- Do not write the final output path unless explicitly told. The controller saves branch checkpoints and copies out the best one.
+- Avoid repeating a branch move that the branch history says has already been tried from the same parent.
+"""
+        return system_prompt + generation_rules
+
+    def _build_initial_messages(
+        self,
+        system_prompt: str,
+        input_dcp: Path,
+        output_dcp: Path,
+        initial_analysis: str,
+        extra_user_text: str = ""
+    ) -> list[dict]:
+        """Build a fresh conversation for either linear mode or a search branch."""
+        return [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"""Optimize this FPGA design for timing.
+
+PATHS:
+- Input DCP: {input_dcp.resolve()}
+- Output DCP (save final result here only if explicitly instructed): {output_dcp.resolve()}
+- Run directory (for intermediate files): {self.temp_dir}
+
+CURRENT STATE:
+- Vivado has the selected candidate design ALREADY OPEN and analyzed
+- RapidWright has the selected candidate design ALREADY LOADED
+
+INITIAL ANALYSIS RESULTS:
+{initial_analysis}
+
+{extra_user_text}
+Proceed with optimization strategy based on the analysis above. Do NOT reload the original input design unless explicitly instructed."""
+            }
+        ]
+
+    def _is_wns_improvement(self, new_wns: Optional[float], old_wns: Optional[float]) -> bool:
+        """Return True if new_wns beats old_wns by the configured threshold."""
+        if new_wns is None:
+            return False
+        if old_wns is None:
+            return True
+        return new_wns > old_wns + self.generation_config.min_wns_delta
+
+    async def _measure_current_wns(self) -> Optional[float]:
+        """Measure current Vivado WNS and update the global best scalar."""
+        wns = await super().get_wns_for_target_clock(self._call_vivado_tool)
+        if wns is None:
+            timing_report = await self.call_tool("vivado_report_timing_summary", {})
+            timing_info = parse_timing_summary_static(timing_report)
+            wns = timing_info["wns"]
+
+        if wns is not None and wns > self.best_wns:
+            self.best_wns = wns
+        return wns
+
+    async def _save_vivado_checkpoint(self, dcp_path: Path) -> bool:
+        """Save the currently-open Vivado design as a branch checkpoint."""
+        result = await self.call_tool("vivado_write_checkpoint", {
+            "dcp_path": str(dcp_path.resolve()),
+            "force": True,
+            "timeout": 900
+        })
+        if "error" in result.lower() and "wrote checkpoint" not in result.lower():
+            logger.warning(f"Failed to save branch checkpoint {dcp_path}: {result[:500]}")
+            return False
+        return dcp_path.exists()
+
+    async def _restore_candidate_state(self, candidate: SearchCandidate) -> None:
+        """Restore a candidate checkpoint into Vivado and RapidWright."""
+        print(f"\n[SEARCH] Restoring candidate {candidate.candidate_id} (WNS: {self._format_wns(candidate.wns)})")
+        result = await self.call_tool("vivado_open_checkpoint", {
+            "dcp_path": str(candidate.dcp_path.resolve()),
+            "timeout": 900
+        })
+        if "error" in result.lower():
+            raise RuntimeError(f"Could not restore Vivado checkpoint {candidate.dcp_path}: {result}")
+
+        result = await self.call_tool("rapidwright_read_checkpoint", {
+            "dcp_path": str(candidate.dcp_path.resolve())
+        })
+        if "error" in result.lower() and "success" not in result.lower():
+            logger.warning(
+                "RapidWright could not load restored candidate %s. "
+                "Vivado-only branches can still continue. Result: %s",
+                candidate.candidate_id,
+                result[:500],
+            )
+
+    def _format_wns(self, wns: Optional[float]) -> str:
+        """Format WNS for logs."""
+        return f"{wns:.3f} ns" if wns is not None else "unknown"
+
+    def _candidate_sort_key(self, candidate: SearchCandidate) -> tuple[float, float]:
+        """Score candidates for beam pruning. Current leaf score is primary."""
+        current = candidate.wns if candidate.wns is not None else float("-inf")
+        peak = candidate.peak_wns if candidate.peak_wns is not None else float("-inf")
+        return current, peak
     
     async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
         """Run the optimization workflow."""
@@ -1129,38 +1307,26 @@ class DCPOptimizer(DCPOptimizerBase):
             print(f"Estimated cost: $0.00")
             print("="*70 + "\n")
             return True
-        
-        # Load and fill in system prompt with temp directory and input DCP path
-        system_prompt_template = load_system_prompt()
-        system_prompt = system_prompt_template.format(
-            temp_dir=self.temp_dir,
-            input_dcp=input_dcp.resolve()
-        )
-        
+
+        if self.generation_config.enabled:
+            return await self._optimize_generational(input_dcp, output_dcp, initial_analysis)
+
+        return await self._optimize_linear(input_dcp, output_dcp, initial_analysis)
+
+    async def _optimize_linear(self, input_dcp: Path, output_dcp: Path, initial_analysis: str) -> bool:
+        """Run the original single-line LLM optimization workflow."""
+        system_prompt = self._build_system_prompt(input_dcp, generation_mode=False)
+
         # Initialize conversation with analysis results
-        self.messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"""Optimize this FPGA design for timing.
+        self.messages = self._build_initial_messages(
+            system_prompt,
+            input_dcp,
+            output_dcp,
+            initial_analysis,
+            extra_user_text="Use the original linear workflow and save the final best result to the output path."
+        )
 
-PATHS:
-- Input DCP: {input_dcp.resolve()}
-- Output DCP (save final result here): {output_dcp.resolve()}
-- Run directory (for intermediate files): {self.temp_dir}
-
-CURRENT STATE:
-- Vivado has the input design ALREADY OPEN and analyzed
-- RapidWright has the input design ALREADY LOADED (from initial analysis)
-
-INITIAL ANALYSIS RESULTS:
-{initial_analysis}
-
-Proceed with optimization strategy based on the analysis above. Do NOT reload the design in either Vivado or RapidWright - both already have it loaded."""
-            }
-        ]
-        
-        max_iterations = 50  # Safety limit
+        max_iterations = self.generation_config.max_llm_calls
         
         print("=== Starting LLM-Driven Optimization ===\n")
         
@@ -1190,6 +1356,281 @@ Proceed with optimization strategy based on the analysis above. Do NOT reload th
         self.end_time = time.time()
         self._print_optimization_summary(max_iterations_reached=True)
         return False
+
+    async def _optimize_generational(self, input_dcp: Path, output_dcp: Path, initial_analysis: str) -> bool:
+        """Run branch-and-generation search around the LLM optimization loop."""
+        cfg = self.generation_config
+        search_dir = self.run_dir / "generation_search"
+        search_dir.mkdir(parents=True, exist_ok=True)
+
+        print("=== Starting Generation Search Optimization ===")
+        print(self._format_search_config_for_prompt())
+
+        root_path = search_dir / "root.dcp"
+        if not await self._save_vivado_checkpoint(root_path):
+            raise RuntimeError(f"Could not save root checkpoint: {root_path}")
+
+        root = SearchCandidate(
+            candidate_id="root",
+            dcp_path=root_path,
+            wns=self.initial_wns,
+            peak_wns=self.initial_wns,
+            generation=0,
+            parent_id=None,
+            branch_index=0,
+            steps_taken=0,
+            steps_since_peak=0,
+            summary="Initial analyzed checkpoint",
+        )
+        self.search_candidates = [root]
+        self.best_candidate = root
+        active_candidates = [root]
+
+        system_prompt = self._build_system_prompt(input_dcp, generation_mode=True)
+
+        for generation in range(1, cfg.max_generations + 1):
+            if self.llm_call_count >= cfg.max_llm_calls:
+                print(f"[SEARCH] Reached max LLM calls ({cfg.max_llm_calls}); stopping search.")
+                break
+
+            print(f"\n{'='*70}")
+            print(f"GENERATION {generation}/{cfg.max_generations}")
+            print(f"{'='*70}")
+
+            branch_results: list[SearchCandidate] = []
+            tried_summaries = "\n".join(
+                f"- {c.candidate_id}: WNS {self._format_wns(c.wns)}; {c.summary}"
+                for c in self.search_candidates[-12:]
+            )
+
+            for parent in active_candidates:
+                for branch_index in range(1, cfg.branch_factor + 1):
+                    if self.llm_call_count >= cfg.max_llm_calls:
+                        break
+
+                    candidate = await self._run_generation_branch(
+                        input_dcp=input_dcp,
+                        output_dcp=output_dcp,
+                        initial_analysis=initial_analysis,
+                        system_prompt=system_prompt,
+                        search_dir=search_dir,
+                        parent=parent,
+                        generation=generation,
+                        branch_index=branch_index,
+                        tried_summaries=tried_summaries,
+                    )
+                    if candidate is None:
+                        continue
+
+                    branch_results.append(candidate)
+
+                    if self._is_wns_improvement(candidate.wns, self.best_candidate.wns if self.best_candidate else None):
+                        self.best_candidate = candidate
+                        print(f"[SEARCH] New global best: {candidate.candidate_id} ({self._format_wns(candidate.wns)})")
+
+                    if (
+                        cfg.stop_when_timing_met
+                        and candidate.wns is not None
+                        and candidate.wns >= 0
+                    ):
+                        print("[SEARCH] Timing met; stopping search because stop_when_timing_met is enabled.")
+                        active_candidates = [candidate]
+                        branch_results = [candidate]
+                        break
+
+                if (
+                    cfg.stop_when_timing_met
+                    and self.best_candidate
+                    and self.best_candidate.wns is not None
+                    and self.best_candidate.wns >= 0
+                ):
+                    break
+
+            if not branch_results:
+                print("[SEARCH] No viable branches produced this generation; stopping.")
+                break
+
+            expandable_results = [
+                c for c in branch_results
+                if c.steps_since_peak < cfg.max_steps_without_improvement
+            ]
+            if not expandable_results:
+                print("[SEARCH] All branches reached patience from their peak; stopping.")
+                break
+
+            active_candidates = sorted(
+                expandable_results,
+                key=self._candidate_sort_key,
+                reverse=True
+            )[:cfg.beam_width]
+
+            print("\n[SEARCH] Beam for next generation:")
+            for candidate in active_candidates:
+                print(
+                    f"  - {candidate.candidate_id}: current {self._format_wns(candidate.wns)}, "
+                    f"peak {self._format_wns(candidate.peak_wns)}, "
+                    f"steps since peak {candidate.steps_since_peak}"
+                )
+
+            if (
+                cfg.stop_when_timing_met
+                and self.best_candidate
+                and self.best_candidate.wns is not None
+                and self.best_candidate.wns >= 0
+            ):
+                break
+
+        if self.best_candidate is None:
+            self.end_time = time.time()
+            self._print_optimization_summary(max_iterations_reached=True)
+            return False
+
+        output_dcp.parent.mkdir(parents=True, exist_ok=True)
+        if self.best_candidate.dcp_path.resolve() != output_dcp.resolve():
+            shutil.copy2(self.best_candidate.dcp_path, output_dcp)
+        self.best_wns = self.best_candidate.wns if self.best_candidate.wns is not None else self.best_wns
+        self.end_time = time.time()
+
+        print(f"\n[SEARCH] Best candidate: {self.best_candidate.candidate_id}")
+        print(f"[SEARCH] Best WNS: {self._format_wns(self.best_candidate.wns)}")
+        print(f"[SEARCH] Copied best checkpoint to: {output_dcp}")
+
+        self._print_optimization_summary()
+        return True
+
+    async def _run_generation_branch(
+        self,
+        input_dcp: Path,
+        output_dcp: Path,
+        initial_analysis: str,
+        system_prompt: str,
+        search_dir: Path,
+        parent: SearchCandidate,
+        generation: int,
+        branch_index: int,
+        tried_summaries: str,
+    ) -> Optional[SearchCandidate]:
+        """Expand one branch from a parent candidate for several tolerated steps."""
+        cfg = self.generation_config
+        branch_id = f"g{generation:02d}_p{parent.candidate_id}_b{branch_index:02d}"
+        print(f"\n[SEARCH] Branch {branch_id} from {parent.candidate_id}")
+
+        try:
+            await self._restore_candidate_state(parent)
+        except Exception as e:
+            logger.exception("Could not restore parent candidate %s", parent.candidate_id)
+            print(f"[SEARCH] Skipping branch {branch_id}: restore failed: {e}")
+            return None
+
+        peak_wns = parent.peak_wns
+        current_wns = parent.wns
+        steps_since_peak = parent.steps_since_peak
+        latest_candidate = parent
+        branch_notes: list[str] = []
+
+        branch_instructions = f"""GENERATION BRANCH TASK:
+- Branch id: {branch_id}
+- Parent candidate: {parent.candidate_id}
+- Parent current WNS: {self._format_wns(parent.wns)}
+- Parent peak WNS along this line: {self._format_wns(parent.peak_wns)}
+
+Already tried recent candidates:
+{tried_summaries or "- none"}
+
+For this branch, try a distinct line of play from the parent. It is acceptable if the next one or more steps temporarily worsen WNS, as long as the branch may lead to a better final checkpoint. For each controller step, perform one coherent optimization move, complete implementation/routing as needed, measure timing, and then stop so the controller can score the position."""
+
+        self.messages = self._build_initial_messages(
+            system_prompt,
+            input_dcp,
+            output_dcp,
+            initial_analysis,
+            extra_user_text=branch_instructions
+        )
+
+        for step in range(1, cfg.max_steps_per_branch + 1):
+            if self.llm_call_count >= cfg.max_llm_calls:
+                break
+
+            self.iteration += 1
+            logger.info("=== Generation %s Branch %s Step %s ===", generation, branch_id, step)
+            print(f"\n[SEARCH] {branch_id} step {step}/{cfg.max_steps_per_branch}")
+
+            try:
+                response_text, is_done = await self.get_completion()
+                if response_text:
+                    print(f"\n{response_text}\n")
+                    branch_notes.append(response_text.strip()[:500])
+            except Exception as e:
+                logger.exception("Error during branch %s step %s", branch_id, step)
+                self.messages.append({
+                    "role": "user",
+                    "content": f"An error occurred in this branch step: {e}. Please recover if possible or summarize why this branch is not viable."
+                })
+                continue
+
+            measured_wns = await self._measure_current_wns()
+            current_wns = measured_wns
+
+            checkpoint_path = search_dir / f"{branch_id}_step{step:02d}.dcp"
+            saved = await self._save_vivado_checkpoint(checkpoint_path)
+            if not saved:
+                print(f"[SEARCH] Branch {branch_id} step {step}: checkpoint save failed; stopping branch.")
+                break
+
+            if self._is_wns_improvement(current_wns, peak_wns):
+                peak_wns = current_wns
+                steps_since_peak = 0
+            else:
+                steps_since_peak += 1
+
+            latest_candidate = SearchCandidate(
+                candidate_id=f"{branch_id}_s{step:02d}",
+                dcp_path=checkpoint_path,
+                wns=current_wns,
+                peak_wns=peak_wns,
+                generation=generation,
+                parent_id=parent.candidate_id,
+                branch_index=branch_index,
+                steps_taken=step,
+                steps_since_peak=steps_since_peak,
+                summary=(branch_notes[-1] if branch_notes else "Branch step completed"),
+            )
+            self.search_candidates.append(latest_candidate)
+
+            print(
+                f"[SEARCH] {latest_candidate.candidate_id}: current {self._format_wns(current_wns)}, "
+                f"peak {self._format_wns(peak_wns)}, steps since peak {steps_since_peak}"
+            )
+
+            if self._is_wns_improvement(current_wns, self.best_candidate.wns if self.best_candidate else None):
+                self.best_candidate = latest_candidate
+                print(f"[SEARCH] New global best inside branch: {latest_candidate.candidate_id}")
+
+            if (
+                cfg.stop_when_timing_met
+                and current_wns is not None
+                and current_wns >= 0
+            ):
+                break
+
+            if steps_since_peak >= cfg.max_steps_without_improvement:
+                print(
+                    f"[SEARCH] Stopping {branch_id}: no improvement over branch peak for "
+                    f"{steps_since_peak} step(s)."
+                )
+                break
+
+            self.messages.append({
+                "role": "user",
+                "content": (
+                    "Continue this same branch with one additional exploratory step. "
+                    f"Current WNS is {self._format_wns(current_wns)} and the branch peak is {self._format_wns(peak_wns)}. "
+                    "Temporary WNS regressions are allowed if the line may recover. "
+                    "Perform the next move, measure timing, and stop."
+                )
+            })
+
+        return latest_candidate if latest_candidate is not parent else None
     
     def save_token_usage_report(self, output_path: Path):
         """Save detailed token usage report to JSON file."""
@@ -1219,6 +1660,25 @@ Proceed with optimization strategy based on the analysis above. Do NOT reload th
         report = {
             "model": self.model,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "generation_search": {
+                "config": asdict(self.generation_config),
+                "best_candidate_id": self.best_candidate.candidate_id if self.best_candidate else None,
+                "candidates": [
+                    {
+                        "candidate_id": c.candidate_id,
+                        "dcp_path": str(c.dcp_path),
+                        "wns": c.wns,
+                        "peak_wns": c.peak_wns,
+                        "generation": c.generation,
+                        "parent_id": c.parent_id,
+                        "branch_index": c.branch_index,
+                        "steps_taken": c.steps_taken,
+                        "steps_since_peak": c.steps_since_peak,
+                        "summary": c.summary,
+                    }
+                    for c in self.search_candidates
+                ],
+            },
             "summary": {
                 "total_runtime_seconds": total_runtime,
                 "total_llm_calls": self.llm_call_count,
@@ -1273,6 +1733,18 @@ Proceed with optimization strategy based on the analysis above. Do NOT reload th
         print(f"\nITERATION STATS:")
         print(f"  Total iterations:    {self.iteration}")
         print(f"  LLM API calls:       {self.llm_call_count}")
+
+        if self.generation_config.enabled:
+            print(f"\nGENERATION SEARCH:")
+            print(f"  Branches/parent:     {self.generation_config.branch_factor}")
+            print(f"  Beam width:          {self.generation_config.beam_width}")
+            print(f"  Max generations:     {self.generation_config.max_generations}")
+            print(f"  Steps/branch:        {self.generation_config.max_steps_per_branch}")
+            print(f"  Patience from peak:  {self.generation_config.max_steps_without_improvement}")
+            print(f"  Candidates saved:    {len(self.search_candidates)}")
+            if self.best_candidate:
+                print(f"  Best candidate:      {self.best_candidate.candidate_id}")
+                print(f"  Best checkpoint:     {self.best_candidate.dcp_path}")
         
         # Token usage
         print(f"\nTOKEN USAGE:")
@@ -2303,6 +2775,8 @@ Examples:
   python dcp_optimizer.py input.dcp
   python dcp_optimizer.py input.dcp --output output.dcp
   python dcp_optimizer.py input.dcp --model anthropic/claude-sonnet-4
+  python dcp_optimizer.py input.dcp --branches 3 --beam-width 2 --generations 4 --steps-without-improvement 3
+  python dcp_optimizer.py input.dcp --search-mode linear
   python dcp_optimizer.py input.dcp --debug
   python dcp_optimizer.py fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp --test
   python dcp_optimizer.py fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp --test
@@ -2343,6 +2817,59 @@ Examples:
         type=int,
         default=5,
         help="Maximum number of high fanout nets to optimize in test mode (default: 5)"
+    )
+    parser.add_argument(
+        "--search-mode",
+        choices=["generations", "linear"],
+        default="generations",
+        help="LLM search controller to use in full agent mode (default: generations)"
+    )
+    parser.add_argument(
+        "--branches",
+        type=int,
+        default=2,
+        help="Number of child branches to try from each active candidate in generation mode (default: 2)"
+    )
+    parser.add_argument(
+        "--beam-width",
+        type=int,
+        default=2,
+        help="Number of best current candidates to keep for the next generation (default: 2)"
+    )
+    parser.add_argument(
+        "--generations",
+        type=int,
+        default=3,
+        help="Maximum number of search generations (default: 3)"
+    )
+    parser.add_argument(
+        "--steps-per-branch",
+        type=int,
+        default=3,
+        help="Maximum LLM steps to take along each branch before pruning (default: 3)"
+    )
+    parser.add_argument(
+        "--steps-without-improvement",
+        type=int,
+        default=3,
+        help="Stop a branch after this many steps without beating that branch's highest WNS (default: 3)"
+    )
+    parser.add_argument(
+        "--max-llm-calls",
+        type=int,
+        default=50,
+        help="Safety cap on total LLM calls in full agent mode (default: 50)"
+    )
+    parser.add_argument(
+        "--min-wns-delta",
+        type=float,
+        default=0.001,
+        help="Minimum WNS delta in ns counted as an improvement (default: 0.001)"
+    )
+    parser.add_argument(
+        "--continue-after-timing-met",
+        action="store_true",
+        help="Keep searching after WNS reaches 0 instead of stopping at timing closure"
     )
     
     args = parser.parse_args()
@@ -2408,13 +2935,32 @@ Examples:
     print(f"Output:      {args.output_dcp.resolve()}")
     print(f"Run dir:     {run_dir}")
     print(f"Model:       {args.model}")
+    print(f"Search mode: {args.search_mode}")
+    if args.search_mode == "generations":
+        print(f"Branches:    {args.branches}")
+        print(f"Beam width:  {args.beam_width}")
+        print(f"Generations: {args.generations}")
+        print(f"Patience:    {args.steps_without_improvement} steps without branch-peak improvement")
     print()
+
+    generation_config = GenerationSearchConfig(
+        enabled=args.search_mode == "generations",
+        branch_factor=max(1, args.branches),
+        beam_width=max(1, args.beam_width),
+        max_generations=max(1, args.generations),
+        max_steps_per_branch=max(1, args.steps_per_branch),
+        max_steps_without_improvement=max(1, args.steps_without_improvement),
+        max_llm_calls=max(1, args.max_llm_calls),
+        min_wns_delta=max(0.0, args.min_wns_delta),
+        stop_when_timing_met=not args.continue_after_timing_met,
+    )
     
     optimizer = DCPOptimizer(
         api_key=args.api_key,
         model=args.model,
         debug=args.debug,
-        run_dir=run_dir
+        run_dir=run_dir,
+        generation_config=generation_config
     )
     
     try:

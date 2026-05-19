@@ -79,5 +79,5 @@ CRITICAL RULES:
 - After RapidWright saves a DCP, open it in Vivado and route 
 - If writing a DCP from Vivado to be opened in RapidWright, also call write_edif to ensure the netlist is unencrypted
 - If a tool fails, check the error message - verify net name exists and retry or skip
-- Track WNS: stop if no improvement after 3 attempts
+- Track WNS after each implemented step. In generation-search mode, let the controller decide branch stopping/pruning based on its configured patience.
 - Be concise - focus on actions and timing numbers
