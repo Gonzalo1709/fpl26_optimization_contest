@@ -265,7 +265,15 @@ python3 dcp_optimizer.py input.dcp --output output.dcp --api-key "your-key"
 
 # Use a different model (default: x-ai/grok-4.1-fast)
 python3 dcp_optimizer.py input.dcp --model anthropic/claude-sonnet-4
+
+# Tune generation search
+python3 dcp_optimizer.py input.dcp --branches 3 --beam-width 2 --generations 4 --steps-without-improvement 3
+
+# Compare against the original single-line loop
+python3 dcp_optimizer.py input.dcp --search-mode linear
 ```
+
+By default, full agent mode uses a generation search controller. It saves checkpoints for several branches, allows a branch to keep going through temporary WNS regressions, prunes only after the branch fails to beat its own highest WNS for the configured patience, and copies the best checkpoint found to the output path.
 
 ### Command Line Options
 
@@ -278,6 +286,21 @@ python3 dcp_optimizer.py input.dcp --model anthropic/claude-sonnet-4
 | `--debug` | Enable debug mode (verbose logging, preserve all files) | False |
 | `--test` | Test mode: run without LLM. Pblock for LogicNets, cell re-placement for VexRiscv | False |
 | `--max-nets` | Max high-fanout nets to optimize in test mode (high fanout flow only) | 5 |
+| `--search-mode` | Full-agent search mode: `generations` or `linear` | `generations` |
+| `--branches` | Child branches to try from each active candidate | 2 |
+| `--beam-width` | Best current candidates kept for the next generation | 2 |
+| `--generations` | Maximum number of search generations | 3 |
+| `--steps-per-branch` | Maximum LLM steps along each branch | 3 |
+| `--steps-without-improvement` | Branch patience measured from that branch's highest WNS, not the previous step | 3 |
+| `--max-llm-calls` | Safety cap on total full-agent LLM calls | 50 |
+| `--min-wns-delta` | Minimum WNS delta in ns counted as an improvement | 0.001 |
+| `--continue-after-timing-met` | Continue search after WNS reaches 0 | False |
+
+With `make run_optimizer`, pass generation controls through `OPT_ARGS`:
+
+```bash
+make run_optimizer DCP=input.dcp OPT_ARGS="--branches 3 --beam-width 2 --generations 4"
+```
 
 ## Validating Optimized Designs
 

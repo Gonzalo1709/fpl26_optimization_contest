@@ -15,6 +15,7 @@ BENCH_DIR="${DEFAULT_BENCH_DIR}"
 MODE="test"
 MAX_NETS="5"
 PYTHON_BIN="python3"
+OPT_ARGS=""
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_ROOT="${SCRIPT_DIR}/batch_logs"
@@ -67,6 +68,10 @@ Options:
   --python <bin>            Python executable to use
                             (default: python3)
 
+  --opt-args <string>       Extra arguments forwarded to optimizer mode
+                            as OPT_ARGS for:
+                            make run_optimizer DCP=<file> OPT_ARGS="<string>"
+
   --upload-target <target>  Optional rclone destination, e.g.
                             gdrive:fpl26-results
 
@@ -79,6 +84,7 @@ Examples:
   $(basename "$0")
   $(basename "$0") --bench-dir "${SCRIPT_DIR}/../fpl26_contest_benchmarks" --mode test
   $(basename "$0") --mode optimizer --logs-dir "${SCRIPT_DIR}/batch_logs/full_run"
+  $(basename "$0") --mode optimizer --opt-args "--branches 3 --beam-width 2 --generations 4"
   $(basename "$0") --mode test --upload-target gdrive:fpl26-results
   $(basename "$0") --mode optimizer --upload-target gdrive:fpl26-results
 EOF
@@ -253,6 +259,10 @@ while [[ $# -gt 0 ]]; do
       PYTHON_BIN="$2"
       shift 2
       ;;
+    --opt-args)
+      OPT_ARGS="$2"
+      shift 2
+      ;;
     --upload-target)
       RCLONE_DEST="$2"
       shift 2
@@ -310,6 +320,13 @@ echo "  Mode:           ${MODE}"
 echo "  Benchmark dir:  ${BENCH_DIR}"
 echo "  Log directory:  ${LOG_DIR}"
 echo "  DCP count:      ${#DCP_FILES[@]}"
+if [[ "${MODE}" == "optimizer" ]]; then
+  if [[ -n "${OPT_ARGS}" ]]; then
+    echo "  OPT_ARGS:       ${OPT_ARGS}"
+  else
+    echo "  OPT_ARGS:       <none>"
+  fi
+fi
 
 if [[ -n "${RCLONE_DEST}" ]]; then
   echo "  Upload target:  ${RCLONE_DEST}"
@@ -335,11 +352,17 @@ for dcp in "${DCP_FILES[@]}"; do
   if [[ "${MODE}" == "test" ]]; then
     cmd=("${PYTHON_BIN}" "${SCRIPT_DIR}/dcp_optimizer.py" "${dcp}" "--test" "--max-nets" "${MAX_NETS}")
   else
-    cmd=("${PYTHON_BIN}" "${SCRIPT_DIR}/dcp_optimizer.py" "${dcp}")
+    cmd=("make" "run_optimizer" "DCP=${dcp}")
+    if [[ -n "${OPT_ARGS}" ]]; then
+      cmd+=("OPT_ARGS=${OPT_ARGS}")
+    fi
   fi
 
+  printf -v cmd_display '%q ' "${cmd[@]}"
+  cmd_display="${cmd_display% }"
+
   echo "[${index}/${total}] Running ${dcp_name}"
-  echo "Command: ${cmd[*]}" > "${log_file}"
+  echo "Command: ${cmd_display}" > "${log_file}"
   echo "Started: ${start_time}" >> "${log_file}"
   echo "------------------------------------------------------------" >> "${log_file}"
 
