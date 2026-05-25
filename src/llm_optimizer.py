@@ -2,24 +2,26 @@
 
 import json
 import logging
-import time
 import re
+import shutil
+import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
 from openai import OpenAI
 
 from src.base import DCPOptimizerBase
-from src.mcp import convert_mcp_tool_to_openai
 from src.parsers import load_system_prompt, parse_timing_summary_static
+from src.search import GenerationSearchConfig, SearchCandidate
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "x-ai/grok-4.1-fast"
+DEFAULT_MODEL = "~openai/gpt-latest"
 
 
 class DCPOptimizer(DCPOptimizerBase):
-    """FPGA Design Optimization Agent using RapidWright and Vivado MCPs."""
+    """FPGA Design Optimization Agent using recipe selection plus generation search."""
 
     def __init__(
         self,
@@ -27,14 +29,13 @@ class DCPOptimizer(DCPOptimizerBase):
         model: str = DEFAULT_MODEL,
         debug: bool = False,
         run_dir: Optional[Path] = None,
+        generation_config: Optional[GenerationSearchConfig] = None,
     ):
         super().__init__(debug=debug, run_dir=run_dir)
 
         self.api_key = api_key
         self.model = model
-        self.tools: list[dict] = []
-        self.messages: list[dict] = []
-
+        self.generation_config = generation_config or GenerationSearchConfig()
         self.openai = OpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
@@ -49,31 +50,16 @@ class DCPOptimizer(DCPOptimizerBase):
         self.total_completion_tokens = 0
         self.total_tokens = 0
         self.total_cost = 0.0
-        self.api_call_details = []
-        self.tool_call_details = []
+        self.api_call_details: list[dict] = []
+        self.tool_call_details: list[dict] = []
 
-        self.start_time = None
-        self.end_time = None
+        self.search_candidates: list[SearchCandidate] = []
+        self.best_candidate: Optional[SearchCandidate] = None
 
-        self.history = []
+        self.start_time: Optional[float] = None
+        self.end_time: Optional[float] = None
 
-    async def start_servers(self, log_prefix: str = ""):
-        """Start and connect to both MCP servers."""
-        await super().start_servers(log_prefix=log_prefix)
-        await self._collect_tools()
-        logger.info(f"Connected to servers with {len(self.tools)} tools available")
-
-    async def _collect_tools(self):
-        """Collect and convert tools from both MCP servers."""
-        self.tools = []
-
-        rw_response = await self.rapidwright_session.list_tools()
-        for tool in rw_response.tools:
-            self.tools.append(convert_mcp_tool_to_openai(tool, "rapidwright"))
-
-        v_response = await self.vivado_session.list_tools()
-        for tool in v_response.tools:
-            self.tools.append(convert_mcp_tool_to_openai(tool, "vivado"))
+        self.history: list[dict] = []
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Execute a tool call on the appropriate MCP server."""
@@ -90,11 +76,11 @@ class DCPOptimizer(DCPOptimizerBase):
         wns_measured = None
 
         try:
-            logger.info(f"Calling {tool_name} with args: {json.dumps(arguments)[:200]}...")
+            logger.info("Calling %s with args: %s...", tool_name, json.dumps(arguments)[:200])
             result = await session.call_tool(actual_name, arguments)
 
             if result.content:
-                text_parts = [c.text for c in result.content if hasattr(c, "text")]
+                text_parts = [chunk.text for chunk in result.content if hasattr(chunk, "text")]
                 result_text = "\n".join(text_parts)
             else:
                 result_text = "(no output)"
@@ -104,183 +90,94 @@ class DCPOptimizer(DCPOptimizerBase):
                     try:
                         clock_wns = await super().get_wns_for_target_clock(self._call_vivado_tool)
                         if clock_wns is not None:
-                            current_wns = clock_wns
-                            wns_measured = current_wns
-                            current_fmax = self.calculate_fmax(current_wns, self.clock_period)
-                            fmax_str = f", fmax: {current_fmax:.2f} MHz" if current_fmax is not None else ""
-                            if current_wns > self.best_wns:
-                                logger.info(
-                                    f"New best WNS (clock: {self.target_clock}): {current_wns:.3f} ns{fmax_str} "
-                                    f"(improved from {self.best_wns:.3f} ns)"
-                                )
-                                self.best_wns = current_wns
-                            else:
-                                logger.info(
-                                    f"Current WNS (clock: {self.target_clock}): {current_wns:.3f} ns{fmax_str} "
-                                    f"(best is still {self.best_wns:.3f} ns)"
-                                )
-                    except Exception as e:
-                        logger.warning(f"Failed to get clock-specific WNS, falling back to overall: {e}")
+                            wns_measured = clock_wns
+                            self._update_best_wns(clock_wns, source=f"clock: {self.target_clock}")
+                    except Exception as exc:
+                        logger.warning("Failed to get clock-specific WNS, falling back to overall: %s", exc)
                         self.target_clock = None
 
                 if not self.target_clock or wns_measured is None:
                     timing_info = parse_timing_summary_static(result_text)
                     if timing_info["wns"] is not None:
-                        current_wns = timing_info["wns"]
-                        wns_measured = current_wns
-                        current_fmax = self.calculate_fmax(current_wns, self.clock_period)
-                        fmax_str = f", fmax: {current_fmax:.2f} MHz" if current_fmax is not None else ""
-                        if current_wns > self.best_wns:
-                            logger.info(
-                                f"New best WNS: {current_wns:.3f} ns{fmax_str} (improved from {self.best_wns:.3f} ns)"
-                            )
-                            self.best_wns = current_wns
-                        else:
-                            logger.info(
-                                f"Current WNS: {current_wns:.3f} ns{fmax_str} (best is still {self.best_wns:.3f} ns)"
-                            )
+                        wns_measured = timing_info["wns"]
+                        self._update_best_wns(wns_measured)
             elif tool_name == "vivado_get_wns":
                 try:
-                    current_wns = float(result_text.strip())
-                    wns_measured = current_wns
-                    current_fmax = self.calculate_fmax(current_wns, self.clock_period)
-                    fmax_str = f", fmax: {current_fmax:.2f} MHz" if current_fmax is not None else ""
-                    if current_wns > self.best_wns:
-                        logger.info(
-                            f"New best WNS (from get_wns): {current_wns:.3f} ns{fmax_str} "
-                            f"(improved from {self.best_wns:.3f} ns)"
-                        )
-                        self.best_wns = current_wns
-                    else:
-                        logger.info(
-                            f"Current WNS (from get_wns): {current_wns:.3f} ns{fmax_str} (best is still {self.best_wns:.3f} ns)"
-                        )
+                    wns_measured = float(result_text.strip())
+                    self._update_best_wns(wns_measured, source="get_wns")
                 except (ValueError, AttributeError):
-                    logger.warning(f"Could not parse WNS from get_wns output: {result_text[:100]}")
+                    logger.warning("Could not parse WNS from get_wns output: %s", result_text[:100])
 
             elapsed_time = time.time() - start_time
-            self.tool_call_details.append({
-                "tool_name": tool_name,
-                "iteration": self.iteration,
-                "elapsed_time": elapsed_time,
-                "wns": wns_measured,
-                "error": False,
-            })
+            self.tool_call_details.append(
+                {
+                    "tool_name": tool_name,
+                    "iteration": self.iteration,
+                    "elapsed_time": elapsed_time,
+                    "wns": wns_measured,
+                    "error": False,
+                }
+            )
             return result_text
-
-        except Exception as e:
+        except Exception as exc:
             elapsed_time = time.time() - start_time
-            self.tool_call_details.append({
-                "tool_name": tool_name,
-                "iteration": self.iteration,
-                "elapsed_time": elapsed_time,
-                "wns": None,
-                "error": True,
-                "error_message": str(e),
-            })
-            logger.error(f"Tool call failed: {e}")
-            return json.dumps({"error": str(e)})
+            self.tool_call_details.append(
+                {
+                    "tool_name": tool_name,
+                    "iteration": self.iteration,
+                    "elapsed_time": elapsed_time,
+                    "wns": None,
+                    "error": True,
+                    "error_message": str(exc),
+                }
+            )
+            logger.error("Tool call failed: %s", exc)
+            return json.dumps({"error": str(exc)})
+
+    def _update_best_wns(self, current_wns: float, source: str = "timing_summary"):
+        current_fmax = self.calculate_fmax(current_wns, self.clock_period)
+        fmax_str = f", fmax: {current_fmax:.2f} MHz" if current_fmax is not None else ""
+        if current_wns > self.best_wns:
+            logger.info(
+                "New best WNS (%s): %.3f ns%s (improved from %.3f ns)",
+                source,
+                current_wns,
+                fmax_str,
+                self.best_wns,
+            )
+            self.best_wns = current_wns
+        else:
+            logger.info(
+                "Current WNS (%s): %.3f ns%s (best is still %.3f ns)",
+                source,
+                current_wns,
+                fmax_str,
+                self.best_wns,
+            )
 
     async def _call_vivado_tool(self, tool_name: str, arguments: dict) -> str:
+        """Helper to call Vivado tools for base-class methods."""
         return await self.call_tool(f"vivado_{tool_name}", arguments)
 
-    async def process_response(self, response) -> tuple[str, bool]:
-        try:
-            if not response:
-                raise ValueError("Response is None")
-            if not hasattr(response, "choices"):
-                raise ValueError(f"Response has no 'choices' attribute. Response type: {type(response)}, Response: {response}")
-            if response.choices is None:
-                raise ValueError("Response.choices is None")
-            if len(response.choices) == 0:
-                raise ValueError("Response choices list is empty")
-
-            message = response.choices[0].message
-            if not message:
-                raise ValueError("Message is None")
-        except Exception as e:
-            logger.error(f"Failed to parse response structure: {e}")
-            logger.error(f"Response object: {response}")
-            raise
-
-        message_dict = message.model_dump(exclude_none=True)
-        self.messages.append(message_dict)
-
-        if self.debug:
-            logger.debug(f"Added message to conversation: {json.dumps(message_dict, indent=2)[:500]}...")
-
-        if message.tool_calls:
-            tool_results = []
-            for tool_call in message.tool_calls:
-                if not tool_call or not hasattr(tool_call, "function") or not tool_call.function:
-                    logger.warning(f"Invalid tool_call structure: {tool_call}")
-                    continue
-
-                tool_name = tool_call.function.name
-                try:
-                    tool_args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
-                except json.JSONDecodeError:
-                    tool_args = {}
-
-                result = await self.call_tool(tool_name, tool_args)
-
-                max_result_length = 50000
-                if len(result) > max_result_length:
-                    logger.warning(
-                        f"Tool result from {tool_name} is {len(result)} chars, truncating to {max_result_length}"
-                    )
-                    result = result[:max_result_length] + f"\n...[truncated {len(result) - max_result_length} characters]"
-
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": tool_name,
-                    "content": result,
-                })
-
-                if self.debug:
-                    logger.debug(f"Tool {tool_name} result: {result[:500]}...")
-
-            self.messages.extend(tool_results)
-            return await self.get_completion()
-
-        content = message.content or ""
-        is_done = any(
-            phrase in content.lower()
-            for phrase in [
-                "optimization complete",
-                "timing is met",
-                "wns >= 0",
-                "no more optimizations",
-                "design meets timing",
-                "successfully saved",
-                "final design saved",
-            ]
-        )
-        return content, is_done
-
     async def perform_initial_analysis(self, input_dcp: Path) -> str:
+        """Perform deterministic startup analysis before the optimization loop begins."""
         logger.info("Performing initial design analysis...")
         print("\n=== Initial Design Analysis ===\n")
 
-        logger.info("Initializing RapidWright...")
         print("Initializing RapidWright...")
         result = await self.call_tool("rapidwright_initialize_rapidwright", {})
         if "error" in result.lower() and "success" not in result.lower():
             raise RuntimeError(f"Failed to initialize RapidWright: {result}")
         print("✓ RapidWright initialized\n")
 
-        logger.info(f"Opening checkpoint: {input_dcp}")
         print(f"Opening checkpoint: {input_dcp.name}")
         result = await self.call_tool("vivado_open_checkpoint", {"dcp_path": str(input_dcp.resolve())})
         if "error" in result.lower() and "opened successfully" not in result.lower():
             raise RuntimeError(f"Failed to open checkpoint: {result}")
         print("✓ Checkpoint opened in Vivado\n")
 
-        logger.info("Analyzing timing...")
         print("Analyzing timing...")
         timing_report = await self.call_tool("vivado_report_timing_summary", {})
-
         timing_info = parse_timing_summary_static(timing_report)
         self.initial_tns = timing_info["tns"]
         self.initial_failing_endpoints = timing_info["failing_endpoints"]
@@ -308,27 +205,32 @@ class DCPOptimizer(DCPOptimizerBase):
             print(f"  - Failing endpoints: {self.initial_failing_endpoints}")
         print()
 
-        logger.info("Identifying critical high fanout nets...")
         print("Identifying critical high fanout nets...")
-        nets_report = await self.call_tool("vivado_get_critical_high_fanout_nets", {"num_paths": 50, "min_fanout": 100})
+        nets_report = await self.call_tool(
+            "vivado_get_critical_high_fanout_nets",
+            {"num_paths": 50, "min_fanout": 100},
+        )
         self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
         print(f"✓ Found {len(self.high_fanout_nets)} high fanout nets (>100 fanout)\n")
 
         critical_path_spread_info = None
 
-        logger.info("Loading design in RapidWright...")
         print("Loading design in RapidWright for spread analysis...")
         result = await self.call_tool("rapidwright_read_checkpoint", {"dcp_path": str(input_dcp.resolve())})
         if "error" in result.lower() and "success" not in result.lower():
             print(f"⚠ Warning: Could not load design in RapidWright: {result}")
         else:
             print("✓ Design loaded in RapidWright\n")
-
-            logger.info("Extracting and analyzing critical path spread...")
             print("Analyzing critical path spread...")
             temp_path = Path(self.temp_dir) / "initial_critical_paths.json"
-            await self.call_tool("vivado_extract_critical_path_cells", {"num_paths": 50, "output_file": str(temp_path)})
-            spread_result = await self.call_tool("rapidwright_analyze_critical_path_spread", {"input_file": str(temp_path)})
+            await self.call_tool(
+                "vivado_extract_critical_path_cells",
+                {"num_paths": 50, "output_file": str(temp_path)},
+            )
+            spread_result = await self.call_tool(
+                "rapidwright_analyze_critical_path_spread",
+                {"input_file": str(temp_path)},
+            )
 
             try:
                 spread_data = json.loads(spread_result)
@@ -342,13 +244,10 @@ class DCPOptimizer(DCPOptimizerBase):
                 print(f"  - Avg distance: {critical_path_spread_info['avg_distance']:.1f} tiles")
                 print(f"  - Paths analyzed: {critical_path_spread_info['paths_analyzed']}")
                 print()
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"⚠ Warning: Could not parse spread results: {e}")
-                critical_path_spread_info = None
+            except (json.JSONDecodeError, KeyError) as exc:
+                print(f"⚠ Warning: Could not parse spread results: {exc}")
 
-        summary = []
-        summary.append("=== Initial Design Analysis ===\n")
-        summary.append("TIMING STATUS:")
+        summary = ["=== Initial Design Analysis ===\n", "TIMING STATUS:"]
         if self.clock_period is not None:
             target_fmax = 1000.0 / self.clock_period
             summary.append(f"  Clock period: {self.clock_period:.3f} ns (target fmax: {target_fmax:.2f} MHz)")
@@ -371,14 +270,14 @@ class DCPOptimizer(DCPOptimizerBase):
             summary.append(f"  Max cell distance: {critical_path_spread_info['max_distance']} tiles")
             summary.append(f"  Avg cell distance: {critical_path_spread_info['avg_distance']:.1f} tiles")
             summary.append(f"  Paths analyzed: {critical_path_spread_info['paths_analyzed']}")
-            if critical_path_spread_info['avg_distance'] > 70 and critical_path_spread_info['paths_analyzed'] >= 5:
+            if critical_path_spread_info["avg_distance"] > 70 and critical_path_spread_info["paths_analyzed"] >= 5:
                 summary.append("  ⚠ RECOMMENDATION: Use PBLOCK strategy (high spread detected)")
             summary.append("")
 
         if self.high_fanout_nets:
             summary.append("CRITICAL HIGH FANOUT NETS (top 10):")
-            for i, (net_name, fanout, path_count) in enumerate(self.high_fanout_nets[:10]):
-                summary.append(f"  {i+1}. {net_name}")
+            for index, (net_name, fanout, path_count) in enumerate(self.high_fanout_nets[:10], start=1):
+                summary.append(f"  {index}. {net_name}")
                 summary.append(f"     Fanout: {fanout}, Critical paths: {path_count}")
             if len(self.high_fanout_nets) > 10:
                 summary.append(f"  ... and {len(self.high_fanout_nets) - 10} more nets")
@@ -393,48 +292,69 @@ class DCPOptimizer(DCPOptimizerBase):
         print()
         return summary_text
 
-    async def get_completion(self) -> tuple[str, bool]:
-        try:
-            self.llm_call_count += 1
-            logger.info(f"LLM API call #{self.llm_call_count}")
+    async def choose_action_llm(self, decision_input: dict) -> dict:
+        """Choose a recipe and its arguments using a single LLM call."""
+        prompt = """
+You are an FPGA optimization planner.
 
-            response = self.openai.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tool_choice="auto",
-                max_tokens=4096,
-                extra_body={"usage": {"include": True}},
-            )
+Choose the next optimization action.
 
-            if response is None:
-                raise ValueError("API returned None response")
+Return JSON:
+{
+  "strategy": "PBLOCK | FANOUT | PHYS_OPT",
+  "args": { ... }
+}
 
-            if hasattr(response, "usage") and response.usage:
-                prompt_tokens = response.usage.prompt_tokens
-                completion_tokens = response.usage.completion_tokens
-                total_tokens = response.usage.total_tokens
+Rules:
+- Prefer PBLOCK when the analysis shows spread-out critical paths.
+- Prefer FANOUT when high-fanout nets are present and not yet exhausted.
+- Prefer PHYS_OPT when placement spread is low or when earlier steps stagnate.
+- Avoid repeating strategies that the recent history shows were ineffective from the current state.
+- If stagnation >= 2, switch strategy if possible.
+- FANOUT: choose top_n_nets (1-10)
+- PHYS_OPT: choose directive from ["Explore", "AggressiveExplore", "Default"]
+- PBLOCK: args can be empty
 
-                self.total_prompt_tokens += prompt_tokens
-                self.total_completion_tokens += completion_tokens
-                self.total_tokens += total_tokens
+Return ONLY JSON.
+"""
 
-                call_cost = 0.0
-                if hasattr(response.usage, "cost") and response.usage.cost is not None:
-                    call_cost = float(response.usage.cost)
-                    self.total_cost += call_cost
-                else:
-                    logger.warning("OpenRouter did not provide cost information")
+        response = self.openai.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(decision_input)},
+            ],
+            max_tokens=200,
+            extra_body={"usage": {"include": True}},
+        )
 
-                cached_tokens = 0
-                reasoning_tokens = 0
-                if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
-                    if hasattr(response.usage.prompt_tokens_details, "cached_tokens"):
-                        cached_tokens = response.usage.prompt_tokens_details.cached_tokens or 0
-                if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
-                    if hasattr(response.usage.completion_tokens_details, "reasoning_tokens"):
-                        reasoning_tokens = response.usage.completion_tokens_details.reasoning_tokens or 0
+        self.llm_call_count += 1
 
-                self.api_call_details.append({
+        usage = getattr(response, "usage", None)
+        if usage:
+            prompt_tokens = getattr(usage, "prompt_tokens", 0)
+            completion_tokens = getattr(usage, "completion_tokens", 0)
+            total_tokens = getattr(usage, "total_tokens", 0)
+            self.total_prompt_tokens += prompt_tokens
+            self.total_completion_tokens += completion_tokens
+            self.total_tokens += total_tokens
+
+            call_cost = 0.0
+            if hasattr(usage, "cost") and usage.cost is not None:
+                call_cost = float(usage.cost)
+                self.total_cost += call_cost
+            else:
+                logger.warning("OpenRouter did not provide cost information")
+
+            cached_tokens = 0
+            reasoning_tokens = 0
+            if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
+                cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+            if hasattr(usage, "completion_tokens_details") and usage.completion_tokens_details:
+                reasoning_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+
+            self.api_call_details.append(
+                {
                     "call_number": self.llm_call_count,
                     "iteration": self.iteration,
                     "prompt_tokens": prompt_tokens,
@@ -443,140 +363,639 @@ class DCPOptimizer(DCPOptimizerBase):
                     "cost": call_cost,
                     "cached_tokens": cached_tokens,
                     "reasoning_tokens": reasoning_tokens,
-                })
+                }
+            )
 
-                cache_info = f", Cached: {cached_tokens:,}" if cached_tokens > 0 else ""
-                reasoning_info = f", Reasoning: {reasoning_tokens:,}" if reasoning_tokens > 0 else ""
-                cost_info = f" | Cost: ${call_cost:.4f}" if call_cost > 0 else ""
+            cache_info = f", Cached: {cached_tokens:,}" if cached_tokens > 0 else ""
+            reasoning_info = f", Reasoning: {reasoning_tokens:,}" if reasoning_tokens > 0 else ""
+            cost_info = f" | Cost: ${call_cost:.4f}" if call_cost > 0 else ""
+            print(
+                f"[API Call #{self.llm_call_count}] Tokens: {total_tokens:,} "
+                f"(Prompt: {prompt_tokens:,}, Completion: {completion_tokens:,}{cache_info}{reasoning_info}){cost_info}"
+            )
 
-                logger.info(
-                    f"API call #{self.llm_call_count} - Tokens: {prompt_tokens} prompt + {completion_tokens} completion = {total_tokens} total"
-                    f"{cost_info}{cache_info}{reasoning_info}"
-                )
-                print(
-                    f"[API Call #{self.llm_call_count}] Tokens: {total_tokens:,} (Prompt: {prompt_tokens:,}, Completion: {completion_tokens:,}{cache_info}{reasoning_info}){cost_info}"
-                )
-            else:
-                logger.warning("No usage information in API response")
+        content = response.choices[0].message.content.strip()
+        try:
+            return json.loads(content)
+        except Exception:
+            logger.warning("Could not parse planner JSON, falling back to PHYS_OPT. Raw content: %s", content)
+            return {"strategy": "PHYS_OPT", "args": {"directive": "Default"}}
 
-            if self.debug:
-                logger.debug(f"Response type: {type(response)}")
-                logger.debug(f"Response: {response}")
+    def sanitize_action(self, action: dict) -> tuple[str, dict]:
+        """Validate strategy output from the LLM."""
+        strategy = action.get("strategy", "PHYS_OPT")
+        args = action.get("args", {})
 
-            if hasattr(response, "error") and response.error:
-                raise ValueError(f"API returned error: {response.error}")
+        if strategy == "FANOUT":
+            top_n = int(args.get("top_n_nets", 5))
+            top_n = max(1, min(10, top_n))
+            return strategy, {"top_n_nets": top_n}
 
-            return await self.process_response(response)
+        if strategy == "PHYS_OPT":
+            directive = args.get("directive", "Default")
+            if directive not in ["Explore", "AggressiveExplore", "Default"]:
+                directive = "Default"
+            return strategy, {"directive": directive}
 
-        except Exception as e:
-            logger.error(f"Error in get_completion: {e}")
-            logger.error(f"Number of messages in conversation: {len(self.messages)}")
-            if self.messages:
-                logger.error(f"Last message: {self.messages[-1]}")
-            raise
+        if strategy == "PBLOCK":
+            return strategy, {}
 
-    async def optimize(self, input_dcp: Path, output_dcp: Path):
+        return "PHYS_OPT", {"directive": "Default"}
+
+    async def v(self, name: str, args: Optional[dict] = None) -> str:
+        """Call a Vivado MCP tool."""
+        return await self.call_tool(f"vivado_{name}", args or {})
+
+    async def rw(self, name: str, args: Optional[dict] = None) -> str:
+        """Call a RapidWright MCP tool."""
+        return await self.call_tool(f"rapidwright_{name}", args or {})
+
+    async def run_pblock_flow(self) -> str:
+        """Execute the deterministic PBLOCK recipe."""
+        util_report = await self.v("report_utilization_for_pblock")
+        util = self.parse_utilization(util_report)
+
+        fabric = await self.rw(
+            "analyze_fabric_for_pblock",
+            {
+                "target_lut_count": int(util["lut"] * 1.5),
+                "target_ff_count": int(util["ff"] * 1.5),
+            },
+        )
+
+        fabric_data = json.loads(fabric)
+        if "recommended_region" not in fabric_data:
+            raise ValueError(f"No recommended_region in response: {fabric_data}")
+
+        region = fabric_data["recommended_region"]
+        pblock = await self.rw(
+            "convert_fabric_region_to_pblock",
+            {
+                "col_min": region["col_min"],
+                "col_max": region["col_max"],
+                "row_min": region["row_min"],
+                "row_max": region["row_max"],
+                "use_clock_regions": False,
+            },
+        )
+        pblock_ranges = json.loads(pblock)["pblock_ranges"]
+
+        await self.v("run_tcl", {"command": "place_design -unplace"})
+        await self.v("create_and_apply_pblock", {"pblock_ranges": pblock_ranges})
+        await self.v("place_design")
+        await self.v("route_design")
+        return await self.v("report_timing_summary")
+
+    async def run_fanout_flow(self, top_n_nets: int = 5) -> str:
+        """Execute the deterministic high-fanout recipe."""
+        for net_name, fanout, _ in self.high_fanout_nets[:top_n_nets]:
+            split_factor = max(3, min(8, fanout // 100))
+            await self.rw(
+                "optimize_fanout",
+                {
+                    "net_name": net_name,
+                    "split_factor": split_factor,
+                },
+            )
+
+        temp_dcp = str(Path(self.temp_dir) / "fanout_opt.dcp")
+        await self.rw(
+            "write_checkpoint",
+            {
+                "dcp_path": temp_dcp,
+                "overwrite": True,
+            },
+        )
+
+        await self.v("open_checkpoint", {"dcp_path": temp_dcp})
+        await self.v("route_design")
+        return await self.v("report_timing_summary")
+
+    async def run_phys_opt_flow(self, directive: str = "Default") -> str:
+        """Execute the deterministic Vivado phys_opt recipe."""
+        await self.v("phys_opt_design", {"directive": directive})
+        return await self.v("report_timing_summary")
+
+    def parse_utilization(self, report: str) -> dict:
+        """Extract LUT and FF counts from the pblock utilization report."""
+        lut = None
+        ff = None
+        in_base_section = False
+
+        for line in report.splitlines():
+            line = line.strip()
+            if "Design Resource Utilization" in line:
+                in_base_section = True
+                continue
+            if "1.5x Multiplier" in line:
+                break
+            if not in_base_section:
+                continue
+
+            if line.startswith("LUTs:"):
+                match = re.search(r"([\d,]+)", line)
+                if match:
+                    lut = int(match.group(1).replace(",", ""))
+            elif line.startswith("FFs:"):
+                match = re.search(r"([\d,]+)", line)
+                if match:
+                    ff = int(match.group(1).replace(",", ""))
+
+        if lut is None or ff is None:
+            raise ValueError(f"Could not parse utilization:\n{report[:500]}")
+
+        return {"lut": lut, "ff": ff}
+
+    async def _execute_strategy(self, strategy: str, args: dict) -> tuple[str, Optional[float]]:
+        """Run a chosen recipe and return the timing report plus measured WNS."""
+        if strategy == "PBLOCK":
+            result = await self.run_pblock_flow()
+        elif strategy == "FANOUT":
+            result = await self.run_fanout_flow(**args)
+        else:
+            result = await self.run_phys_opt_flow(**args)
+
+        current_wns = await self._measure_current_wns(result)
+        return result, current_wns
+
+    def _build_decision_input(
+        self,
+        analysis_summary: str,
+        stagnation: int,
+        recent_history: list[dict],
+        branch_context: str = "",
+        tried_summaries: str = "",
+    ) -> dict:
+        """Assemble the planner input for one recipe-selection decision."""
+        return {
+            "analysis": analysis_summary,
+            "history": recent_history,
+            "best_wns": self.best_wns,
+            "stagnation": stagnation,
+            "branch_context": branch_context,
+            "recent_candidates": tried_summaries,
+            "search_settings": asdict(self.generation_config),
+            "available_strategies": {
+                "PBLOCK": {},
+                "FANOUT": {"top_n_nets": "int (1-10)"},
+                "PHYS_OPT": {"directive": ["Explore", "AggressiveExplore", "Default"]},
+            },
+        }
+
+    def _is_wns_improvement(self, new_wns: Optional[float], old_wns: Optional[float]) -> bool:
+        """Return True if new_wns beats old_wns by the configured threshold."""
+        if new_wns is None:
+            return False
+        if old_wns is None:
+            return True
+        return new_wns > old_wns + self.generation_config.min_wns_delta
+
+    async def _measure_current_wns(self, timing_report: Optional[str] = None) -> Optional[float]:
+        """Measure current Vivado WNS and update the global best scalar."""
+        wns = await super().get_wns_for_target_clock(self._call_vivado_tool)
+        if wns is None:
+            report = timing_report
+            if report is None:
+                report = await self.v("report_timing_summary")
+            timing_info = parse_timing_summary_static(report)
+            wns = timing_info["wns"]
+
+        if wns is not None and wns > self.best_wns:
+            self.best_wns = wns
+        return wns
+
+    async def _save_vivado_checkpoint(self, dcp_path: Path) -> bool:
+        """Save the currently-open Vivado design as a branch checkpoint."""
+        result = await self.v(
+            "write_checkpoint",
+            {
+                "dcp_path": str(dcp_path.resolve()),
+                "force": True,
+                "timeout": 900,
+            },
+        )
+        if "error" in result.lower() and "wrote checkpoint" not in result.lower():
+            logger.warning("Failed to save branch checkpoint %s: %s", dcp_path, result[:500])
+            return False
+        return dcp_path.exists()
+
+    async def _restore_candidate_state(self, candidate: SearchCandidate) -> None:
+        """Restore a candidate checkpoint into Vivado and RapidWright."""
+        print(f"\n[SEARCH] Restoring candidate {candidate.candidate_id} (WNS: {self._format_wns(candidate.wns)})")
+        result = await self.v(
+            "open_checkpoint",
+            {
+                "dcp_path": str(candidate.dcp_path.resolve()),
+                "timeout": 900,
+            },
+        )
+        if "error" in result.lower():
+            raise RuntimeError(f"Could not restore Vivado checkpoint {candidate.dcp_path}: {result}")
+
+        result = await self.rw("read_checkpoint", {"dcp_path": str(candidate.dcp_path.resolve())})
+        if "error" in result.lower() and "success" not in result.lower():
+            logger.warning(
+                "RapidWright could not load restored candidate %s. Vivado-only branches can still continue. Result: %s",
+                candidate.candidate_id,
+                result[:500],
+            )
+
+    def _format_wns(self, wns: Optional[float]) -> str:
+        """Format WNS for logs."""
+        return f"{wns:.3f} ns" if wns is not None else "unknown"
+
+    def _candidate_sort_key(self, candidate: SearchCandidate) -> tuple[float, float]:
+        """Score candidates for beam pruning. Current leaf score is primary."""
+        current = candidate.wns if candidate.wns is not None else float("-inf")
+        peak = candidate.peak_wns if candidate.peak_wns is not None else float("-inf")
+        return current, peak
+
+    async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
+        """Run the optimization workflow."""
         self.start_time = time.time()
 
-        analysis = await self.perform_initial_analysis(input_dcp)
+        try:
+            initial_analysis = await self.perform_initial_analysis(input_dcp)
+        except Exception as exc:
+            logger.exception("Initial analysis failed: %s", exc)
+            print(f"\n✗ Initial analysis failed: {exc}\n")
+            self.end_time = time.time()
+            return False
 
-        if self.initial_wns >= 0:
-            await self.v("write_checkpoint", {
-                "dcp_path": str(output_dcp),
-                "force": True
-            })
+        if self.initial_wns is not None and self.initial_wns >= 0:
+            print("✓ Design already meets timing! No optimization needed.\n")
+            await self.v(
+                "write_checkpoint",
+                {
+                    "dcp_path": str(output_dcp.resolve()),
+                    "force": True,
+                },
+            )
+            print(f"Saved design to: {output_dcp}\n")
+
+            self.end_time = time.time()
+            total_runtime = self.end_time - self.start_time
+
+            print("\n=== No Optimization Required ===")
+            initial_fmax = self.calculate_fmax(self.initial_wns, self.clock_period)
+            if initial_fmax is not None:
+                print(f"Design already meets timing - Fmax: {initial_fmax:.2f} MHz (WNS: {self.initial_wns:.3f} ns)")
+            else:
+                print(f"Design already meets timing (WNS: {self.initial_wns:.3f} ns)")
+            print(f"Total runtime: {total_runtime:.2f} seconds ({total_runtime / 60:.2f} minutes)")
+            print("LLM API calls: 0 (analysis performed without LLM)")
+            print("Estimated cost: $0.00")
+            print("=" * 70 + "\n")
             return True
+
+        if self.generation_config.enabled:
+            return await self._optimize_generational(input_dcp, output_dcp, initial_analysis)
+        return await self._optimize_linear(input_dcp, output_dcp, initial_analysis)
+
+    async def _optimize_linear(self, input_dcp: Path, output_dcp: Path, initial_analysis: str) -> bool:
+        """Run the recipe-driven linear optimization workflow."""
+        print("=== Starting LLM-Driven Optimization ===\n")
 
         best_wns = self.initial_wns
         stagnation = 0
         best_dcp_path = Path(self.temp_dir) / "best_iter.dcp"
         last_best_iteration = 0
 
-        await self.v("write_checkpoint", {
-            "dcp_path": str(best_dcp_path),
-            "force": True
-        })
+        await self.v(
+            "write_checkpoint",
+            {
+                "dcp_path": str(best_dcp_path),
+                "force": True,
+            },
+        )
 
-        for i in range(50):
+        max_iterations = self.generation_config.max_llm_calls
+
+        for index in range(max_iterations):
             self.iteration += 1
+            print(f"\n=== Iteration {index + 1} ===")
 
-            print(f"\n=== Iteration {i+1} ===")
-
-            if best_dcp_path.exists() and last_best_iteration != i:
+            if best_dcp_path.exists() and last_best_iteration != index:
                 await self.v("open_checkpoint", {"dcp_path": str(best_dcp_path)})
                 await self.rw("read_checkpoint", {"dcp_path": str(best_dcp_path)})
 
-            # --- LLM ONLY DECIDES ---
-            action = await self.choose_action_llm(analysis, stagnation)
-
+            decision_input = self._build_decision_input(
+                initial_analysis,
+                stagnation,
+                self.history[-5:],
+            )
+            action = await self.choose_action_llm(decision_input)
             strategy, args = self.sanitize_action(action)
-
             print(f"Chosen: {strategy} with args {args}")
 
-            # --- DETERMINISTIC EXECUTION ---
-            if strategy == "PBLOCK":
-                result = await self.run_pblock_flow()
+            _, current_wns = await self._execute_strategy(strategy, args)
+            delta = current_wns - best_wns if (current_wns is not None and best_wns is not None) else None
+            self.history.append(
+                {
+                    "iteration": index + 1,
+                    "strategy": strategy,
+                    "args": args,
+                    "wns": current_wns,
+                    "delta_wns": delta,
+                    "stagnation_count": stagnation,
+                }
+            )
 
-            elif strategy == "FANOUT":
-                result = await self.run_fanout_flow(**args)
+            print(f"WNS: {self._format_wns(current_wns)}")
 
-            elif strategy == "PHYS_OPT":
-                result = await self.run_phys_opt_flow(**args)
-
-            # --- Evaluate ---
-            timing = parse_timing_summary_static(result)
-            current_wns = timing["wns"]
-
-            self.history.append({
-                "iteration": i + 1,
-                "strategy": strategy,
-                "wns": current_wns,
-                "delta_wns": current_wns - best_wns if best_wns is not None else None,
-                "stagnation_count": stagnation
-            })
-
-            print(f"WNS: {current_wns:.3f} ns")
-
-            if current_wns > best_wns:
+            if self._is_wns_improvement(current_wns, best_wns):
                 best_wns = current_wns
                 stagnation = 0
-                await self.v("write_checkpoint", {
-                    "dcp_path": str(best_dcp_path),
-                    "force": True
-                })
-                last_best_iteration = i + 1
+                await self.v(
+                    "write_checkpoint",
+                    {
+                        "dcp_path": str(best_dcp_path),
+                        "force": True,
+                    },
+                )
+                last_best_iteration = index + 1
             else:
                 stagnation += 1
 
-            # --- Stop conditions ---
-            if best_wns >= 0:
+            if best_wns is not None and best_wns >= 0:
                 print("Timing met.")
                 break
 
-            if stagnation >= 3:
+            if stagnation >= self.generation_config.max_steps_without_improvement:
                 print("No improvement. Stopping.")
                 break
 
-        # Save best result
-        await self.v("write_checkpoint", {
-            "dcp_path": str(output_dcp),
-            "force": True
-        })
+        if best_dcp_path.exists():
+            shutil.copy2(best_dcp_path, output_dcp)
+        else:
+            await self.v(
+                "write_checkpoint",
+                {
+                    "dcp_path": str(output_dcp.resolve()),
+                    "force": True,
+                },
+            )
 
         self.end_time = time.time()
         self._print_optimization_summary(max_iterations_reached=False)
         return True
 
+    async def _optimize_generational(self, input_dcp: Path, output_dcp: Path, initial_analysis: str) -> bool:
+        """Run branch-and-generation search over recipe choices."""
+        cfg = self.generation_config
+        search_dir = self.run_dir / "generation_search"
+        search_dir.mkdir(parents=True, exist_ok=True)
+
+        print("=== Starting Generation Search Optimization ===")
+        print(json.dumps(asdict(cfg), indent=2))
+
+        root_path = search_dir / "root.dcp"
+        if not await self._save_vivado_checkpoint(root_path):
+            raise RuntimeError(f"Could not save root checkpoint: {root_path}")
+
+        root = SearchCandidate(
+            candidate_id="root",
+            dcp_path=root_path,
+            wns=self.initial_wns,
+            peak_wns=self.initial_wns,
+            generation=0,
+            parent_id=None,
+            branch_index=0,
+            steps_taken=0,
+            steps_since_peak=0,
+            summary="Initial analyzed checkpoint",
+        )
+        self.search_candidates = [root]
+        self.best_candidate = root
+        active_candidates = [root]
+
+        for generation in range(1, cfg.max_generations + 1):
+            if self.llm_call_count >= cfg.max_llm_calls:
+                print(f"[SEARCH] Reached max LLM calls ({cfg.max_llm_calls}); stopping search.")
+                break
+
+            print(f"\n{'=' * 70}")
+            print(f"GENERATION {generation}/{cfg.max_generations}")
+            print(f"{'=' * 70}")
+
+            branch_results: list[SearchCandidate] = []
+            tried_summaries = "\n".join(
+                f"- {candidate.candidate_id}: WNS {self._format_wns(candidate.wns)}; {candidate.summary}"
+                for candidate in self.search_candidates[-12:]
+            )
+
+            for parent in active_candidates:
+                for branch_index in range(1, cfg.branch_factor + 1):
+                    if self.llm_call_count >= cfg.max_llm_calls:
+                        break
+
+                    candidate = await self._run_generation_branch(
+                        initial_analysis=initial_analysis,
+                        search_dir=search_dir,
+                        parent=parent,
+                        generation=generation,
+                        branch_index=branch_index,
+                        tried_summaries=tried_summaries,
+                    )
+                    if candidate is None:
+                        continue
+
+                    branch_results.append(candidate)
+
+                    if self._is_wns_improvement(candidate.wns, self.best_candidate.wns if self.best_candidate else None):
+                        self.best_candidate = candidate
+                        print(f"[SEARCH] New global best: {candidate.candidate_id} ({self._format_wns(candidate.wns)})")
+
+                    if cfg.stop_when_timing_met and candidate.wns is not None and candidate.wns >= 0:
+                        print("[SEARCH] Timing met; stopping search because stop_when_timing_met is enabled.")
+                        active_candidates = [candidate]
+                        branch_results = [candidate]
+                        break
+
+                if cfg.stop_when_timing_met and self.best_candidate and self.best_candidate.wns is not None and self.best_candidate.wns >= 0:
+                    break
+
+            if not branch_results:
+                print("[SEARCH] No viable branches produced this generation; stopping.")
+                break
+
+            expandable_results = [
+                candidate for candidate in branch_results if candidate.steps_since_peak < cfg.max_steps_without_improvement
+            ]
+            if not expandable_results:
+                print("[SEARCH] All branches reached patience from their peak; stopping.")
+                break
+
+            active_candidates = sorted(expandable_results, key=self._candidate_sort_key, reverse=True)[: cfg.beam_width]
+
+            print("\n[SEARCH] Beam for next generation:")
+            for candidate in active_candidates:
+                print(
+                    f"  - {candidate.candidate_id}: current {self._format_wns(candidate.wns)}, "
+                    f"peak {self._format_wns(candidate.peak_wns)}, "
+                    f"steps since peak {candidate.steps_since_peak}"
+                )
+
+            if cfg.stop_when_timing_met and self.best_candidate and self.best_candidate.wns is not None and self.best_candidate.wns >= 0:
+                break
+
+        if self.best_candidate is None:
+            self.end_time = time.time()
+            self._print_optimization_summary(max_iterations_reached=True)
+            return False
+
+        output_dcp.parent.mkdir(parents=True, exist_ok=True)
+        if self.best_candidate.dcp_path.resolve() != output_dcp.resolve():
+            shutil.copy2(self.best_candidate.dcp_path, output_dcp)
+        self.best_wns = self.best_candidate.wns if self.best_candidate.wns is not None else self.best_wns
+        self.end_time = time.time()
+
+        print(f"\n[SEARCH] Best candidate: {self.best_candidate.candidate_id}")
+        print(f"[SEARCH] Best WNS: {self._format_wns(self.best_candidate.wns)}")
+        print(f"[SEARCH] Copied best checkpoint to: {output_dcp}")
+
+        self._print_optimization_summary()
+        return True
+
+    async def _run_generation_branch(
+        self,
+        initial_analysis: str,
+        search_dir: Path,
+        parent: SearchCandidate,
+        generation: int,
+        branch_index: int,
+        tried_summaries: str,
+    ) -> Optional[SearchCandidate]:
+        """Expand one branch from a parent candidate across recipe decisions."""
+        cfg = self.generation_config
+        branch_id = f"g{generation:02d}_p{parent.candidate_id}_b{branch_index:02d}"
+        print(f"\n[SEARCH] Branch {branch_id} from {parent.candidate_id}")
+
+        try:
+            await self._restore_candidate_state(parent)
+        except Exception as exc:
+            logger.exception("Could not restore parent candidate %s", parent.candidate_id)
+            print(f"[SEARCH] Skipping branch {branch_id}: restore failed: {exc}")
+            return None
+
+        peak_wns = parent.peak_wns
+        current_wns = parent.wns
+        steps_since_peak = parent.steps_since_peak
+        latest_candidate = parent
+        branch_history: list[dict] = []
+
+        for step in range(1, cfg.max_steps_per_branch + 1):
+            if self.llm_call_count >= cfg.max_llm_calls:
+                break
+
+            self.iteration += 1
+            logger.info("=== Generation %s Branch %s Step %s ===", generation, branch_id, step)
+            print(f"\n[SEARCH] {branch_id} step {step}/{cfg.max_steps_per_branch}")
+
+            branch_context = (
+                f"Branch id: {branch_id}\n"
+                f"Parent candidate: {parent.candidate_id}\n"
+                f"Parent current WNS: {self._format_wns(parent.wns)}\n"
+                f"Parent peak WNS along this line: {self._format_wns(parent.peak_wns)}\n"
+                "Use one recipe decision for this step, then let the controller score it."
+            )
+            decision_input = self._build_decision_input(
+                initial_analysis,
+                steps_since_peak,
+                branch_history[-5:],
+                branch_context=branch_context,
+                tried_summaries=tried_summaries,
+            )
+
+            action = await self.choose_action_llm(decision_input)
+            strategy, args = self.sanitize_action(action)
+            print(f"[SEARCH] Chosen: {strategy} with args {args}")
+
+            try:
+                _, current_wns = await self._execute_strategy(strategy, args)
+            except Exception as exc:
+                logger.exception("Error during branch %s step %s", branch_id, step)
+                branch_history.append(
+                    {
+                        "step": step,
+                        "strategy": strategy,
+                        "args": args,
+                        "wns": None,
+                        "error": str(exc),
+                    }
+                )
+                steps_since_peak += 1
+                continue
+
+            branch_history.append(
+                {
+                    "step": step,
+                    "strategy": strategy,
+                    "args": args,
+                    "wns": current_wns,
+                    "delta_vs_parent": (
+                        current_wns - parent.wns if current_wns is not None and parent.wns is not None else None
+                    ),
+                }
+            )
+
+            checkpoint_path = search_dir / f"{branch_id}_step{step:02d}.dcp"
+            saved = await self._save_vivado_checkpoint(checkpoint_path)
+            if not saved:
+                print(f"[SEARCH] Branch {branch_id} step {step}: checkpoint save failed; stopping branch.")
+                break
+
+            if self._is_wns_improvement(current_wns, peak_wns):
+                peak_wns = current_wns
+                steps_since_peak = 0
+            else:
+                steps_since_peak += 1
+
+            latest_candidate = SearchCandidate(
+                candidate_id=f"{branch_id}_s{step:02d}",
+                dcp_path=checkpoint_path,
+                wns=current_wns,
+                peak_wns=peak_wns,
+                generation=generation,
+                parent_id=parent.candidate_id,
+                branch_index=branch_index,
+                steps_taken=step,
+                steps_since_peak=steps_since_peak,
+                summary=f"{strategy} {args}",
+            )
+            self.search_candidates.append(latest_candidate)
+
+            print(
+                f"[SEARCH] {latest_candidate.candidate_id}: current {self._format_wns(current_wns)}, "
+                f"peak {self._format_wns(peak_wns)}, steps since peak {steps_since_peak}"
+            )
+
+            if self._is_wns_improvement(current_wns, self.best_candidate.wns if self.best_candidate else None):
+                self.best_candidate = latest_candidate
+                print(f"[SEARCH] New global best inside branch: {latest_candidate.candidate_id}")
+
+            if cfg.stop_when_timing_met and current_wns is not None and current_wns >= 0:
+                break
+
+            if steps_since_peak >= cfg.max_steps_without_improvement:
+                print(
+                    f"[SEARCH] Stopping {branch_id}: no improvement over branch peak for "
+                    f"{steps_since_peak} step(s)."
+                )
+                break
+
+        return latest_candidate if latest_candidate is not parent else None
+
     def save_token_usage_report(self, output_path: Path):
+        """Save detailed token usage report to JSON."""
         total_cached = sum(detail.get("cached_tokens", 0) for detail in self.api_call_details)
         total_reasoning = sum(detail.get("reasoning_tokens", 0) for detail in self.api_call_details)
         total_tool_time = sum(detail["elapsed_time"] for detail in self.tool_call_details)
-        tool_counts = {}
+
+        tool_counts: dict[str, int] = {}
         for detail in self.tool_call_details:
             tool_name = detail["tool_name"]
-            if tool_name not in tool_counts:
-                tool_counts[tool_name] = 0
-            tool_counts[tool_name] += 1
+            tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
 
         total_runtime = None
         if self.start_time is not None:
@@ -589,6 +1008,25 @@ class DCPOptimizer(DCPOptimizerBase):
         report = {
             "model": self.model,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "generation_search": {
+                "config": asdict(self.generation_config),
+                "best_candidate_id": self.best_candidate.candidate_id if self.best_candidate else None,
+                "candidates": [
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "dcp_path": str(candidate.dcp_path),
+                        "wns": candidate.wns,
+                        "peak_wns": candidate.peak_wns,
+                        "generation": candidate.generation,
+                        "parent_id": candidate.parent_id,
+                        "branch_index": candidate.branch_index,
+                        "steps_taken": candidate.steps_taken,
+                        "steps_since_peak": candidate.steps_since_peak,
+                        "summary": candidate.summary,
+                    }
+                    for candidate in self.search_candidates
+                ],
+            },
             "summary": {
                 "total_runtime_seconds": total_runtime,
                 "total_llm_calls": self.llm_call_count,
@@ -614,32 +1052,45 @@ class DCPOptimizer(DCPOptimizerBase):
             "per_tool_call_details": self.tool_call_details,
         }
 
-        with open(output_path, "w") as f:
-            json.dump(report, f, indent=2)
+        with output_path.open("w") as handle:
+            json.dump(report, handle, indent=2)
 
-        logger.info(f"Token usage report saved to {output_path}")
+        logger.info("Token usage report saved to %s", output_path)
 
     def _print_optimization_summary(self, max_iterations_reached: bool = False):
+        """Print a detailed optimization summary including token usage."""
         title = "Optimization Summary (Max Iterations Reached)" if max_iterations_reached else "Optimization Summary"
         print(f"\n{'=' * 70}")
-        print(f"{title}")
+        print(title)
         print(f"{'=' * 70}")
 
         if self.start_time is not None:
             total_runtime = (self.end_time or time.time()) - self.start_time
-            print(f"\nTOTAL RUNTIME: {total_runtime:.2f} seconds ({total_runtime/60:.2f} minutes)")
+            print(f"\nTOTAL RUNTIME: {total_runtime:.2f} seconds ({total_runtime / 60:.2f} minutes)")
 
         best_wns = self.best_wns if self.best_wns > float("-inf") else None
         result_lines = self._format_fmax_results(self.clock_period, self.initial_wns, best_wns, result_label="Best")
         if result_lines:
-            print(f"\nFMAX RESULTS:")
+            print("\nFMAX RESULTS:")
             print("\n".join(result_lines))
 
-        print(f"\nITERATION STATS:")
+        print("\nITERATION STATS:")
         print(f"  Total iterations:    {self.iteration}")
         print(f"  LLM API calls:       {self.llm_call_count}")
 
-        print(f"\nTOKEN USAGE:")
+        if self.generation_config.enabled:
+            print("\nGENERATION SEARCH:")
+            print(f"  Branches/parent:     {self.generation_config.branch_factor}")
+            print(f"  Beam width:          {self.generation_config.beam_width}")
+            print(f"  Max generations:     {self.generation_config.max_generations}")
+            print(f"  Steps/branch:        {self.generation_config.max_steps_per_branch}")
+            print(f"  Patience from peak:  {self.generation_config.max_steps_without_improvement}")
+            print(f"  Candidates saved:    {len(self.search_candidates)}")
+            if self.best_candidate:
+                print(f"  Best candidate:      {self.best_candidate.candidate_id}")
+                print(f"  Best checkpoint:     {self.best_candidate.dcp_path}")
+
+        print("\nTOKEN USAGE:")
         print(f"  Prompt tokens:       {self.total_prompt_tokens:,}")
         print(f"  Completion tokens:   {self.total_completion_tokens:,}")
         print(f"  Total tokens:        {self.total_tokens:,}")
@@ -652,34 +1103,32 @@ class DCPOptimizer(DCPOptimizerBase):
         if total_reasoning > 0:
             print(f"  Reasoning tokens:    {total_reasoning:,}")
 
-        print(f"\nCOST:")
+        print("\nCOST:")
         print(f"  Model:               {self.model}")
         if self.total_cost > 0:
             print(f"  Total cost:          ${self.total_cost:.4f}")
         else:
-            print(f"  Total cost:          Not available")
+            print("  Total cost:          Not available")
 
         if self.tool_call_details:
-            print(f"\nTOOL CALLS SUMMARY:")
+            print("\nTOOL CALLS SUMMARY:")
             print(f"  Total tool calls:    {len(self.tool_call_details)}")
             total_tool_time = sum(detail["elapsed_time"] for detail in self.tool_call_details)
             print(f"  Total tool time:     {total_tool_time:.2f}s")
 
-            tool_counts = {}
+            tool_counts: dict[str, int] = {}
             for detail in self.tool_call_details:
                 tool_name = detail["tool_name"]
-                if tool_name not in tool_counts:
-                    tool_counts[tool_name] = 0
-                tool_counts[tool_name] += 1
+                tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
 
-            print(f"\n  Tool call breakdown:")
-            for tool_name, count in sorted(tool_counts.items(), key=lambda x: -x[1]):
+            print("\n  Tool call breakdown:")
+            for tool_name, count in sorted(tool_counts.items(), key=lambda item: -item[1]):
                 print(f"    {tool_name}: {count}")
 
-            print(f"\n  Detailed tool call log:")
+            print("\n  Detailed tool call log:")
             print(f"  {'#':<5} {'Iter':<6} {'Tool':<40} {'Time (s)':<12} {'WNS (ns)':<12} {'Status':<10}")
-            print(f"  {'-'*5} {'-'*6} {'-'*40} {'-'*12} {'-'*12} {'-'*10}")
-            for i, detail in enumerate(self.tool_call_details, 1):
+            print(f"  {'-' * 5} {'-' * 6} {'-' * 40} {'-' * 12} {'-' * 12} {'-' * 10}")
+            for index, detail in enumerate(self.tool_call_details, start=1):
                 tool_name = detail["tool_name"]
                 iteration = detail.get("iteration", 0)
                 elapsed = detail["elapsed_time"]
@@ -687,12 +1136,12 @@ class DCPOptimizer(DCPOptimizerBase):
                 error = detail.get("error", False)
                 wns_str = f"{wns:.3f}" if wns is not None else "-"
                 status_str = "ERROR" if error else "OK"
-                print(f"  {i:<5} {iteration:<6} {tool_name:<40} {elapsed:<12.2f} {wns_str:<12} {status_str:<10}")
+                print(f"  {index:<5} {iteration:<6} {tool_name:<40} {elapsed:<12.2f} {wns_str:<12} {status_str:<10}")
                 if error and "error_message" in detail:
                     print(f"        Error: {detail['error_message'][:80]}")
 
         if self.debug and self.api_call_details:
-            print(f"\nPER-CALL BREAKDOWN:")
+            print("\nPER-CALL BREAKDOWN:")
             has_cached = any(detail.get("cached_tokens", 0) > 0 for detail in self.api_call_details)
             has_reasoning = any(detail.get("reasoning_tokens", 0) > 0 for detail in self.api_call_details)
             has_cost = any(detail.get("cost", 0) > 0 for detail in self.api_call_details)
@@ -707,237 +1156,33 @@ class DCPOptimizer(DCPOptimizerBase):
                 header += f" {'Cost':<12}"
             print(header)
 
-            separator = f"  {'-'*6} {'-'*6} {'-'*10} {'-'*12}"
+            separator = f"  {'-' * 6} {'-' * 6} {'-' * 10} {'-' * 12}"
             if has_cached:
-                separator += f" {'-'*10}"
+                separator += f" {'-' * 10}"
             if has_reasoning:
-                separator += f" {'-'*10}"
-            separator += f" {'-'*10}"
+                separator += f" {'-' * 10}"
+            separator += f" {'-' * 10}"
             if has_cost:
-                separator += f" {'-'*12}"
+                separator += f" {'-' * 12}"
             print(separator)
 
             for detail in self.api_call_details:
-                line = (f"  {detail['call_number']:<6} {detail['iteration']:<6} "
-                        f"{detail['prompt_tokens']:<10,} {detail['completion_tokens']:<12,}")
+                line = f"  {detail['call_number']:<6} {detail['iteration']:<6} {detail['prompt_tokens']:<10,} {detail['completion_tokens']:<12,}"
                 if has_cached:
                     line += f" {detail.get('cached_tokens', 0):<10,}"
                 if has_reasoning:
                     line += f" {detail.get('reasoning_tokens', 0):<10,}"
                 line += f" {detail['total_tokens']:<10,}"
                 if has_cost:
-                    cost = detail.get('cost', 0)
+                    cost = detail.get("cost", 0)
                     line += f" ${cost:<11.4f}" if cost > 0 else f" {'N/A':<12}"
                 print(line)
 
-        print(f"\n{'='*70}\n")
+        print(f"\n{'=' * 70}\n")
 
         try:
             report_path = self.run_dir / "token_usage.json"
             self.save_token_usage_report(report_path)
             print(f"Detailed token usage report saved to: {report_path}\n")
-        except Exception as e:
-            logger.warning(f"Failed to save token usage report: {e}")
-    
-
-    async def v(self, name, args={}):
-        return await self.call_tool(f"vivado_{name}", args)
-
-    async def rw(self, name, args={}):
-        return await self.call_tool(f"rapidwright_{name}", args)
-    
-    async def run_pblock_flow(self):
-        # 1. Get utilization
-        util_report = await self.v("report_utilization_for_pblock")
-
-        util = self.parse_utilization(util_report)
-
-        targets = {
-            "target_lut_count": int(util["lut"] * 1.5),
-            "target_ff_count": int(util["ff"] * 1.5),
-        }
-
-        # 2. Analyze fabric
-        fabric = await self.rw("analyze_fabric_for_pblock", targets)
-
-        fabric_data = json.loads(fabric)
-
-        if "recommended_region" not in fabric_data:
-            raise ValueError(f"No recommended_region in response: {fabric_data}")
-
-        # 3. Convert to pblock
-        region = fabric_data["recommended_region"]
-
-        pblock = await self.rw("convert_fabric_region_to_pblock", {
-            "col_min": region["col_min"],
-            "col_max": region["col_max"],
-            "row_min": region["row_min"],
-            "row_max": region["row_max"],
-            "use_clock_regions": False
-        })
-
-        pblock_ranges = json.loads(pblock)["pblock_ranges"]
-
-        # 4. Apply flow
-        await self.v("run_tcl", {"command": "place_design -unplace"})
-        await self.v("create_and_apply_pblock", {"pblock_ranges": pblock_ranges})
-        await self.v("place_design")
-        await self.v("route_design")
-
-        # 5. Measure
-        return await self.v("report_timing_summary")
-
-    async def run_fanout_flow(self, top_n_nets=5):
-        for net_name, fanout, _ in self.high_fanout_nets[:top_n_nets]:
-            split_factor = max(3, min(8, fanout // 100))
-
-            await self.rw("optimize_fanout", {
-                "net_name": net_name,
-                "split_factor": split_factor
-            })
-
-        temp_dcp = str(Path(self.temp_dir) / "fanout_opt.dcp")
-
-        await self.rw("write_checkpoint", {
-            "dcp_path": temp_dcp,
-            "overwrite": True
-        })
-
-        await self.v("open_checkpoint", {"dcp_path": temp_dcp})
-        await self.v("route_design")
-
-        return await self.v("report_timing_summary")
-
-    async def run_phys_opt_flow(self, directive="Default"):
-        await self.v("phys_opt_design", {
-            "directive": directive
-        })
-
-        return await self.v("report_timing_summary")
-    
-    async def choose_action_llm(self, analysis_summary: str, stagnation: int):
-        recent_history = self.history[-5:]
-
-        decision_input = {
-            "analysis": analysis_summary,
-            "history": recent_history,
-            "best_wns": self.best_wns,
-            "stagnation": stagnation,
-            "available_strategies": {
-                "PBLOCK": {},
-                "FANOUT": {
-                    "top_n_nets": "int (1-10)"
-                },
-                "PHYS_OPT": {
-                    "directive": ["Explore", "AggressiveExplore", "Default"]
-                }
-            }
-        }
-
-        prompt = """
-You are an FPGA optimization planner.
-
-Choose the next optimization action.
-
-Return JSON:
-{
-"strategy": "PBLOCK | FANOUT | PHYS_OPT",
-"args": { ... }
-}
-
-Rules:
-- Avoid repeating strategies that did not improve WNS
-- If stagnation >= 2, switch strategy
-- FANOUT: choose top_n_nets (1-10)
-- PHYS_OPT: choose directive
-- PBLOCK: args can be empty
-
-Return ONLY JSON.
-"""
-
-        response = self.openai.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": json.dumps(decision_input)}
-            ],
-            max_tokens=100,
-        )
-
-        self.llm_call_count += 1
-        
-        usage = getattr(response, "usage", None)
-        if usage:
-            self.total_prompt_tokens += getattr(usage, "prompt_tokens", 0)
-            self.total_completion_tokens += getattr(usage, "completion_tokens", 0)
-            self.total_tokens += getattr(usage, "total_tokens", 0)
-            
-            call_cost = 0.0
-            if hasattr(response.usage, "cost") and response.usage.cost is not None:
-                call_cost = float(response.usage.cost)
-                self.total_cost += call_cost
-            else:
-                logger.warning("OpenRouter did not provide cost information")
-
-        content = response.choices[0].message.content.strip()
-
-        try:
-            return json.loads(content)
-        except Exception:
-            return {"strategy": "PHYS_OPT", "args": {"directive": "Default"}}
-
-    def sanitize_action(self, action):
-        strategy = action.get("strategy", "PHYS_OPT")
-        args = action.get("args", {})
-
-        if strategy == "FANOUT":
-            top_n = int(args.get("top_n_nets", 5))
-            top_n = max(1, min(10, top_n))
-            return strategy, {"top_n_nets": top_n}
-
-        elif strategy == "PHYS_OPT":
-            directive = args.get("directive", "Default")
-            if directive not in ["Explore", "AggressiveExplore", "Default"]:
-                directive = "Default"
-            return strategy, {"directive": directive}
-
-        elif strategy == "PBLOCK":
-            return strategy, {}
-
-        return "PHYS_OPT", {"directive": "Default"}
-
-    def parse_utilization(self, report: str) -> dict:
-        lut = None
-        ff = None
-        in_base_section = False
-
-        for line in report.splitlines():
-            line = line.strip()
-
-            if "Design Resource Utilization" in line:
-                in_base_section = True
-                continue
-
-            if "1.5x Multiplier" in line:
-                break  # stop before scaled values
-
-            if not in_base_section:
-                continue
-
-            if line.startswith("LUTs:"):
-                match = re.search(r"([\d,]+)", line)
-                if match:
-                    lut = int(match.group(1).replace(",", ""))
-
-            elif line.startswith("FFs:"):
-                match = re.search(r"([\d,]+)", line)
-                if match:
-                    ff = int(match.group(1).replace(",", ""))
-
-        if lut is None or ff is None:
-            raise ValueError(f"Could not parse utilization:\n{report[:500]}")
-
-        return {
-            "lut": lut,
-            "ff": ff
-        }
+        except Exception as exc:
+            logger.warning("Failed to save token usage report: %s", exc)
