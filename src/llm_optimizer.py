@@ -61,6 +61,49 @@ class DCPOptimizer(DCPOptimizerBase):
 
         self.history: list[dict] = []
 
+    def _extract_llm_text(self, response) -> str:
+        """Best-effort extraction of text content from a chat completion response."""
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            logger.warning("LLM response had no choices")
+            return ""
+
+        message = getattr(choices[0], "message", None)
+        if message is None:
+            logger.warning("LLM response choice had no message")
+            return ""
+
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text" and part.get("text"):
+                        text_parts.append(part["text"])
+                else:
+                    part_type = getattr(part, "type", None)
+                    part_text = getattr(part, "text", None)
+                    if part_type == "text" and part_text:
+                        text_parts.append(part_text)
+            if text_parts:
+                return "\n".join(text_parts).strip()
+
+        refusal = getattr(message, "refusal", None)
+        if refusal:
+            logger.warning("LLM response returned refusal text instead of content: %s", refusal)
+            return str(refusal).strip()
+
+        finish_reason = getattr(choices[0], "finish_reason", None)
+        logger.warning(
+            "LLM response had empty content (finish_reason=%s, content_type=%s)",
+            finish_reason,
+            type(content).__name__ if content is not None else "None",
+        )
+        return ""
+
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Execute a tool call on the appropriate MCP server."""
         if tool_name.startswith("rapidwright_"):
@@ -374,7 +417,11 @@ Return ONLY JSON.
                 f"(Prompt: {prompt_tokens:,}, Completion: {completion_tokens:,}{cache_info}{reasoning_info}){cost_info}"
             )
 
-        content = response.choices[0].message.content.strip()
+        content = self._extract_llm_text(response)
+        if not content:
+            logger.warning("Planner returned no text, falling back to PHYS_OPT")
+            return {"strategy": "PHYS_OPT", "args": {"directive": "Default"}}
+
         try:
             return json.loads(content)
         except Exception:
