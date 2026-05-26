@@ -76,6 +76,27 @@ Examples:
         default=5,
         help="Maximum number of high fanout nets to optimize in test mode (default: 5)",
     )
+    force_group = parser.add_mutually_exclusive_group()
+    force_group.add_argument(
+        "--force-pblock",
+        action="store_true",
+        help="Force the PBLOCK recipe every iteration",
+    )
+    force_group.add_argument(
+        "--force-fanout",
+        action="store_true",
+        help="Force the FANOUT recipe every iteration",
+    )
+    force_group.add_argument(
+        "--force-cell-relocate",
+        action="store_true",
+        help="Force the detour-aware CELL_RELOCATE recipe every iteration",
+    )
+    force_group.add_argument(
+        "--force-phys-opt",
+        action="store_true",
+        help="Force the PHYS_OPT recipe every iteration",
+    )
 
     args = parser.parse_args()
 
@@ -124,6 +145,16 @@ Examples:
         print("Error: openai package not installed. Run: pip install openai", file=sys.stderr)
         sys.exit(1)
 
+    force_strategy = None
+    if args.force_pblock:
+        force_strategy = "PBLOCK"
+    elif args.force_fanout:
+        force_strategy = "FANOUT"
+    elif args.force_cell_relocate:
+        force_strategy = "CELL_RELOCATE"
+    elif args.force_phys_opt:
+        force_strategy = "PHYS_OPT"
+
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
 
@@ -133,6 +164,8 @@ Examples:
     print(f"Output:      {args.output_dcp.resolve()}")
     print(f"Run dir:     {run_dir}")
     print(f"Model:       {args.model}")
+    if force_strategy:
+        print(f"Forced recipe: {force_strategy}")
     print()
 
     optimizer = DCPOptimizer(
@@ -140,6 +173,7 @@ Examples:
         model=args.model,
         debug=args.debug,
         run_dir=run_dir,
+        force_strategy=force_strategy,
     )
 
     try:
