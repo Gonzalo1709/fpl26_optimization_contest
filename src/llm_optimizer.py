@@ -15,7 +15,7 @@ from src.parsers import load_system_prompt, parse_timing_summary_static
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "x-ai/grok-4.1-fast"
+DEFAULT_MODEL = "x-ai/grok-4.3"
 
 
 class DCPOptimizer(DCPOptimizerBase):
@@ -27,11 +27,13 @@ class DCPOptimizer(DCPOptimizerBase):
         model: str = DEFAULT_MODEL,
         debug: bool = False,
         run_dir: Optional[Path] = None,
+        force_strategy: Optional[str] = None,
     ):
         super().__init__(debug=debug, run_dir=run_dir)
 
         self.api_key = api_key
         self.model = model
+        self.force_strategy = force_strategy
         self.tools: list[dict] = []
         self.messages: list[dict] = []
 
@@ -495,10 +497,13 @@ class DCPOptimizer(DCPOptimizerBase):
 
             print(f"\n=== Iteration {i+1} ===")
 
-            # --- LLM ONLY DECIDES ---
-            action = await self.choose_action_llm(analysis, stagnation)
-
-            strategy, args = self.sanitize_action(action)
+            if self.force_strategy:
+                strategy, args = self.sanitize_action({"strategy": self.force_strategy, "args": {}})
+                print(f"Forced strategy: {strategy}")
+            else:
+                # --- LLM ONLY DECIDES ---
+                action = await self.choose_action_llm(analysis, stagnation)
+                strategy, args = self.sanitize_action(action)
 
             print(f"Chosen: {strategy} with args {args}")
 
@@ -508,6 +513,9 @@ class DCPOptimizer(DCPOptimizerBase):
 
             elif strategy == "FANOUT":
                 result = await self.run_fanout_flow(**args)
+
+            elif strategy == "CELL_RELOCATE":
+                result = await self.run_cell_relocation_flow(**args)
 
             elif strategy == "PHYS_OPT":
                 result = await self.run_phys_opt_flow(**args)
@@ -792,6 +800,82 @@ class DCPOptimizer(DCPOptimizerBase):
 
         return await self.v("report_timing_summary")
 
+    async def run_cell_relocation_flow(self, num_paths=10, detour_threshold=2.0, max_cells=3):
+        pins_file = Path(self.temp_dir) / f"critical_path_pins_iter_{self.iteration}.json"
+
+        await self.v("extract_critical_path_pins", {
+            "num_paths": num_paths,
+            "output_file": str(pins_file),
+        })
+
+        detour_report = await self.rw("analyze_net_detour", {
+            "input_file": str(pins_file),
+            "detour_threshold": detour_threshold,
+        })
+        detour_data = json.loads(detour_report)
+
+        if "error" in detour_data:
+            raise RuntimeError(f"analyze_net_detour failed: {detour_data['error']}")
+
+        candidates = detour_data.get("candidates", [])
+        if not candidates:
+            print("No detour-heavy critical cells found; measuring without relocation.")
+            return await self.v("report_timing_summary")
+
+        prioritized_candidates = sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.get("path", float("inf")),
+                -float(candidate.get("max_detour_ratio", 0.0)),
+            ),
+        )
+
+        prioritized_cells = []
+        seen_cells = set()
+        for candidate in prioritized_candidates:
+            cell_name = str(candidate.get("cell", "")).strip()
+            if not cell_name or cell_name in seen_cells:
+                continue
+            prioritized_cells.append(cell_name)
+            seen_cells.add(cell_name)
+            if len(prioritized_cells) >= max_cells:
+                break
+
+        if not prioritized_cells:
+            print("Detour analysis returned candidates, but no valid cells were selected.")
+            return await self.v("report_timing_summary")
+
+        print(
+            "Relocating detour-heavy cells: "
+            + ", ".join(prioritized_cells)
+        )
+
+        relocation_report = await self.rw("optimize_cell_placement", {
+            "cell_names": prioritized_cells,
+            "max_candidates": max_cells,
+        })
+        relocation_data = json.loads(relocation_report)
+
+        if "error" in relocation_data:
+            raise RuntimeError(f"optimize_cell_placement failed: {relocation_data['error']}")
+
+        for cell_result in relocation_data.get("results", []):
+            print(
+                f"  {cell_result.get('cell')}: "
+                f"{cell_result.get('status')} - {cell_result.get('message')}"
+            )
+
+        temp_dcp = str(Path(self.temp_dir) / f"cell_relocate_iter_{self.iteration}.dcp")
+
+        await self.rw("write_checkpoint", {
+            "dcp_path": temp_dcp,
+        })
+
+        await self.v("open_checkpoint", {"dcp_path": temp_dcp})
+        await self.v("route_design")
+
+        return await self.v("report_timing_summary")
+
     async def run_phys_opt_flow(self, directive="Default"):
         await self.v("phys_opt_design", {
             "directive": directive
@@ -812,6 +896,11 @@ class DCPOptimizer(DCPOptimizerBase):
                 "FANOUT": {
                     "top_n_nets": "int (1-10)"
                 },
+                "CELL_RELOCATE": {
+                    "num_paths": "int (3-20)",
+                    "detour_threshold": "float (1.2-4.0)",
+                    "max_cells": "int (1-5)"
+                },
                 "PHYS_OPT": {
                     "directive": ["Explore", "AggressiveExplore", "Default"]
                 }
@@ -825,7 +914,7 @@ Choose the next optimization action.
 
 Return JSON:
 {
-"strategy": "PBLOCK | FANOUT | PHYS_OPT",
+"strategy": "PBLOCK | FANOUT | CELL_RELOCATE | PHYS_OPT",
 "args": { ... }
 }
 
@@ -833,6 +922,7 @@ Rules:
 - Avoid repeating strategies that did not improve WNS
 - If stagnation >= 2, switch strategy
 - FANOUT: choose top_n_nets (1-10)
+- CELL_RELOCATE: use for detour-heavy critical paths; choose num_paths, detour_threshold, and max_cells
 - PHYS_OPT: choose directive
 - PBLOCK: args can be empty
 
@@ -878,6 +968,31 @@ Return ONLY JSON.
             top_n = int(args.get("top_n_nets", 5))
             top_n = max(1, min(10, top_n))
             return strategy, {"top_n_nets": top_n}
+
+        elif strategy == "CELL_RELOCATE":
+            try:
+                num_paths = int(args.get("num_paths", 10))
+            except (TypeError, ValueError):
+                num_paths = 10
+            num_paths = max(3, min(20, num_paths))
+
+            try:
+                detour_threshold = float(args.get("detour_threshold", 2.0))
+            except (TypeError, ValueError):
+                detour_threshold = 2.0
+            detour_threshold = max(1.2, min(4.0, detour_threshold))
+
+            try:
+                max_cells = int(args.get("max_cells", 3))
+            except (TypeError, ValueError):
+                max_cells = 3
+            max_cells = max(1, min(5, max_cells))
+
+            return strategy, {
+                "num_paths": num_paths,
+                "detour_threshold": detour_threshold,
+                "max_cells": max_cells,
+            }
 
         elif strategy == "PHYS_OPT":
             directive = args.get("directive", "Default")
