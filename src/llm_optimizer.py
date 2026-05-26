@@ -491,6 +491,13 @@ class DCPOptimizer(DCPOptimizerBase):
 
         best_wns = self.initial_wns
         stagnation = 0
+        best_dcp_path = Path(self.temp_dir) / "best_iter.dcp"
+        last_best_iteration = 0
+
+        await self.v("write_checkpoint", {
+            "dcp_path": str(best_dcp_path),
+            "force": True
+        })
 
         for i in range(50):
             self.iteration += 1
@@ -537,6 +544,11 @@ class DCPOptimizer(DCPOptimizerBase):
             if current_wns > best_wns:
                 best_wns = current_wns
                 stagnation = 0
+                await self.v("write_checkpoint", {
+                    "dcp_path": str(best_dcp_path),
+                    "force": True
+                })
+                last_best_iteration = i + 1
             else:
                 stagnation += 1
 
