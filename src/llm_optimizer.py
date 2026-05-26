@@ -543,6 +543,7 @@ class DCPOptimizer(DCPOptimizerBase):
 
             if current_wns > best_wns:
                 best_wns = current_wns
+                self.best_wns = current_wns
                 stagnation = 0
                 await self.v("write_checkpoint", {
                     "dcp_path": str(best_dcp_path),
@@ -560,6 +561,16 @@ class DCPOptimizer(DCPOptimizerBase):
             if stagnation >= 3:
                 print("No improvement. Stopping.")
                 break
+
+        if last_best_iteration > 0:
+            logger.info(
+                f"Restoring best checkpoint from iteration {last_best_iteration} "
+                f"with WNS {best_wns:.3f} ns"
+            )
+        else:
+            logger.info(f"Restoring initial checkpoint with WNS {best_wns:.3f} ns")
+
+        await self.v("open_checkpoint", {"dcp_path": str(best_dcp_path)})
 
         # Save best result
         await self.v("write_checkpoint", {
