@@ -17,6 +17,99 @@ _initialized = False
 _current_design = None
 
 
+def _repair_logical_hier_net(design, net) -> tuple[Optional[object], Optional[str]]:
+    """
+    Best-effort restoration of a physical net's logical hierarchical net mapping.
+
+    Returns the resolved EDIFHierNet and a short note describing how it was found.
+    """
+    if net is None:
+        return None, "missing_physical_net"
+
+    logical_net = net.getLogicalHierNet()
+    if logical_net is not None:
+        return logical_net, "already_present"
+
+    netlist = design.getNetlist()
+    net_name = str(net.getName())
+
+    candidates = [net_name]
+    try:
+        parent_name = netlist.getParentNetName(net_name)
+        if parent_name and parent_name not in candidates:
+            candidates.append(parent_name)
+    except Exception:
+        parent_name = None
+
+    for candidate_name in candidates:
+        try:
+            candidate = netlist.getHierNetFromName(candidate_name)
+        except Exception:
+            candidate = None
+        if candidate is not None:
+            net.setLogicalHierNet(candidate)
+            return candidate, f"resolved_from:{candidate_name}"
+
+    return None, "logical_hier_net_not_found"
+
+
+def _repair_driver_related_logical_nets(design, net) -> dict[str, str]:
+    """
+    Repair logical hierarchical net mappings for the target net and any likely
+    driver-related source nets that FanOutOptimization will query.
+    """
+    repair_notes: dict[str, str] = {}
+
+    logical_net, note = _repair_logical_hier_net(design, net)
+    repair_notes[str(net.getName())] = note
+    if logical_net is None:
+        return repair_notes
+
+    try:
+        driver_cell = logical_net.getLeafSourcePortInst().getPhysicalCell(design)
+    except Exception:
+        return repair_notes
+
+    if driver_cell is None:
+        return repair_notes
+
+    try:
+        site_inst = driver_cell.getSiteInst()
+        if site_inst is None:
+            return repair_notes
+
+        driver_type = str(driver_cell.getType())
+        logical_pin_names = ["Q"] if driver_cell.getBEL().isFF() else []
+        if not logical_pin_names:
+            try:
+                for port_inst in driver_cell.getEDIFCellInst().getPortInsts():
+                    if port_inst.isInput():
+                        logical_pin_names.append(str(port_inst.getName()))
+            except Exception:
+                logical_pin_names = []
+
+        if driver_cell.getBEL().isFF():
+            logical_pin_names.extend(["D", "C", "CE"])
+            rst_pin_name = {"FDRE": "R", "FDSE": "S", "FDCE": "CLR", "FDPE": "PRE"}.get(driver_type)
+            if rst_pin_name:
+                logical_pin_names.append(rst_pin_name)
+
+        for logical_pin_name in logical_pin_names:
+            try:
+                site_wire_name = driver_cell.getSiteWireNameFromLogicalPin(logical_pin_name)
+                related_net = site_inst.getNetFromSiteWire(site_wire_name)
+            except Exception:
+                related_net = None
+            if related_net is None:
+                continue
+            _, related_note = _repair_logical_hier_net(design, related_net)
+            repair_notes[str(related_net.getName())] = related_note
+    except Exception:
+        pass
+
+    return repair_notes
+
+
 def initialize_rapidwright(jvm_max_memory: str = "4G") -> Dict[str, Any]:
     """
     Initialize the RapidWright environment.
@@ -656,10 +749,16 @@ def optimize_fanout(net_name: str, split_factor: int) -> Dict[str, Any]:
         Dictionary with optimization results
     """
     if not _initialized:
-        return {"error": "RapidWright not initialized. Call initialize_rapidwright first."}
+        return {
+            "error": "RapidWright not initialized. Call initialize_rapidwright first.",
+            "error_category": "not_initialized",
+        }
     
     if _current_design is None:
-        return {"error": "No design loaded. Use load_design first."}
+        return {
+            "error": "No design loaded. Use load_design first.",
+            "error_category": "no_design_loaded",
+        }
     
     try:
         from com.xilinx.rapidwright.eco import FanOutOptimization
@@ -669,10 +768,28 @@ def optimize_fanout(net_name: str, split_factor: int) -> Dict[str, Any]:
         # Get the net
         net = design.getNet(net_name)
         if net is None:
-            return {"error": f"Net '{net_name}' not found in design"}
+            return {
+                "error": f"Net '{net_name}' not found in design",
+                "error_category": "net_not_found",
+            }
+
+        repair_notes = _repair_driver_related_logical_nets(design, net)
+        logical_net = net.getLogicalHierNet()
+        if logical_net is None:
+            return {
+                "error": f"Net '{net_name}' is missing logical net mapping required for fanout optimization",
+                "error_category": "missing_logical_hier_net",
+                "net_name": net_name,
+                "repair_notes": repair_notes,
+            }
         
         # Get original fanout info
         original_fanout = net.getFanOut()
+        if original_fanout <= 1:
+            return {
+                "error": f"Net '{net_name}' fanout is too small for replication ({original_fanout})",
+                "error_category": "fanout_too_small",
+            }
         logger.info(f"Optimizing net '{net_name}' with fanout {original_fanout} into {split_factor} parts")
         
         # Perform optimization
@@ -700,12 +817,27 @@ def optimize_fanout(net_name: str, split_factor: int) -> Dict[str, Any]:
             "original_fanout": original_fanout,
             "split_factor": split_factor,
             "new_nets": new_nets_info,
+            "repair_notes": repair_notes,
             "message": f"Successfully split net '{net_name}' into {split_factor} parts"
         }
         
     except Exception as e:
+        error_message = str(e)
+        error_category = "unknown_error"
+        if "EDIFHierNet.getNet()" in error_message or "ehn" in error_message:
+            error_category = "missing_edif_mapping"
+        elif "NullPointerException" in error_message:
+            error_category = "null_pointer"
+        elif "encrypted" in error_message.lower():
+            error_category = "encrypted_ip_boundary"
+
         logger.error(f"Error in fanout optimization: {e}")
-        return {"error": str(e)}
+        return {
+            "error": error_message,
+            "error_category": error_category,
+            "net_name": net_name,
+            "split_factor": split_factor,
+        }
 
 
 def analyze_fabric_for_pblock(
@@ -1909,4 +2041,3 @@ def convert_fabric_region_to_pblock_ranges(
         import traceback
         traceback.print_exc()
         return {"error": str(e)}
-

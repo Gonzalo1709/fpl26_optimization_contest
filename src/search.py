@@ -27,6 +27,8 @@ class SearchCandidate:
     candidate_id: str
     dcp_path: Path
     wns: Optional[float]
+    tns: Optional[float]
+    failing_endpoints: Optional[int]
     peak_wns: Optional[float]
     generation: int
     parent_id: Optional[str]

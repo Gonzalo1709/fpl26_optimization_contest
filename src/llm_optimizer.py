@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "~openai/gpt-latest"
 
 
+class ToolExecutionError(RuntimeError):
+    """Raised when an MCP tool call fails or returns an error payload."""
+
+
 class DCPOptimizer(DCPOptimizerBase):
     """FPGA Design Optimization Agent using recipe selection plus generation search."""
 
@@ -60,6 +64,7 @@ class DCPOptimizer(DCPOptimizerBase):
         self.end_time: Optional[float] = None
 
         self.history: list[dict] = []
+        self.fanout_blacklist: dict[str, str] = {}
 
     def _extract_llm_text(self, response) -> str:
         """Best-effort extraction of text content from a chat completion response."""
@@ -104,6 +109,23 @@ class DCPOptimizer(DCPOptimizerBase):
         )
         return ""
 
+    def _raise_if_tool_reported_error(self, tool_name: str, result_text: str) -> None:
+        """Raise when a tool encodes failure in its textual payload."""
+        try:
+            payload = json.loads(result_text)
+        except json.JSONDecodeError:
+            return
+
+        if isinstance(payload, dict):
+            error_message = payload.get("error")
+            if error_message:
+                error_category = payload.get("error_category")
+                category_prefix = f"[{error_category}] " if error_category else ""
+                raise ToolExecutionError(f"{tool_name} failed: {category_prefix}{error_message}")
+            if payload.get("status") == "error":
+                message = payload.get("message") or result_text
+                raise ToolExecutionError(f"{tool_name} failed: {message}")
+
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Execute a tool call on the appropriate MCP server."""
         if tool_name.startswith("rapidwright_"):
@@ -113,7 +135,7 @@ class DCPOptimizer(DCPOptimizerBase):
             session = self.vivado_session
             actual_name = tool_name[len("vivado_"):]
         else:
-            return json.dumps({"error": f"Unknown tool prefix in: {tool_name}"})
+            raise ToolExecutionError(f"Unknown tool prefix in: {tool_name}")
 
         start_time = time.time()
         wns_measured = None
@@ -127,6 +149,8 @@ class DCPOptimizer(DCPOptimizerBase):
                 result_text = "\n".join(text_parts)
             else:
                 result_text = "(no output)"
+
+            self._raise_if_tool_reported_error(tool_name, result_text)
 
             if tool_name == "vivado_report_timing_summary":
                 if self.target_clock:
@@ -162,6 +186,20 @@ class DCPOptimizer(DCPOptimizerBase):
                 }
             )
             return result_text
+        except ToolExecutionError as exc:
+            elapsed_time = time.time() - start_time
+            self.tool_call_details.append(
+                {
+                    "tool_name": tool_name,
+                    "iteration": self.iteration,
+                    "elapsed_time": elapsed_time,
+                    "wns": None,
+                    "error": True,
+                    "error_message": str(exc),
+                }
+            )
+            logger.error("Tool call failed: %s", exc)
+            raise
         except Exception as exc:
             elapsed_time = time.time() - start_time
             self.tool_call_details.append(
@@ -175,7 +213,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 }
             )
             logger.error("Tool call failed: %s", exc)
-            return json.dumps({"error": str(exc)})
+            raise ToolExecutionError(f"{tool_name} failed: {exc}") from exc
 
     def _update_best_wns(self, current_wns: float, source: str = "timing_summary"):
         current_fmax = self.calculate_fmax(current_wns, self.clock_period)
@@ -340,7 +378,7 @@ class DCPOptimizer(DCPOptimizerBase):
         prompt = """
 You are an FPGA optimization planner.
 
-Choose the next optimization action.
+Choose the next optimization recipe.
 
 Return JSON:
 {
@@ -349,14 +387,27 @@ Return JSON:
 }
 
 Rules:
-- Prefer PBLOCK when the analysis shows spread-out critical paths.
-- Prefer FANOUT when high-fanout nets are present and not yet exhausted.
-- Prefer PHYS_OPT when placement spread is low or when earlier steps stagnate.
+- You do not have direct access to Vivado or RapidWright tools.
+- You must choose only among the provided recipes.
+- Do not reason in terms of tool calls, tool names, or command sequences.
+- Prefer PBLOCK when the analysis shows spread-out critical paths or explicitly recommends PBLOCK.
+- Prefer FANOUT when critical high-fanout nets are present, not blacklisted, and placement spread is not the main issue.
+- Prefer PHYS_OPT when placement spread is low, after PBLOCK/FANOUT changed the design, or when earlier steps stagnate.
 - Avoid repeating strategies that the recent history shows were ineffective from the current state.
 - If stagnation >= 2, switch strategy if possible.
+- If a FANOUT net previously failed, do not pick FANOUT just to retry the same exhausted net set.
+- Use timing metrics holistically: WNS first, then TNS, then failing endpoints.
+- FANOUT means: choose how many top candidate nets the controller should try within the FANOUT recipe.
+- PBLOCK means: choose the PBLOCK recipe when spread reduction is the main bet.
+- PHYS_OPT means: choose the PHYS_OPT recipe when local fine-tuning is the main bet.
 - FANOUT: choose top_n_nets (1-10)
 - PHYS_OPT: choose directive from ["Explore", "AggressiveExplore", "Default"]
 - PBLOCK: args can be empty
+
+Recipe intent reference:
+- FANOUT is best for shared enable/valid/control nets on many failing paths.
+- PBLOCK is best for spread-out critical paths and large physical distance.
+- PHYS_OPT is best for local cleanup and fine-tuning after structure/placement is already reasonable.
 
 Return ONLY JSON.
 """
@@ -457,8 +508,110 @@ Return ONLY JSON.
         """Call a RapidWright MCP tool."""
         return await self.call_tool(f"rapidwright_{name}", args or {})
 
+    async def _reload_rapidwright_from_vivado_checkpoint(self, dcp_path: Path) -> None:
+        """Load a freshly written Vivado checkpoint into RapidWright."""
+        await self.rw("read_checkpoint", {"dcp_path": str(dcp_path.resolve())})
+
+    async def _reroute_and_measure(self) -> tuple[str, Optional[float]]:
+        """Route the current Vivado design and return timing plus measured WNS."""
+        timing_report = await self.v("route_design")
+        timing_report = await self.v("report_timing_summary")
+        return timing_report, await self._measure_current_wns(timing_report)
+
+    def _extract_timing_metrics(self, timing_report: str) -> dict:
+        """Parse WNS/TNS/failing endpoints from a timing report."""
+        metrics = parse_timing_summary_static(timing_report)
+        return {
+            "wns": metrics.get("wns"),
+            "tns": metrics.get("tns"),
+            "failing_endpoints": metrics.get("failing_endpoints"),
+        }
+
+    def _metrics_sort_key(self, metrics: Optional[dict]) -> tuple[float, float, float]:
+        """Sort timing metrics from best to worst."""
+        if not metrics:
+            return (float("-inf"), float("-inf"), float("-inf"))
+        wns = metrics.get("wns")
+        tns = metrics.get("tns")
+        failing_endpoints = metrics.get("failing_endpoints")
+        return (
+            wns if wns is not None else float("-inf"),
+            tns if tns is not None else float("-inf"),
+            -(failing_endpoints if failing_endpoints is not None else float("inf")),
+        )
+
+    def _is_metrics_improvement(self, new_metrics: Optional[dict], old_metrics: Optional[dict]) -> bool:
+        """Return True if timing metrics show a meaningful improvement."""
+        if not new_metrics:
+            return False
+        if not old_metrics:
+            return True
+
+        new_wns = new_metrics.get("wns")
+        old_wns = old_metrics.get("wns")
+        if self._is_wns_improvement(new_wns, old_wns):
+            return True
+
+        if new_wns is not None and old_wns is not None and abs(new_wns - old_wns) <= self.generation_config.min_wns_delta:
+            new_tns = new_metrics.get("tns")
+            old_tns = old_metrics.get("tns")
+            if new_tns is not None and old_tns is not None and new_tns > old_tns + 0.01:
+                return True
+
+            new_fe = new_metrics.get("failing_endpoints")
+            old_fe = old_metrics.get("failing_endpoints")
+            if (
+                new_fe is not None
+                and old_fe is not None
+                and new_tns is not None
+                and old_tns is not None
+                and abs(new_tns - old_tns) <= 0.01
+                and new_fe < old_fe
+            ):
+                return True
+
+        return False
+
+    async def _measure_current_metrics(self, timing_report: Optional[str] = None) -> dict:
+        """Measure current timing metrics from the current Vivado state."""
+        report = timing_report
+        if report is None:
+            report = await self.v("report_timing_summary")
+        metrics = self._extract_timing_metrics(report)
+
+        if metrics["wns"] is None:
+            metrics["wns"] = await super().get_wns_for_target_clock(self._call_vivado_tool)
+
+        if metrics["wns"] is not None and metrics["wns"] > self.best_wns:
+            self.best_wns = metrics["wns"]
+        return metrics
+
+    def _forced_branch_strategy(
+        self,
+        generation: int,
+        parent: SearchCandidate,
+        branch_index: int,
+        step: int,
+    ) -> Optional[tuple[str, dict]]:
+        """Force recipe diversity for the first generation from the root candidate."""
+        if generation != 1 or parent.candidate_id != "root" or step != 1:
+            return None
+
+        forced_strategies = [
+            ("FANOUT", {"top_n_nets": 3}),
+            ("PBLOCK", {}),
+            ("PHYS_OPT", {"directive": "Explore"}),
+        ]
+        strategy_index = min(branch_index - 1, len(forced_strategies) - 1)
+        return forced_strategies[strategy_index]
+
     async def run_pblock_flow(self) -> str:
-        """Execute the deterministic PBLOCK recipe."""
+        """Execute a staged PBLOCK recipe with progressively stronger constraints."""
+        baseline_checkpoint = Path(self.temp_dir) / "pblock_baseline.dcp"
+        await self.v("write_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "force": True})
+        baseline_report = await self.v("report_timing_summary")
+        baseline_metrics = await self._measure_current_metrics(baseline_report)
+
         util_report = await self.v("report_utilization_for_pblock")
         util = self.parse_utilization(util_report)
 
@@ -487,41 +640,141 @@ Return ONLY JSON.
         )
         pblock_ranges = json.loads(pblock)["pblock_ranges"]
 
-        await self.v("run_tcl", {"command": "place_design -unplace"})
-        await self.v("create_and_apply_pblock", {"pblock_ranges": pblock_ranges})
-        await self.v("place_design")
-        await self.v("route_design")
-        return await self.v("report_timing_summary")
+        attempt_plans = [
+            {"suffix": "soft", "is_soft": True, "place_directive": "Default", "phys_opt_directive": "Default"},
+            {"suffix": "balanced", "is_soft": False, "place_directive": "Explore", "phys_opt_directive": "Explore"},
+            {
+                "suffix": "aggressive",
+                "is_soft": False,
+                "place_directive": "Quick",
+                "phys_opt_directive": "AggressiveExplore",
+            },
+        ]
+
+        best_report: Optional[str] = baseline_report
+        best_metrics = baseline_metrics
+        best_checkpoint = baseline_checkpoint
+
+        for attempt_index, plan in enumerate(attempt_plans, start=1):
+            checkpoint_path = Path(self.temp_dir) / f"pblock_attempt_{attempt_index:02d}.dcp"
+            await self.v("write_checkpoint", {"dcp_path": str(checkpoint_path.resolve()), "force": True})
+            await self.v("open_checkpoint", {"dcp_path": str(checkpoint_path.resolve())})
+
+            await self.v("create_and_apply_pblock", {
+                "pblock_name": f"opt_pblock_{plan['suffix']}",
+                "ranges": pblock_ranges,
+                "is_soft": plan["is_soft"],
+            })
+            await self.v("run_tcl", {"command": "place_design -unplace"})
+            await self.v("place_design", {"directive": plan["place_directive"]})
+            await self.v("phys_opt_design", {"directive": plan["phys_opt_directive"]})
+            report, _ = await self._reroute_and_measure()
+            current_metrics = await self._measure_current_metrics(report)
+
+            if self._is_metrics_improvement(current_metrics, best_metrics):
+                best_metrics = current_metrics
+                best_report = report
+                best_checkpoint = Path(self.temp_dir) / f"pblock_best_{attempt_index:02d}.dcp"
+                await self.v("write_checkpoint", {"dcp_path": str(best_checkpoint.resolve()), "force": True})
+
+        await self.v("open_checkpoint", {"dcp_path": str(best_checkpoint.resolve())})
+        return best_report
 
     async def run_fanout_flow(self, top_n_nets: int = 5) -> str:
-        """Execute the deterministic high-fanout recipe."""
-        for net_name, fanout, _ in self.high_fanout_nets[:top_n_nets]:
+        """Execute high-fanout optimization with per-net reroute feedback."""
+        nets_report = await self.v(
+            "get_critical_high_fanout_nets",
+            {
+                "num_paths": 50,
+                "min_fanout": 100,
+                "exclude_clocks": True,
+            },
+        )
+        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
+        nets_to_optimize = [
+            net_info for net_info in self.high_fanout_nets if net_info[0] not in self.fanout_blacklist
+        ][:top_n_nets]
+        if not nets_to_optimize:
+            raise ValueError("No critical high-fanout nets are available in the current design state.")
+
+        best_report = await self.v("report_timing_summary")
+        best_metrics = await self._measure_current_metrics(best_report)
+
+        for net_index, (net_name, fanout, _) in enumerate(nets_to_optimize, start=1):
+            baseline_checkpoint = Path(self.temp_dir) / f"fanout_before_{net_index:02d}.dcp"
+            await self.v("write_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "force": True})
+            await self._reload_rapidwright_from_vivado_checkpoint(baseline_checkpoint)
+
             split_factor = max(3, min(8, fanout // 100))
+            try:
+                await self.rw(
+                    "optimize_fanout",
+                    {
+                        "net_name": net_name,
+                        "split_factor": split_factor,
+                    },
+                )
+            except ToolExecutionError as exc:
+                self.fanout_blacklist[net_name] = str(exc)
+                logger.warning("Blacklisting fanout net %s after tool failure: %s", net_name, exc)
+                continue
+
+            temp_dcp = Path(self.temp_dir) / f"fanout_opt_{net_index:02d}.dcp"
             await self.rw(
-                "optimize_fanout",
+                "write_checkpoint",
                 {
-                    "net_name": net_name,
-                    "split_factor": split_factor,
+                    "dcp_path": str(temp_dcp.resolve()),
+                    "overwrite": True,
                 },
             )
 
-        temp_dcp = str(Path(self.temp_dir) / "fanout_opt.dcp")
-        await self.rw(
-            "write_checkpoint",
-            {
-                "dcp_path": temp_dcp,
-                "overwrite": True,
-            },
-        )
+            await self.v("open_checkpoint", {"dcp_path": str(temp_dcp.resolve())})
+            report, _ = await self._reroute_and_measure()
+            current_metrics = await self._measure_current_metrics(report)
 
-        await self.v("open_checkpoint", {"dcp_path": temp_dcp})
-        await self.v("route_design")
-        return await self.v("report_timing_summary")
+            if self._is_metrics_improvement(current_metrics, best_metrics):
+                best_metrics = current_metrics
+                best_report = report
+            else:
+                await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
+
+        return best_report
 
     async def run_phys_opt_flow(self, directive: str = "Default") -> str:
-        """Execute the deterministic Vivado phys_opt recipe."""
-        await self.v("phys_opt_design", {"directive": directive})
-        return await self.v("report_timing_summary")
+        """Execute a multi-pass Vivado phys_opt recipe."""
+        baseline_checkpoint = Path(self.temp_dir) / "phys_opt_baseline.dcp"
+        await self.v("write_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "force": True})
+        baseline_report = await self.v("report_timing_summary")
+        baseline_metrics = await self._measure_current_metrics(baseline_report)
+
+        directive_sequence = [directive]
+        if directive == "Default":
+            directive_sequence.extend(["Explore", "AggressiveExplore"])
+        elif directive == "Explore":
+            directive_sequence.append("AggressiveExplore")
+
+        best_report: Optional[str] = baseline_report
+        best_metrics = baseline_metrics
+        best_checkpoint = baseline_checkpoint
+
+        for pass_index, current_directive in enumerate(directive_sequence, start=1):
+            checkpoint_path = Path(self.temp_dir) / f"phys_opt_before_{pass_index:02d}.dcp"
+            await self.v("write_checkpoint", {"dcp_path": str(checkpoint_path.resolve()), "force": True})
+            await self.v("phys_opt_design", {"directive": current_directive})
+            report = await self.v("report_timing_summary")
+            current_metrics = await self._measure_current_metrics(report)
+
+            if self._is_metrics_improvement(current_metrics, best_metrics):
+                best_metrics = current_metrics
+                best_report = report
+                best_checkpoint = Path(self.temp_dir) / f"phys_opt_best_{pass_index:02d}.dcp"
+                await self.v("write_checkpoint", {"dcp_path": str(best_checkpoint.resolve()), "force": True})
+                continue
+
+            await self.v("open_checkpoint", {"dcp_path": str(checkpoint_path.resolve())})
+
+        await self.v("open_checkpoint", {"dcp_path": str(best_checkpoint.resolve())})
+        return best_report
 
     def parse_utilization(self, report: str) -> dict:
         """Extract LUT and FF counts from the pblock utilization report."""
@@ -581,6 +834,7 @@ Return ONLY JSON.
             "stagnation": stagnation,
             "branch_context": branch_context,
             "recent_candidates": tried_summaries,
+            "fanout_blacklist": self.fanout_blacklist,
             "search_settings": asdict(self.generation_config),
             "available_strategies": {
                 "PBLOCK": {},
@@ -610,6 +864,12 @@ Return ONLY JSON.
         if wns is not None and wns > self.best_wns:
             self.best_wns = wns
         return wns
+
+    async def _save_best_checkpoint(self, dcp_path: Path) -> Path:
+        """Persist the current Vivado design and return the saved checkpoint path."""
+        if not await self._save_vivado_checkpoint(dcp_path):
+            raise RuntimeError(f"Failed to save checkpoint: {dcp_path}")
+        return dcp_path
 
     async def _save_vivado_checkpoint(self, dcp_path: Path) -> bool:
         """Save the currently-open Vivado design as a branch checkpoint."""
@@ -651,9 +911,15 @@ Return ONLY JSON.
         """Format WNS for logs."""
         return f"{wns:.3f} ns" if wns is not None else "unknown"
 
-    def _candidate_sort_key(self, candidate: SearchCandidate) -> tuple[float, float]:
+    def _candidate_sort_key(self, candidate: SearchCandidate) -> tuple[tuple[float, float, float], float]:
         """Score candidates for beam pruning. Current leaf score is primary."""
-        current = candidate.wns if candidate.wns is not None else float("-inf")
+        current = self._metrics_sort_key(
+            {
+                "wns": candidate.wns,
+                "tns": candidate.tns,
+                "failing_endpoints": candidate.failing_endpoints,
+            }
+        )
         peak = candidate.peak_wns if candidate.peak_wns is not None else float("-inf")
         return current, peak
 
@@ -704,17 +970,14 @@ Return ONLY JSON.
         print("=== Starting LLM-Driven Optimization ===\n")
 
         best_wns = self.initial_wns
+        best_metrics = {
+            "wns": self.initial_wns,
+            "tns": self.initial_tns,
+            "failing_endpoints": self.initial_failing_endpoints,
+        }
         stagnation = 0
-        best_dcp_path = Path(self.temp_dir) / "best_iter.dcp"
+        best_dcp_path = await self._save_best_checkpoint(Path(self.temp_dir) / "best_iter_000.dcp")
         last_best_iteration = 0
-
-        await self.v(
-            "write_checkpoint",
-            {
-                "dcp_path": str(best_dcp_path),
-                "force": True,
-            },
-        )
 
         max_iterations = self.generation_config.max_llm_calls
 
@@ -734,31 +997,66 @@ Return ONLY JSON.
             action = await self.choose_action_llm(decision_input)
             strategy, args = self.sanitize_action(action)
             print(f"Chosen: {strategy} with args {args}")
+            previous_metrics = await self._measure_current_metrics()
+            previous_wns = previous_metrics["wns"]
 
-            _, current_wns = await self._execute_strategy(strategy, args)
-            delta = current_wns - best_wns if (current_wns is not None and best_wns is not None) else None
+            try:
+                result_report, current_wns = await self._execute_strategy(strategy, args)
+            except Exception as exc:
+                logger.exception("Error during linear iteration %s", index + 1)
+                self.history.append(
+                    {
+                        "iteration": index + 1,
+                        "strategy": strategy,
+                        "args": args,
+                        "wns": None,
+                        "error": str(exc),
+                        "stagnation_count": stagnation,
+                    }
+                )
+                print(f"Iteration failed: {exc}")
+                stagnation += 1
+
+                if stagnation >= self.generation_config.max_steps_without_improvement:
+                    print("No improvement. Stopping.")
+                    break
+                continue
+
+            current_metrics = await self._measure_current_metrics(result_report)
+            delta = current_wns - previous_wns if (current_wns is not None and previous_wns is not None) else None
             self.history.append(
                 {
                     "iteration": index + 1,
                     "strategy": strategy,
                     "args": args,
                     "wns": current_wns,
+                    "tns": current_metrics.get("tns"),
+                    "failing_endpoints": current_metrics.get("failing_endpoints"),
                     "delta_wns": delta,
+                    "previous_wns": previous_wns,
+                    "delta_tns": (
+                        current_metrics.get("tns") - previous_metrics["tns"]
+                        if current_metrics.get("tns") is not None and previous_metrics["tns"] is not None
+                        else None
+                    ),
+                    "delta_failing_endpoints": (
+                        current_metrics.get("failing_endpoints") - previous_metrics["failing_endpoints"]
+                        if current_metrics.get("failing_endpoints") is not None
+                        and previous_metrics["failing_endpoints"] is not None
+                        else None
+                    ),
                     "stagnation_count": stagnation,
                 }
             )
 
             print(f"WNS: {self._format_wns(current_wns)}")
 
-            if self._is_wns_improvement(current_wns, best_wns):
+            if self._is_metrics_improvement(current_metrics, best_metrics):
                 best_wns = current_wns
+                best_metrics = current_metrics
                 stagnation = 0
-                await self.v(
-                    "write_checkpoint",
-                    {
-                        "dcp_path": str(best_dcp_path),
-                        "force": True,
-                    },
+                best_dcp_path = await self._save_best_checkpoint(
+                    Path(self.temp_dir) / f"best_iter_{index + 1:03d}.dcp"
                 )
                 last_best_iteration = index + 1
             else:
@@ -772,16 +1070,7 @@ Return ONLY JSON.
                 print("No improvement. Stopping.")
                 break
 
-        if best_dcp_path.exists():
-            shutil.copy2(best_dcp_path, output_dcp)
-        else:
-            await self.v(
-                "write_checkpoint",
-                {
-                    "dcp_path": str(output_dcp.resolve()),
-                    "force": True,
-                },
-            )
+        shutil.copy2(best_dcp_path, output_dcp)
 
         self.end_time = time.time()
         self._print_optimization_summary(max_iterations_reached=False)
@@ -804,6 +1093,8 @@ Return ONLY JSON.
             candidate_id="root",
             dcp_path=root_path,
             wns=self.initial_wns,
+            tns=self.initial_tns,
+            failing_endpoints=self.initial_failing_endpoints,
             peak_wns=self.initial_wns,
             generation=0,
             parent_id=None,
@@ -849,7 +1140,21 @@ Return ONLY JSON.
 
                     branch_results.append(candidate)
 
-                    if self._is_wns_improvement(candidate.wns, self.best_candidate.wns if self.best_candidate else None):
+                    candidate_metrics = {
+                        "wns": candidate.wns,
+                        "tns": candidate.tns,
+                        "failing_endpoints": candidate.failing_endpoints,
+                    }
+                    best_metrics = (
+                        {
+                            "wns": self.best_candidate.wns,
+                            "tns": self.best_candidate.tns,
+                            "failing_endpoints": self.best_candidate.failing_endpoints,
+                        }
+                        if self.best_candidate
+                        else None
+                    )
+                    if self._is_metrics_improvement(candidate_metrics, best_metrics):
                         self.best_candidate = candidate
                         print(f"[SEARCH] New global best: {candidate.candidate_id} ({self._format_wns(candidate.wns)})")
 
@@ -926,6 +1231,11 @@ Return ONLY JSON.
             return None
 
         peak_wns = parent.peak_wns
+        peak_metrics = {
+            "wns": parent.peak_wns,
+            "tns": parent.tns,
+            "failing_endpoints": parent.failing_endpoints,
+        }
         current_wns = parent.wns
         steps_since_peak = parent.steps_since_peak
         latest_candidate = parent
@@ -954,12 +1264,23 @@ Return ONLY JSON.
                 tried_summaries=tried_summaries,
             )
 
-            action = await self.choose_action_llm(decision_input)
-            strategy, args = self.sanitize_action(action)
-            print(f"[SEARCH] Chosen: {strategy} with args {args}")
+            forced_action = self._forced_branch_strategy(generation, parent, branch_index, step)
+            if forced_action is not None:
+                strategy, args = forced_action
+                print(f"[SEARCH] Forced diversity choice: {strategy} with args {args}")
+            else:
+                action = await self.choose_action_llm(decision_input)
+                strategy, args = self.sanitize_action(action)
+                print(f"[SEARCH] Chosen: {strategy} with args {args}")
+            previous_wns = current_wns
+            previous_metrics = {
+                "wns": current_wns,
+                "tns": latest_candidate.tns,
+                "failing_endpoints": latest_candidate.failing_endpoints,
+            }
 
             try:
-                _, current_wns = await self._execute_strategy(strategy, args)
+                result_report, current_wns = await self._execute_strategy(strategy, args)
             except Exception as exc:
                 logger.exception("Error during branch %s step %s", branch_id, step)
                 branch_history.append(
@@ -974,12 +1295,30 @@ Return ONLY JSON.
                 steps_since_peak += 1
                 continue
 
+            current_metrics = await self._measure_current_metrics(result_report)
             branch_history.append(
                 {
                     "step": step,
                     "strategy": strategy,
                     "args": args,
                     "wns": current_wns,
+                    "tns": current_metrics.get("tns"),
+                    "failing_endpoints": current_metrics.get("failing_endpoints"),
+                    "delta_wns": (
+                        current_wns - previous_wns if current_wns is not None and previous_wns is not None else None
+                    ),
+                    "previous_wns": previous_wns,
+                    "delta_tns": (
+                        current_metrics.get("tns") - previous_metrics["tns"]
+                        if current_metrics.get("tns") is not None and previous_metrics["tns"] is not None
+                        else None
+                    ),
+                    "delta_failing_endpoints": (
+                        current_metrics.get("failing_endpoints") - previous_metrics["failing_endpoints"]
+                        if current_metrics.get("failing_endpoints") is not None
+                        and previous_metrics["failing_endpoints"] is not None
+                        else None
+                    ),
                     "delta_vs_parent": (
                         current_wns - parent.wns if current_wns is not None and parent.wns is not None else None
                     ),
@@ -992,8 +1331,9 @@ Return ONLY JSON.
                 print(f"[SEARCH] Branch {branch_id} step {step}: checkpoint save failed; stopping branch.")
                 break
 
-            if self._is_wns_improvement(current_wns, peak_wns):
+            if self._is_metrics_improvement(current_metrics, peak_metrics):
                 peak_wns = current_wns
+                peak_metrics = current_metrics
                 steps_since_peak = 0
             else:
                 steps_since_peak += 1
@@ -1002,6 +1342,8 @@ Return ONLY JSON.
                 candidate_id=f"{branch_id}_s{step:02d}",
                 dcp_path=checkpoint_path,
                 wns=current_wns,
+                tns=current_metrics.get("tns"),
+                failing_endpoints=current_metrics.get("failing_endpoints"),
                 peak_wns=peak_wns,
                 generation=generation,
                 parent_id=parent.candidate_id,
@@ -1017,7 +1359,18 @@ Return ONLY JSON.
                 f"peak {self._format_wns(peak_wns)}, steps since peak {steps_since_peak}"
             )
 
-            if self._is_wns_improvement(current_wns, self.best_candidate.wns if self.best_candidate else None):
+            if self._is_metrics_improvement(
+                current_metrics,
+                (
+                    {
+                        "wns": self.best_candidate.wns,
+                        "tns": self.best_candidate.tns,
+                        "failing_endpoints": self.best_candidate.failing_endpoints,
+                    }
+                    if self.best_candidate
+                    else None
+                ),
+            ):
                 self.best_candidate = latest_candidate
                 print(f"[SEARCH] New global best inside branch: {latest_candidate.candidate_id}")
 
