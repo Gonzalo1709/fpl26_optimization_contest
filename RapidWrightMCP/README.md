@@ -80,6 +80,7 @@ Restart Cursor after saving.
 | `search_cells` | Search for cells by name or type |
 | `get_tile_info` | Get information about a specific tile |
 | `search_sites` | Search for sites by type on a device |
+| `build_hardblock_relocation_graph` | Build a graph of DSP/BRAM/URAM relocation and cascade relationships |
 | `optimize_lut_input_cone` | Optimize LUT chains by combining into single LUTs |
 | `optimize_fanout` | Split high fanout nets by replicating drivers |
 
@@ -101,6 +102,11 @@ AI: [calls optimize_lut_input_cone]
 User: "The net 'clk_enable' has very high fanout. Split it into 4 parts."
 AI: [calls optimize_fanout]
     "Split 'clk_enable' (original fanout: 2,456) into 4 nets with ~614 loads each."
+
+User: "Build me a DSP/BRAM relocation graph for these placed hard blocks."
+AI: [calls build_hardblock_relocation_graph]
+    "I found the legal hard-block sites, linked cascade neighbors, and annotated
+    candidate relocation nodes for the requested cells."
 ```
 
 ## Tips
@@ -186,6 +192,28 @@ After:   Driver_1 -> [250 loads]
 **Limitations:**
 - Only works on routed nets
 - Not beneficial for small fanouts (<100 loads)
+
+### Hard-Block Relocation Graph
+
+Builds a graph-oriented view of the device for hard-block movement planning.
+
+**What it models:**
+- Nodes for legal hard-block sites such as `DSP48E2`, `RAMB36`, and `URAM288`
+- `cascade` edges between vertically adjacent hard blocks in the same column
+- `relocation` edges between nearby equivalent sites
+- Optional annotations for specific placed cells and simple inferred cascade chains
+
+**When to use:**
+- Exploring DSP/BRAM/URAM relocation as a graph problem
+- Building a cascade-aware move generator before writing an optimizer
+- Inspecting legal candidate destinations for a selected set of hard blocks
+
+**Key parameters:**
+- `site_types`: Hard-block site types to include
+- `include_same_column_edges`: Connect nearby same-type sites in a column
+- `include_adjacent_column_edges`: Also connect nearby same-type sites across neighboring columns
+- `include_cascade_edges`: Add directed vertical cascade edges
+- `cell_names`: Annotate relocation candidates for specific currently placed cells
 
 ### Optimization Troubleshooting
 
@@ -312,4 +340,3 @@ tail -f rapidwright_mcp.log
 - [RapidWright Javadoc](https://www.rapidwright.io/javadoc/)
 - [RapidWright GitHub](https://github.com/Xilinx/RapidWright)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
-

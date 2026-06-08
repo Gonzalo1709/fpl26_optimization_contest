@@ -171,6 +171,63 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="build_hardblock_relocation_graph",
+            description="""Build a device graph for hard-block relocation.
+
+            Nodes represent legal hard-block sites such as DSP48E2, RAMB36, and
+            URAM288. Edges represent either legal relocation relationships
+            between equivalent sites or vertical cascade relationships.
+
+            If cell_names is provided, the tool also returns candidate
+            destination nodes for those currently placed cells and attempts to
+            summarize simple cascade-chain macro groups.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "site_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Hard-block site types to include (default: ['DSP48E2', 'RAMB36', 'URAM288'])"
+                    },
+                    "include_occupied": {
+                        "type": "boolean",
+                        "description": "Include currently occupied sites as graph nodes (default: true)",
+                        "default": True
+                    },
+                    "include_free": {
+                        "type": "boolean",
+                        "description": "Include currently free sites as graph nodes (default: true)",
+                        "default": True
+                    },
+                    "include_same_column_edges": {
+                        "type": "boolean",
+                        "description": "Include relocation edges between same-type sites within the same column (default: true)",
+                        "default": True
+                    },
+                    "include_adjacent_column_edges": {
+                        "type": "boolean",
+                        "description": "Include relocation edges to nearby same-type sites in adjacent columns (default: false)",
+                        "default": False
+                    },
+                    "include_cascade_edges": {
+                        "type": "boolean",
+                        "description": "Include directed vertical cascade edges between consecutive hard blocks in a column (default: true)",
+                        "default": True
+                    },
+                    "max_neighbor_distance": {
+                        "type": "integer",
+                        "description": "Maximum vertical distance, in site-instance coordinates, for relocation neighbors (default: 16)",
+                        "default": 16
+                    },
+                    "cell_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of placed hard-block cells to annotate with current and candidate graph nodes"
+                    }
+                }
+            }
+        ),
+        Tool(
             name="optimize_lut_input_cone",
             description="Optimize LUT input cones by combining chained small LUTs into a single larger LUT to reduce logic depth. This is useful for optimizing critical paths.",
             inputSchema={
@@ -463,6 +520,18 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 site_type=arguments.get("site_type"),
                 device_name=arguments.get("device_name"),
                 limit=arguments.get("limit", 50)
+            )
+
+        elif name == "build_hardblock_relocation_graph":
+            result = rw.build_hardblock_relocation_graph(
+                site_types=arguments.get("site_types"),
+                include_occupied=arguments.get("include_occupied", True),
+                include_free=arguments.get("include_free", True),
+                include_same_column_edges=arguments.get("include_same_column_edges", True),
+                include_adjacent_column_edges=arguments.get("include_adjacent_column_edges", False),
+                include_cascade_edges=arguments.get("include_cascade_edges", True),
+                max_neighbor_distance=arguments.get("max_neighbor_distance", 16),
+                cell_names=arguments.get("cell_names")
             )
         
         elif name == "optimize_lut_input_cone":

@@ -640,6 +640,322 @@ def search_sites(site_type: Optional[str] = None,
         return {"error": str(e)}
 
 
+def build_hardblock_relocation_graph(
+    site_types: Optional[list[str]] = None,
+    include_occupied: bool = True,
+    include_free: bool = True,
+    include_same_column_edges: bool = True,
+    include_adjacent_column_edges: bool = False,
+    include_cascade_edges: bool = True,
+    max_neighbor_distance: int = 16,
+    cell_names: Optional[list[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Build a graph of legal hard-block relocation sites on the current device.
+
+    Nodes represent hard-block sites such as DSPs, BRAMs, and URAMs. Edges
+    represent either:
+      - relocation relationships between equivalent sites, or
+      - cascade relationships between vertically adjacent hard blocks.
+
+    If cell_names is provided, the result also includes relocation candidates
+    for those cells based on site compatibility and Manhattan distance.
+    """
+    if not _initialized:
+        return {"error": "RapidWright not initialized. Call initialize_rapidwright first."}
+
+    if _current_design is None:
+        return {"error": "No design loaded. Use read_checkpoint first."}
+
+    try:
+        from collections import defaultdict
+
+        design = _current_design
+        device = design.getDevice()
+
+        if site_types is None:
+            site_types = ["DSP48E2", "RAMB36", "URAM288"]
+
+        normalized_site_types = [str(site_type) for site_type in site_types]
+
+        nodes = []
+        edges = []
+        node_by_id = {}
+        site_name_to_node = {}
+        typed_columns: dict[str, dict[int, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+
+        def get_clock_region_name(tile) -> Optional[str]:
+            try:
+                clock_region = device.getClockRegionFromTile(tile)
+                return str(clock_region.getName()) if clock_region is not None else None
+            except Exception:
+                return None
+
+        def get_slr_name(tile) -> Optional[str]:
+            try:
+                slr = tile.getSLR()
+                return str(slr.getName()) if slr is not None else None
+            except Exception:
+                return None
+
+        def get_site_occupants(site_inst) -> list[str]:
+            if site_inst is None:
+                return []
+            try:
+                cells = site_inst.getCells()
+            except Exception:
+                return []
+            if cells is None:
+                return []
+
+            occupants = []
+            try:
+                for cell in cells:
+                    occupants.append(str(cell.getName()))
+            except Exception:
+                return []
+            return occupants
+
+        def is_supported_site(site_type_name: str) -> bool:
+            return any(kind in site_type_name for kind in normalized_site_types)
+
+        for site in device.getAllSites():
+            site_type_name = str(site.getSiteTypeEnum())
+            if not is_supported_site(site_type_name):
+                continue
+
+            site_inst = design.getSiteInstFromSite(site)
+            occupants = get_site_occupants(site_inst)
+            occupied = len(occupants) > 0
+
+            if occupied and not include_occupied:
+                continue
+            if (not occupied) and not include_free:
+                continue
+
+            tile = site.getTile()
+            column = int(tile.getColumn())
+            row = int(tile.getRow())
+            node_id = f"{site_type_name}:{site.getName()}"
+
+            node = {
+                "id": node_id,
+                "site_name": str(site.getName()),
+                "site_type": site_type_name,
+                "tile": str(tile.getName()),
+                "column": column,
+                "row": row,
+                "instance_x": int(site.getInstanceX()),
+                "instance_y": int(site.getInstanceY()),
+                "clock_region": get_clock_region_name(tile),
+                "slr": get_slr_name(tile),
+                "occupied": occupied,
+                "occupant_cells": occupants,
+                "cascade_up": None,
+                "cascade_down": None,
+            }
+
+            nodes.append(node)
+            node_by_id[node_id] = node
+            site_name_to_node[node["site_name"]] = node
+            typed_columns[site_type_name][column].append(node)
+
+        def add_edge(src: dict[str, Any], dst: dict[str, Any], edge_type: str, same_column: bool) -> None:
+            weight = abs(src["column"] - dst["column"]) + abs(src["row"] - dst["row"])
+            edges.append(
+                {
+                    "src": src["id"],
+                    "dst": dst["id"],
+                    "edge_type": edge_type,
+                    "weight": 0.1 if edge_type == "cascade" else weight,
+                    "same_type": src["site_type"] == dst["site_type"],
+                    "same_column": same_column,
+                }
+            )
+
+        for site_type_name, column_map in typed_columns.items():
+            sorted_columns = sorted(column_map.keys())
+
+            for column in sorted_columns:
+                column_nodes = sorted(column_map[column], key=lambda node: (node["instance_y"], node["row"]))
+
+                if include_cascade_edges:
+                    for lower, upper in zip(column_nodes, column_nodes[1:]):
+                        lower["cascade_up"] = upper["id"]
+                        upper["cascade_down"] = lower["id"]
+                        add_edge(lower, upper, "cascade", same_column=True)
+                        add_edge(upper, lower, "cascade", same_column=True)
+
+                if include_same_column_edges:
+                    for index, src in enumerate(column_nodes):
+                        for dst in column_nodes[index + 1:]:
+                            distance = abs(src["instance_y"] - dst["instance_y"])
+                            if distance > max_neighbor_distance:
+                                break
+                            add_edge(src, dst, "relocation", same_column=True)
+                            add_edge(dst, src, "relocation", same_column=True)
+
+            if include_adjacent_column_edges:
+                for left_column, right_column in zip(sorted_columns, sorted_columns[1:]):
+                    if right_column != left_column + 1:
+                        continue
+
+                    left_nodes = sorted(column_map[left_column], key=lambda node: node["instance_y"])
+                    right_nodes = sorted(column_map[right_column], key=lambda node: node["instance_y"])
+
+                    for src in left_nodes:
+                        nearest = None
+                        nearest_distance = None
+                        for dst in right_nodes:
+                            distance = abs(src["instance_y"] - dst["instance_y"])
+                            if distance > max_neighbor_distance:
+                                continue
+                            if nearest is None or distance < nearest_distance:
+                                nearest = dst
+                                nearest_distance = distance
+
+                        if nearest is not None:
+                            add_edge(src, nearest, "relocation", same_column=False)
+                            add_edge(nearest, src, "relocation", same_column=False)
+
+        relocation_targets = []
+        macro_instances = []
+
+        if cell_names:
+            macro_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+
+            for cell_name in cell_names:
+                cell = design.getCell(cell_name)
+                if cell is None:
+                    relocation_targets.append(
+                        {
+                            "cell": cell_name,
+                            "status": "cell_not_found",
+                            "current_node": None,
+                            "candidate_nodes": [],
+                        }
+                    )
+                    continue
+
+                if not cell.isPlaced():
+                    relocation_targets.append(
+                        {
+                            "cell": cell_name,
+                            "status": "cell_unplaced",
+                            "current_node": None,
+                            "candidate_nodes": [],
+                        }
+                    )
+                    continue
+
+                current_site = cell.getSite()
+                current_site_type = str(current_site.getSiteTypeEnum())
+                current_site_name = str(current_site.getName())
+                current_node = site_name_to_node.get(current_site_name)
+
+                if current_node is None:
+                    relocation_targets.append(
+                        {
+                            "cell": cell_name,
+                            "status": "unsupported_site_type",
+                            "current_node": None,
+                            "candidate_nodes": [],
+                        }
+                    )
+                    continue
+
+                current_column = current_node["column"]
+                current_row = current_node["row"]
+
+                candidates = []
+                for node in nodes:
+                    if node["site_type"] != current_site_type:
+                        continue
+                    if node["occupied"] and node["id"] != current_node["id"]:
+                        continue
+
+                    manhattan_distance = abs(node["column"] - current_column) + abs(node["row"] - current_row)
+                    candidates.append(
+                        {
+                            "node_id": node["id"],
+                            "manhattan_distance": manhattan_distance,
+                            "same_column": node["column"] == current_column,
+                            "occupied": node["occupied"],
+                        }
+                    )
+
+                candidates.sort(key=lambda candidate: (candidate["manhattan_distance"], candidate["node_id"]))
+                relocation_targets.append(
+                    {
+                        "cell": cell_name,
+                        "status": "ok",
+                        "current_node": current_node["id"],
+                        "candidate_nodes": candidates[:16],
+                    }
+                )
+
+                base_name = cell_name
+                chain_index = None
+                if "[" in cell_name and "]" in cell_name:
+                    prefix = cell_name.split("[", 1)[0]
+                    suffix = cell_name.split("]", 1)[1]
+                    index_text = cell_name.split("[", 1)[1].split("]", 1)[0]
+                    if index_text.isdigit():
+                        base_name = prefix + suffix
+                        chain_index = int(index_text)
+
+                macro_groups[(current_site_type, base_name)].append(
+                    {
+                        "cell": cell_name,
+                        "current_node": current_node["id"],
+                        "chain_index": chain_index,
+                        "site_name": current_site_name,
+                    }
+                )
+
+            for (site_type_name, base_name), members in macro_groups.items():
+                indexed_members = [member for member in members if member["chain_index"] is not None]
+                if len(indexed_members) < 2:
+                    continue
+
+                sorted_members = sorted(indexed_members, key=lambda member: member["chain_index"])
+                legal_anchor_nodes = []
+                for edge in edges:
+                    if edge["edge_type"] != "cascade":
+                        continue
+                    src_node = node_by_id.get(edge["src"])
+                    if src_node is None or src_node["site_type"] != site_type_name:
+                        continue
+                    legal_anchor_nodes.append(edge["src"])
+
+                macro_instances.append(
+                    {
+                        "name": base_name,
+                        "kind": f"{site_type_name}_CASCADE_CHAIN",
+                        "members": [member["cell"] for member in sorted_members],
+                        "current_nodes": [member["current_node"] for member in sorted_members],
+                        "legal_anchor_nodes": sorted(set(legal_anchor_nodes)),
+                    }
+                )
+
+        return {
+            "status": "success",
+            "graph_type": "hardblock_relocation",
+            "device": str(device.getName()),
+            "site_types": normalized_site_types,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+            "relocation_targets": relocation_targets,
+            "macro_instances": macro_instances,
+        }
+
+    except Exception as e:
+        logger.error(f"Error building hard-block relocation graph: {e}")
+        return {"error": str(e)}
+
+
 def optimize_lut_input_cone(hierarchical_input_pins: list[str]) -> Dict[str, Any]:
     """
     Optimize LUT input cones by combining chained small LUTs into a single larger LUT.
