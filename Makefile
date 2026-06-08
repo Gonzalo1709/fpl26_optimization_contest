@@ -3,6 +3,7 @@
 # Configuration
 PYTHON := python3
 PIP := $(PYTHON) -m pip
+RUN_CWD ?= $(CURDIR)
 
 # Vivado executable - can be overridden with: make setup VIVADO_EXEC=/path/to/vivado
 VIVADO_EXEC ?= vivado
@@ -88,6 +89,7 @@ help:
 	@echo "Environment variables:"
 	@echo "  VIVADO_EXEC     - Path to Vivado executable (default: vivado)"
 	@echo "  JAVA_HOME       - Java installation directory (auto-detected from PATH if not set)"
+	@echo "  RUN_CWD         - Working directory for optimizer/test execution (default: repo root)"
 	@echo "  DCP             - Input DCP file for run_optimizer / run_test targets"
 	@echo "  MAX_NETS        - Max high fanout nets to optimize in test mode (default: 5)"
 	@echo "  GOLDEN          - Golden (reference) DCP for validation"
@@ -240,7 +242,7 @@ run_optimizer:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" $(OPT_ARGS)
+	cd "$(RUN_CWD)" && $(PYTHON) "$(CURDIR)/dcp_optimizer.py" "$(DCP)" $(OPT_ARGS)
 
 # Run test mode: Run dcp_optimizer.py with --test flag (no LLM required)
 run_test:
@@ -275,7 +277,7 @@ run_test:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" --test $(if $(MAX_NETS),--max-nets $(MAX_NETS))
+	cd "$(RUN_CWD)" && $(PYTHON) "$(CURDIR)/dcp_optimizer.py" "$(DCP)" --test $(if $(MAX_NETS),--max-nets $(MAX_NETS))
 
 # Validation target: Validate functional equivalence between two DCPs
 validate:
