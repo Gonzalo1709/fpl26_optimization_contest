@@ -1,7 +1,8 @@
 """Pure parsing and file-loading helpers for the FPGA optimizer."""
 
-from pathlib import Path
 from typing import Any
+
+from src.prompting import load_system_prompt
 
 
 def parse_timing_summary_static(timing_report: str) -> dict:
@@ -49,13 +50,3 @@ def parse_timing_summary_static(timing_report: str) -> dict:
 			pass
 
 	return result
-
-
-def load_system_prompt() -> str:
-	"""Load system prompt from SYSTEM_PROMPT.TXT file."""
-	prompt_file = Path(__file__).resolve().parent.parent / "SYSTEM_PROMPT.TXT"
-
-	try:
-		return prompt_file.read_text()
-	except FileNotFoundError:
-		raise FileNotFoundError(f"System prompt file not found: {prompt_file}")

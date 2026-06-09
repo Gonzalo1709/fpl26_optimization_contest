@@ -63,6 +63,12 @@ Examples:
         help=f"LLM model to use (default: {DEFAULT_MODEL})",
     )
     parser.add_argument(
+        "--system-prompt",
+        type=Path,
+        default=None,
+        help="Path to the base system prompt to use for planner decisions (default: SYSTEM_PROMPT.TXT)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode (verbose logging, save intermediate checkpoints)",
@@ -186,6 +192,8 @@ Examples:
     print(f"Output:      {args.output_dcp.resolve()}")
     print(f"Run dir:     {run_dir}")
     print(f"Model:       {args.model}")
+    if args.system_prompt:
+        print(f"Prompt:      {args.system_prompt.resolve()}")
     print(f"Search mode: {args.search_mode}")
     if args.search_mode == "generations":
         print(f"Branches:    {args.branches}")
@@ -212,6 +220,7 @@ Examples:
         debug=args.debug,
         run_dir=run_dir,
         generation_config=generation_config,
+        system_prompt_path=args.system_prompt,
     )
 
     try:

@@ -12,7 +12,8 @@ from typing import Optional
 from openai import OpenAI
 
 from src.base import DCPOptimizerBase
-from src.parsers import load_system_prompt, parse_timing_summary_static
+from src.parsers import parse_timing_summary_static
+from src.prompting import DEFAULT_SYSTEM_PROMPT_PATH, build_planner_system_prompt, prompt_sha256
 from src.search import GenerationSearchConfig, SearchCandidate
 
 logger = logging.getLogger(__name__)
@@ -34,12 +35,20 @@ class DCPOptimizer(DCPOptimizerBase):
         debug: bool = False,
         run_dir: Optional[Path] = None,
         generation_config: Optional[GenerationSearchConfig] = None,
+        system_prompt_path: Optional[Path] = None,
+        system_prompt: Optional[str] = None,
     ):
         super().__init__(debug=debug, run_dir=run_dir)
 
         self.api_key = api_key
         self.model = model
         self.generation_config = generation_config or GenerationSearchConfig()
+        self.system_prompt_path = system_prompt_path or DEFAULT_SYSTEM_PROMPT_PATH
+        self.planner_system_prompt = build_planner_system_prompt(
+            base_prompt=system_prompt,
+            prompt_path=self.system_prompt_path,
+        )
+        self.system_prompt_hash = prompt_sha256(self.planner_system_prompt)
         self.openai = OpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
@@ -375,47 +384,10 @@ class DCPOptimizer(DCPOptimizerBase):
 
     async def choose_action_llm(self, decision_input: dict) -> dict:
         """Choose a recipe and its arguments using a single LLM call."""
-        prompt = """
-You are an FPGA optimization planner.
-
-Choose the next optimization recipe.
-
-Return JSON:
-{
-  "strategy": "PBLOCK | FANOUT | PHYS_OPT",
-  "args": { ... }
-}
-
-Rules:
-- You do not have direct access to Vivado or RapidWright tools.
-- You must choose only among the provided recipes.
-- Do not reason in terms of tool calls, tool names, or command sequences.
-- Prefer PBLOCK when the analysis shows spread-out critical paths or explicitly recommends PBLOCK.
-- Prefer FANOUT when critical high-fanout nets are present, not blacklisted, and placement spread is not the main issue.
-- Prefer PHYS_OPT when placement spread is low, after PBLOCK/FANOUT changed the design, or when earlier steps stagnate.
-- Avoid repeating strategies that the recent history shows were ineffective from the current state.
-- If stagnation >= 2, switch strategy if possible.
-- If a FANOUT net previously failed, do not pick FANOUT just to retry the same exhausted net set.
-- Use timing metrics holistically: WNS first, then TNS, then failing endpoints.
-- FANOUT means: choose how many top candidate nets the controller should try within the FANOUT recipe.
-- PBLOCK means: choose the PBLOCK recipe when spread reduction is the main bet.
-- PHYS_OPT means: choose the PHYS_OPT recipe when local fine-tuning is the main bet.
-- FANOUT: choose top_n_nets (1-10)
-- PHYS_OPT: choose directive from ["Explore", "AggressiveExplore", "Default"]
-- PBLOCK: args can be empty
-
-Recipe intent reference:
-- FANOUT is best for shared enable/valid/control nets on many failing paths.
-- PBLOCK is best for spread-out critical paths and large physical distance.
-- PHYS_OPT is best for local cleanup and fine-tuning after structure/placement is already reasonable.
-
-Return ONLY JSON.
-"""
-
         response = self.openai.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": prompt},
+                {"role": "system", "content": self.planner_system_prompt},
                 {"role": "user", "content": json.dumps(decision_input)},
             ],
             max_tokens=200,
@@ -1408,6 +1380,10 @@ Return ONLY JSON.
         report = {
             "model": self.model,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "system_prompt": {
+                "path": str(self.system_prompt_path),
+                "sha256_16": self.system_prompt_hash,
+            },
             "generation_search": {
                 "config": asdict(self.generation_config),
                 "best_candidate_id": self.best_candidate.candidate_id if self.best_candidate else None,
