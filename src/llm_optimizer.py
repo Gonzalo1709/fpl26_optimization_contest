@@ -566,6 +566,8 @@ class DCPOptimizer(DCPOptimizerBase):
         step: int,
     ) -> Optional[tuple[str, dict]]:
         """Force recipe diversity for the first generation from the root candidate."""
+        if self.generation_config.strategy_effort == "fast" or self.generation_config.branch_factor < 2:
+            return None
         if generation != 1 or parent.candidate_id != "root" or step != 1:
             return None
 
@@ -612,16 +614,38 @@ class DCPOptimizer(DCPOptimizerBase):
         )
         pblock_ranges = json.loads(pblock)["pblock_ranges"]
 
-        attempt_plans = [
-            {"suffix": "soft", "is_soft": True, "place_directive": "Default", "phys_opt_directive": "Default"},
-            {"suffix": "balanced", "is_soft": False, "place_directive": "Explore", "phys_opt_directive": "Explore"},
-            {
-                "suffix": "aggressive",
-                "is_soft": False,
-                "place_directive": "Quick",
-                "phys_opt_directive": "AggressiveExplore",
-            },
-        ]
+        attempt_plans_by_effort = {
+            "fast": [
+                {"suffix": "fast", "is_soft": False, "place_directive": "Quick", "phys_opt_directive": None},
+            ],
+            "balanced": [
+                {"suffix": "soft", "is_soft": True, "place_directive": "Default", "phys_opt_directive": "Default"},
+                {"suffix": "balanced", "is_soft": False, "place_directive": "Explore", "phys_opt_directive": "Explore"},
+                {
+                    "suffix": "aggressive",
+                    "is_soft": False,
+                    "place_directive": "Quick",
+                    "phys_opt_directive": "AggressiveExplore",
+                },
+            ],
+            "thorough": [
+                {"suffix": "soft", "is_soft": True, "place_directive": "Default", "phys_opt_directive": "Default"},
+                {"suffix": "balanced", "is_soft": False, "place_directive": "Explore", "phys_opt_directive": "Explore"},
+                {
+                    "suffix": "aggressive",
+                    "is_soft": False,
+                    "place_directive": "Quick",
+                    "phys_opt_directive": "AggressiveExplore",
+                },
+                {
+                    "suffix": "default_hard",
+                    "is_soft": False,
+                    "place_directive": "Default",
+                    "phys_opt_directive": "AggressiveExplore",
+                },
+            ],
+        }
+        attempt_plans = attempt_plans_by_effort.get(self.generation_config.strategy_effort, attempt_plans_by_effort["balanced"])
 
         best_report: Optional[str] = baseline_report
         best_metrics = baseline_metrics
@@ -639,7 +663,8 @@ class DCPOptimizer(DCPOptimizerBase):
             })
             await self.v("run_tcl", {"command": "place_design -unplace"})
             await self.v("place_design", {"directive": plan["place_directive"]})
-            await self.v("phys_opt_design", {"directive": plan["phys_opt_directive"]})
+            if plan["phys_opt_directive"]:
+                await self.v("phys_opt_design", {"directive": plan["phys_opt_directive"]})
             report, _ = await self._reroute_and_measure()
             current_metrics = await self._measure_current_metrics(report)
 
@@ -654,6 +679,11 @@ class DCPOptimizer(DCPOptimizerBase):
 
     async def run_fanout_flow(self, top_n_nets: int = 5) -> str:
         """Execute high-fanout optimization with per-net reroute feedback."""
+        if self.generation_config.strategy_effort == "fast":
+            top_n_nets = min(top_n_nets, 1)
+        elif self.generation_config.strategy_effort == "balanced":
+            top_n_nets = min(top_n_nets, 5)
+
         nets_report = await self.v(
             "get_critical_high_fanout_nets",
             {
@@ -707,6 +737,8 @@ class DCPOptimizer(DCPOptimizerBase):
             if self._is_metrics_improvement(current_metrics, best_metrics):
                 best_metrics = current_metrics
                 best_report = report
+                if self.generation_config.strategy_effort == "fast":
+                    break
             else:
                 await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
 
@@ -720,10 +752,17 @@ class DCPOptimizer(DCPOptimizerBase):
         baseline_metrics = await self._measure_current_metrics(baseline_report)
 
         directive_sequence = [directive]
-        if directive == "Default":
+        if self.generation_config.strategy_effort == "fast":
+            directive_sequence = [directive]
+        elif directive == "Default":
             directive_sequence.extend(["Explore", "AggressiveExplore"])
         elif directive == "Explore":
             directive_sequence.append("AggressiveExplore")
+
+        if self.generation_config.strategy_effort == "thorough":
+            for extra_directive in ["Default", "Explore", "AggressiveExplore"]:
+                if extra_directive not in directive_sequence:
+                    directive_sequence.append(extra_directive)
 
         best_report: Optional[str] = baseline_report
         best_metrics = baseline_metrics
@@ -895,6 +934,44 @@ class DCPOptimizer(DCPOptimizerBase):
         peak = candidate.peak_wns if candidate.peak_wns is not None else float("-inf")
         return current, peak
 
+    def _budget_stop_reason(self) -> Optional[str]:
+        """Return a human-readable stop reason when configured budgets are exhausted."""
+        cfg = self.generation_config
+        if cfg.max_runtime_minutes is not None and self.start_time is not None:
+            elapsed_minutes = (time.time() - self.start_time) / 60.0
+            if elapsed_minutes >= cfg.max_runtime_minutes:
+                return f"runtime budget reached ({elapsed_minutes:.1f}/{cfg.max_runtime_minutes:.1f} minutes)"
+
+        if cfg.max_cost is not None and self.total_cost >= cfg.max_cost:
+            return f"OpenRouter cost budget reached (${self.total_cost:.4f}/${cfg.max_cost:.4f})"
+
+        return None
+
+    def _should_stop_for_budget(self, prefix: str = "[BUDGET]") -> bool:
+        """Print and return True when no new expensive search step should start."""
+        reason = self._budget_stop_reason()
+        if reason:
+            print(f"{prefix} {reason}; stopping before starting another search step.")
+            return True
+        return False
+
+    def _is_step_roi_acceptable(self, delta_wns: Optional[float], elapsed_seconds: float) -> bool:
+        """Return whether a step improvement is large enough for its elapsed runtime."""
+        threshold = self.generation_config.min_wns_per_minute
+        if threshold <= 0:
+            return True
+        if delta_wns is None or delta_wns <= 0:
+            return False
+        elapsed_minutes = max(elapsed_seconds / 60.0, 1.0 / 60.0)
+        return (delta_wns / elapsed_minutes) >= threshold
+
+    def _format_step_roi(self, delta_wns: Optional[float], elapsed_seconds: float) -> str:
+        """Format elapsed step cost and WNS-per-minute ROI for logs."""
+        elapsed_minutes = elapsed_seconds / 60.0
+        if delta_wns is None or elapsed_minutes <= 0:
+            return f"elapsed {elapsed_minutes:.2f} min, WNS ROI unknown"
+        return f"elapsed {elapsed_minutes:.2f} min, WNS ROI {delta_wns / max(elapsed_minutes, 1e-9):.4f} ns/min"
+
     async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
         """Run the optimization workflow."""
         self.start_time = time.time()
@@ -954,6 +1031,9 @@ class DCPOptimizer(DCPOptimizerBase):
         max_iterations = self.generation_config.max_llm_calls
 
         for index in range(max_iterations):
+            if self._should_stop_for_budget():
+                break
+
             self.iteration += 1
             print(f"\n=== Iteration {index + 1} ===")
 
@@ -973,7 +1053,9 @@ class DCPOptimizer(DCPOptimizerBase):
             previous_wns = previous_metrics["wns"]
 
             try:
+                step_start_time = time.time()
                 result_report, current_wns = await self._execute_strategy(strategy, args)
+                step_elapsed_time = time.time() - step_start_time
             except Exception as exc:
                 logger.exception("Error during linear iteration %s", index + 1)
                 self.history.append(
@@ -996,6 +1078,12 @@ class DCPOptimizer(DCPOptimizerBase):
 
             current_metrics = await self._measure_current_metrics(result_report)
             delta = current_wns - previous_wns if (current_wns is not None and previous_wns is not None) else None
+            delta_vs_best = (
+                current_wns - best_metrics["wns"]
+                if current_wns is not None and best_metrics.get("wns") is not None
+                else None
+            )
+            roi_accepted = self._is_step_roi_acceptable(delta_vs_best, step_elapsed_time)
             self.history.append(
                 {
                     "iteration": index + 1,
@@ -1005,6 +1093,9 @@ class DCPOptimizer(DCPOptimizerBase):
                     "tns": current_metrics.get("tns"),
                     "failing_endpoints": current_metrics.get("failing_endpoints"),
                     "delta_wns": delta,
+                    "delta_vs_best": delta_vs_best,
+                    "elapsed_seconds": step_elapsed_time,
+                    "roi_accepted": roi_accepted,
                     "previous_wns": previous_wns,
                     "delta_tns": (
                         current_metrics.get("tns") - previous_metrics["tns"]
@@ -1022,15 +1113,20 @@ class DCPOptimizer(DCPOptimizerBase):
             )
 
             print(f"WNS: {self._format_wns(current_wns)}")
+            print(f"Step cost: {self._format_step_roi(delta_vs_best, step_elapsed_time)}")
 
             if self._is_metrics_improvement(current_metrics, best_metrics):
                 best_wns = current_wns
                 best_metrics = current_metrics
-                stagnation = 0
                 best_dcp_path = await self._save_best_checkpoint(
                     Path(self.temp_dir) / f"best_iter_{index + 1:03d}.dcp"
                 )
                 last_best_iteration = index + 1
+                if roi_accepted:
+                    stagnation = 0
+                else:
+                    stagnation += 1
+                    print("Improvement saved, but below configured WNS/runtime ROI; patience was not reset.")
             else:
                 stagnation += 1
 
@@ -1080,6 +1176,9 @@ class DCPOptimizer(DCPOptimizerBase):
         active_candidates = [root]
 
         for generation in range(1, cfg.max_generations + 1):
+            if self._should_stop_for_budget("[SEARCH]"):
+                break
+
             if self.llm_call_count >= cfg.max_llm_calls:
                 print(f"[SEARCH] Reached max LLM calls ({cfg.max_llm_calls}); stopping search.")
                 break
@@ -1096,6 +1195,9 @@ class DCPOptimizer(DCPOptimizerBase):
 
             for parent in active_candidates:
                 for branch_index in range(1, cfg.branch_factor + 1):
+                    if self._should_stop_for_budget("[SEARCH]"):
+                        break
+
                     if self.llm_call_count >= cfg.max_llm_calls:
                         break
 
@@ -1214,6 +1316,9 @@ class DCPOptimizer(DCPOptimizerBase):
         branch_history: list[dict] = []
 
         for step in range(1, cfg.max_steps_per_branch + 1):
+            if self._should_stop_for_budget("[SEARCH]"):
+                break
+
             if self.llm_call_count >= cfg.max_llm_calls:
                 break
 
@@ -1252,7 +1357,9 @@ class DCPOptimizer(DCPOptimizerBase):
             }
 
             try:
+                step_start_time = time.time()
                 result_report, current_wns = await self._execute_strategy(strategy, args)
+                step_elapsed_time = time.time() - step_start_time
             except Exception as exc:
                 logger.exception("Error during branch %s step %s", branch_id, step)
                 branch_history.append(
@@ -1268,6 +1375,12 @@ class DCPOptimizer(DCPOptimizerBase):
                 continue
 
             current_metrics = await self._measure_current_metrics(result_report)
+            delta_vs_peak = (
+                current_wns - peak_metrics["wns"]
+                if current_wns is not None and peak_metrics.get("wns") is not None
+                else None
+            )
+            roi_accepted = self._is_step_roi_acceptable(delta_vs_peak, step_elapsed_time)
             branch_history.append(
                 {
                     "step": step,
@@ -1279,6 +1392,9 @@ class DCPOptimizer(DCPOptimizerBase):
                     "delta_wns": (
                         current_wns - previous_wns if current_wns is not None and previous_wns is not None else None
                     ),
+                    "delta_vs_peak": delta_vs_peak,
+                    "elapsed_seconds": step_elapsed_time,
+                    "roi_accepted": roi_accepted,
                     "previous_wns": previous_wns,
                     "delta_tns": (
                         current_metrics.get("tns") - previous_metrics["tns"]
@@ -1306,7 +1422,14 @@ class DCPOptimizer(DCPOptimizerBase):
             if self._is_metrics_improvement(current_metrics, peak_metrics):
                 peak_wns = current_wns
                 peak_metrics = current_metrics
-                steps_since_peak = 0
+                if roi_accepted:
+                    steps_since_peak = 0
+                else:
+                    steps_since_peak += 1
+                    print(
+                        "[SEARCH] Improvement saved, but below configured WNS/runtime ROI; "
+                        "branch patience was not reset."
+                    )
             else:
                 steps_since_peak += 1
 
@@ -1330,6 +1453,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 f"[SEARCH] {latest_candidate.candidate_id}: current {self._format_wns(current_wns)}, "
                 f"peak {self._format_wns(peak_wns)}, steps since peak {steps_since_peak}"
             )
+            print(f"[SEARCH] Step cost: {self._format_step_roi(delta_vs_peak, step_elapsed_time)}")
 
             if self._is_metrics_improvement(
                 current_metrics,
@@ -1453,6 +1577,17 @@ class DCPOptimizer(DCPOptimizerBase):
         print("\nITERATION STATS:")
         print(f"  Total iterations:    {self.iteration}")
         print(f"  LLM API calls:       {self.llm_call_count}")
+
+        print("\nSEARCH BUDGET:")
+        print(f"  Budget profile:      {self.generation_config.budget_profile}")
+        print(f"  Strategy effort:     {self.generation_config.strategy_effort}")
+        print(f"  Min WNS improvement: {self.generation_config.min_wns_delta:.3f} ns")
+        if self.generation_config.min_wns_per_minute > 0:
+            print(f"  Min WNS ROI:         {self.generation_config.min_wns_per_minute:.4f} ns/min")
+        if self.generation_config.max_runtime_minutes is not None:
+            print(f"  Runtime budget:      {self.generation_config.max_runtime_minutes:.1f} min")
+        if self.generation_config.max_cost is not None:
+            print(f"  Cost budget:         ${self.generation_config.max_cost:.4f}")
 
         if self.generation_config.enabled:
             print("\nGENERATION SEARCH:")
