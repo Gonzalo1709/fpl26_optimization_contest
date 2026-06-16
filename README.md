@@ -190,6 +190,10 @@ make run_test DCP=fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp
 # Full agent mode: LLM-guided optimization (requires OPENROUTER_API_KEY)
 export OPENROUTER_API_KEY="<your_key_here>"
 make run_optimizer DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp
+
+# Single-method mode: run one selected recipe once (no LLM required)
+python3 dcp_optimizer.py fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp --single-method PBLOCK
+python3 dcp_optimizer.py fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp --single-method PHYS_OPT --phys-opt-directive Explore
 ```
 
 Both targets will:

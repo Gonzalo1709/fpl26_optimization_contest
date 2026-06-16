@@ -18,6 +18,7 @@ from src.search import GenerationSearchConfig, SearchCandidate
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "~openai/gpt-latest"
+SUPPORTED_SINGLE_METHODS = ("PBLOCK", "FANOUT", "PHYS_OPT", "HARD_BLOCK")
 
 
 class ToolExecutionError(RuntimeError):
@@ -776,6 +777,55 @@ Return ONLY JSON.
         await self.v("open_checkpoint", {"dcp_path": str(best_checkpoint.resolve())})
         return best_report
 
+    async def run_hard_block_flow(
+        self,
+        hard_block_types: Optional[list[str]] = None,
+        min_score_improvement: float = 5.0,
+    ) -> str:
+        """Execute the hard-block column/cascade relocation recipe once."""
+        baseline_checkpoint = Path(self.temp_dir) / "hard_block_baseline.dcp"
+        await self.v("write_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "force": True})
+        baseline_report = await self.v("report_timing_summary")
+        baseline_metrics = await self._measure_current_metrics(baseline_report)
+
+        await self._reload_rapidwright_from_vivado_checkpoint(baseline_checkpoint)
+        result = await self.rw(
+            "hard_block_column_cascade_relocation",
+            {
+                "hard_block_types": hard_block_types or ["DSP", "BRAM", "URAM"],
+                "min_score_improvement": min_score_improvement,
+                "dry_run": False,
+            },
+        )
+
+        relocation_data = json.loads(result)
+        if relocation_data.get("error"):
+            raise RuntimeError(relocation_data["error"])
+
+        if relocation_data.get("status") == "no_improvement":
+            logger.info("Hard-block flow found no improving legal move; keeping baseline placement.")
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
+            return baseline_report
+
+        temp_dcp = Path(self.temp_dir) / "hard_block_opt.dcp"
+        await self.rw(
+            "write_checkpoint",
+            {
+                "dcp_path": str(temp_dcp.resolve()),
+                "overwrite": True,
+            },
+        )
+
+        await self.v("open_checkpoint", {"dcp_path": str(temp_dcp.resolve())})
+        report, _ = await self._reroute_and_measure()
+        current_metrics = await self._measure_current_metrics(report)
+
+        if self._is_metrics_improvement(current_metrics, baseline_metrics):
+            return report
+
+        await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
+        return baseline_report
+
     def parse_utilization(self, report: str) -> dict:
         """Extract LUT and FF counts from the pblock utilization report."""
         lut = None
@@ -812,6 +862,8 @@ Return ONLY JSON.
             result = await self.run_pblock_flow()
         elif strategy == "FANOUT":
             result = await self.run_fanout_flow(**args)
+        elif strategy == "HARD_BLOCK":
+            result = await self.run_hard_block_flow(**args)
         else:
             result = await self.run_phys_opt_flow(**args)
 
@@ -840,6 +892,7 @@ Return ONLY JSON.
                 "PBLOCK": {},
                 "FANOUT": {"top_n_nets": "int (1-10)"},
                 "PHYS_OPT": {"directive": ["Explore", "AggressiveExplore", "Default"]},
+                "HARD_BLOCK": {"hard_block_types": ["DSP", "BRAM", "URAM"]},
             },
         }
 
@@ -964,6 +1017,72 @@ Return ONLY JSON.
         if self.generation_config.enabled:
             return await self._optimize_generational(input_dcp, output_dcp, initial_analysis)
         return await self._optimize_linear(input_dcp, output_dcp, initial_analysis)
+
+    async def run_single_method(
+        self,
+        input_dcp: Path,
+        output_dcp: Path,
+        method: str,
+        *,
+        top_n_nets: int = 5,
+        phys_opt_directive: str = "Default",
+    ) -> bool:
+        """Run one selected optimization method exactly once, without LLM search."""
+        self.start_time = time.time()
+        method = method.upper()
+        if method not in SUPPORTED_SINGLE_METHODS:
+            raise ValueError(
+                f"Unsupported single method '{method}'. Supported methods: {', '.join(SUPPORTED_SINGLE_METHODS)}"
+            )
+
+        try:
+            await self.perform_initial_analysis(input_dcp)
+
+            if method == "PBLOCK":
+                strategy_args = {}
+            elif method == "FANOUT":
+                strategy_args = {"top_n_nets": top_n_nets}
+            elif method == "HARD_BLOCK":
+                strategy_args = {"hard_block_types": ["DSP", "BRAM", "URAM"]}
+            else:
+                strategy_args = {"directive": phys_opt_directive}
+
+            print(f"=== Running Single Method: {method} ===\n")
+            timing_report, _ = await self._execute_strategy(method, strategy_args)
+            final_metrics = await self._measure_current_metrics(timing_report)
+
+            await self.v(
+                "write_checkpoint",
+                {
+                    "dcp_path": str(output_dcp.resolve()),
+                    "force": True,
+                },
+            )
+
+            self.end_time = time.time()
+            total_runtime = self.end_time - self.start_time
+            self.final_wns = final_metrics.get("wns")
+
+            print("=== Single-Method Summary ===")
+            print(f"Method: {method}")
+            if self.initial_wns is not None:
+                print(f"Initial WNS: {self.initial_wns:.3f} ns")
+            if self.final_wns is not None:
+                print(f"Final WNS:   {self.final_wns:.3f} ns")
+            if self.clock_period is not None and self.initial_wns is not None and self.final_wns is not None:
+                initial_fmax = self.calculate_fmax(self.initial_wns, self.clock_period)
+                final_fmax = self.calculate_fmax(self.final_wns, self.clock_period)
+                if initial_fmax is not None and final_fmax is not None:
+                    print(f"Fmax:        {initial_fmax:.2f} -> {final_fmax:.2f} MHz")
+            print(f"Runtime:     {total_runtime:.2f} seconds")
+            print(f"Saved DCP:   {output_dcp}")
+            print("=" * 70 + "\n")
+            return True
+        except Exception as exc:
+            logger.exception("Single-method run failed: %s", exc)
+            print(f"\n✗ Single-method run failed: {exc}\n")
+            self.end_time = time.time()
+            return False
 
     async def _optimize_linear(self, input_dcp: Path, output_dcp: Path, initial_analysis: str) -> bool:
         """Run the recipe-driven linear optimization workflow."""

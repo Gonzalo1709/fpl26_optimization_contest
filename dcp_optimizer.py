@@ -15,7 +15,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from src.llm_optimizer import DCPOptimizer, DEFAULT_MODEL
+from src.llm_optimizer import DCPOptimizer, DEFAULT_MODEL, SUPPORTED_SINGLE_METHODS
 from src.search import GenerationSearchConfig
 from src.test_modes import run_test_mode
 
@@ -37,6 +37,9 @@ Examples:
   python dcp_optimizer.py input.dcp --model anthropic/claude-sonnet-4
   python dcp_optimizer.py input.dcp --branches 3 --beam-width 2 --generations 4 --steps-without-improvement 3
   python dcp_optimizer.py input.dcp --search-mode linear
+  python dcp_optimizer.py input.dcp --single-method PBLOCK
+  python dcp_optimizer.py input.dcp --single-method FANOUT --top-n-nets 3
+  python dcp_optimizer.py input.dcp --single-method PHYS_OPT --phys-opt-directive Explore
   python dcp_optimizer.py input.dcp --debug
   python dcp_optimizer.py fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp --test
   python dcp_optimizer.py fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp --test
@@ -131,6 +134,23 @@ Examples:
         action="store_true",
         help="Keep searching after WNS reaches 0 instead of stopping at timing closure",
     )
+    parser.add_argument(
+        "--single-method",
+        choices=SUPPORTED_SINGLE_METHODS,
+        help="Run exactly one selected optimization method once, without LLM search.",
+    )
+    parser.add_argument(
+        "--top-n-nets",
+        type=int,
+        default=5,
+        help="When using --single-method FANOUT, optimize this many high-fanout nets (default: 5)",
+    )
+    parser.add_argument(
+        "--phys-opt-directive",
+        choices=["Default", "Explore", "AggressiveExplore"],
+        default="Default",
+        help="When using --single-method PHYS_OPT, use this phys_opt_design directive (default: Default)",
+    )
 
     args = parser.parse_args()
 
@@ -167,6 +187,63 @@ Examples:
             run_dir=run_dir,
         )
         sys.exit(exit_code)
+
+    if args.single_method:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+
+        print("FPGA Design Optimization - SINGLE METHOD MODE")
+        print("==============================================")
+        print(f"Input:        {args.input_dcp.resolve()}")
+        print(f"Output:       {args.output_dcp.resolve()}")
+        print(f"Run dir:      {run_dir}")
+        print(f"Method:       {args.single_method}")
+        if args.single_method == "FANOUT":
+            print(f"Top nets:     {args.top_n_nets}")
+        elif args.single_method == "PHYS_OPT":
+            print(f"Directive:    {args.phys_opt_directive}")
+        print()
+
+        generation_config = GenerationSearchConfig(enabled=False)
+        optimizer = DCPOptimizer(
+            api_key=args.api_key or "",
+            model=args.model,
+            debug=args.debug,
+            run_dir=run_dir,
+            generation_config=generation_config,
+        )
+
+        try:
+            await optimizer.start_servers()
+            success = await optimizer.run_single_method(
+                args.input_dcp,
+                args.output_dcp,
+                args.single_method,
+                top_n_nets=max(1, args.top_n_nets),
+                phys_opt_directive=args.phys_opt_directive,
+            )
+
+            if success:
+                print("\n✓ Single-method optimization completed successfully")
+                print("\nOutput files:")
+                print(f"  Optimized DCP: {args.output_dcp}")
+                print(f"  Run directory: {run_dir}")
+                sys.exit(0)
+
+            print("\n✗ Single-method optimization did not complete successfully")
+            print(f"\nRun directory preserved at: {run_dir}")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            print("\n\nInterrupted by user")
+            print(f"Run directory preserved at: {run_dir}")
+            sys.exit(130)
+        except Exception as exc:
+            logging.exception("Fatal error")
+            print(f"\n✗ Fatal error: {exc}")
+            print(f"Run directory preserved at: {run_dir}")
+            sys.exit(1)
+        finally:
+            await optimizer.cleanup()
 
     if not args.api_key:
         print("Error: OpenRouter API key required. Set OPENROUTER_API_KEY or use --api-key", file=sys.stderr)
