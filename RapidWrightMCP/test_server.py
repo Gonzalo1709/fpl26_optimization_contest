@@ -92,6 +92,13 @@ def main():
     if result != 0:
         print("\n❌ ERROR: write_checkpoint overwrite test failed.")
         return 1
+
+    # Test 7: Hard-block relocation recipe on an empty design
+    print("\n[7/7] Testing hard-block relocation recipe on an empty design...")
+    result = test_hard_block_recipe_empty_design()
+    if result != 0:
+        print("\n❌ ERROR: hard-block relocation recipe test failed.")
+        return 1
     
     print("\n" + "="*60)
     print("✅ Test suite completed successfully!")
@@ -235,6 +242,42 @@ def test_write_checkpoint_overwrite():
         
     except Exception as e:
         print(f"  ❌ Exception during overwrite test: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+def test_hard_block_recipe_empty_design():
+    """
+    Exercise the hard-block relocation recipe on a minimal design with no
+    placed hard blocks. This validates the tool wiring and dry-run behavior
+    without requiring a benchmark checkpoint.
+    """
+    try:
+        from com.xilinx.rapidwright.design import Design
+
+        design_name = "test_hard_block_recipe_empty_design"
+        part_name = "xcvu3p-ffvc1517-2-e"
+
+        print("  Creating empty design for hard-block recipe test...")
+        design = Design(design_name, part_name)
+        rw._current_design = design
+
+        result = rw.hard_block_column_cascade_relocation(dry_run=True)
+        print_result("hard_block_column_cascade_relocation", result)
+
+        if result.get("status") not in {"success", "no_improvement"}:
+            print(f"  ❌ Unexpected recipe status: {result.get('status')}")
+            return 1
+
+        if result.get("hard_block_cells_found", 0) != 0:
+            print(f"  ❌ Expected zero hard blocks, got {result.get('hard_block_cells_found')}")
+            return 1
+
+        print("  ✓ hard-block relocation recipe handled empty design correctly")
+        return 0
+    except Exception as e:
+        print(f"  ❌ Exception during hard-block recipe test: {e}")
         import traceback
         traceback.print_exc()
         return 1

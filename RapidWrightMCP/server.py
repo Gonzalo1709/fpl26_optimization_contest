@@ -411,6 +411,57 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["cell_names"]
             }
+        ),
+        Tool(
+            name="hard_block_column_cascade_relocation",
+            description="""Localized hard-block relocation recipe for DSP/BRAM/URAM macros.
+
+            Builds an internal graph of placed hard blocks, detects cascade-connected
+            or conservatively stacked macros, enumerates legal same-type relocation
+            targets across compatible columns, scores candidates, applies the best
+            improving move, and unroutes affected nets for downstream rerouting.
+
+            Must be called AFTER read_checkpoint.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hard_block_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Subset of hard-block families to consider (default: ['DSP', 'BRAM', 'URAM'])"
+                    },
+                    "max_macros": {
+                        "type": "integer",
+                        "description": "Maximum macros to evaluate (default: 50)",
+                        "default": 50
+                    },
+                    "max_candidates_per_macro": {
+                        "type": "integer",
+                        "description": "Maximum legal candidates to retain per macro (default: 25)",
+                        "default": 25
+                    },
+                    "min_score_improvement": {
+                        "type": "number",
+                        "description": "Minimum conservative score improvement required to accept a move (default: 5.0)",
+                        "default": 5.0
+                    },
+                    "preserve_slr": {
+                        "type": "boolean",
+                        "description": "Reject candidates that move cells to a different SLR (default: true)",
+                        "default": True
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Analyze and select a move without modifying the design (default: false)",
+                        "default": False
+                    },
+                    "fallback_neighbor_gap": {
+                        "type": "integer",
+                        "description": "Vertical Y-gap used by conservative fallback grouping when exact cascade detection is insufficient (default: 1)",
+                        "default": 1
+                    }
+                }
+            }
         )
     ]
 
@@ -518,6 +569,17 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             result = rw.optimize_cell_placement(
                 cell_names=arguments["cell_names"],
                 max_candidates=arguments.get("max_candidates", 10)
+            )
+
+        elif name == "hard_block_column_cascade_relocation":
+            result = rw.hard_block_column_cascade_relocation(
+                hard_block_types=arguments.get("hard_block_types"),
+                max_macros=arguments.get("max_macros", 50),
+                max_candidates_per_macro=arguments.get("max_candidates_per_macro", 25),
+                min_score_improvement=arguments.get("min_score_improvement", 5.0),
+                preserve_slr=arguments.get("preserve_slr", True),
+                dry_run=arguments.get("dry_run", False),
+                fallback_neighbor_gap=arguments.get("fallback_neighbor_gap", 1),
             )
         
         else:

@@ -8,6 +8,8 @@ Uses the rapidwright pip package for JPype integration, with RAPIDWRIGHT_PATH
 and CLASSPATH pointing to the local RapidWright git submodule for Java classes.
 """
 import logging
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -1710,6 +1712,781 @@ def analyze_net_detour(
         return {"error": str(e)}                
 
 #
+
+
+@dataclass
+class HardBlockCellNode:
+    name: str
+    hard_block_type: str
+    cell_type: str
+    current_site_name: str
+    site_type: str
+    column_id: str
+    y_index: int
+    clock_region: str
+    slr: str
+    fixed: bool
+    parent_hierarchy: str
+    relative_y_offset: int = 0
+    site_occupancy: str = "occupied"
+    target_site_name: Optional[str] = None
+    cascade_direction: Optional[str] = None
+    boundary_net_count: int = 0
+    timing_criticality: Optional[float] = None
+
+
+@dataclass
+class HardBlockMacro:
+    macro_id: str
+    hard_block_type: str
+    cell_names: list[str]
+    ordered_cell_names: list[str]
+    relative_y_offsets: dict[str, int]
+    current_sites: dict[str, str]
+    current_columns: list[str]
+    boundary_nets: list[str]
+    cascade_edges: list[dict[str, str]]
+    same_column_required: bool = True
+    fixed: bool = False
+    adjacency_span: int = 0
+
+
+@dataclass
+class HardBlockRelocationCandidate:
+    macro_id: str
+    anchor_site: str
+    column_id: str
+    target_sites: dict[str, str]
+    current_score: float
+    candidate_score: float
+    boundary_cost_before: float
+    boundary_cost_after: float
+    move_distance: int
+    clock_region_changes: int
+    slr_changes: int
+    reroute_scope_nets: int
+    rejected_reasons: list[str] = field(default_factory=list)
+
+
+def _safe_invoke(obj, method_name: str, *args, default=None):
+    try:
+        method = getattr(obj, method_name)
+    except Exception:
+        return default
+    try:
+        return method(*args)
+    except Exception:
+        return default
+
+
+def _normalize_hard_block_type(cell_type: str) -> Optional[str]:
+    if cell_type.startswith("DSP48"):
+        return "DSP"
+    if cell_type.startswith("RAMB18") or cell_type.startswith("RAMB36"):
+        return "BRAM"
+    if cell_type.startswith("URAM288"):
+        return "URAM"
+    return None
+
+
+def _get_parent_hierarchy(cell_name: str) -> str:
+    if "/" not in cell_name:
+        return ""
+    return cell_name.rsplit("/", 1)[0]
+
+
+def _cell_is_fixed(cell) -> bool:
+    for method_name in ("isLocked", "isSiteFixed", "isBELFixed", "isBelFixed"):
+        value = _safe_invoke(cell, method_name, default=None)
+        if value:
+            return True
+    return False
+
+
+def _site_clock_region_name(site) -> str:
+    tile = _safe_invoke(site, "getTile", default=None)
+    if tile is None:
+        return "UNKNOWN"
+    clock_region = _safe_invoke(tile, "getClockRegion", default=None)
+    return str(clock_region) if clock_region is not None else "UNKNOWN"
+
+
+def _site_slr_name(site) -> str:
+    tile = _safe_invoke(site, "getTile", default=None)
+    if tile is None:
+        return "UNKNOWN"
+    slr = _safe_invoke(tile, "getSLR", default=None)
+    return str(slr) if slr is not None else "UNKNOWN"
+
+
+def _site_instance_y(site) -> int:
+    instance_y = _safe_invoke(site, "getInstanceY", default=None)
+    if instance_y is not None:
+        return int(instance_y)
+    tile = _safe_invoke(site, "getTile", default=None)
+    row = _safe_invoke(tile, "getRow", default=0) if tile is not None else 0
+    return int(row)
+
+
+def _site_column_id(site) -> str:
+    site_type = str(site.getSiteTypeEnum())
+    instance_x = _safe_invoke(site, "getInstanceX", default=None)
+    if instance_x is not None:
+        return f"{site_type}_X{int(instance_x)}"
+    tile = _safe_invoke(site, "getTile", default=None)
+    col = _safe_invoke(tile, "getColumn", default=0) if tile is not None else 0
+    return f"{site_type}_COL{int(col)}"
+
+
+def _site_manhattan_distance(site_a, site_b) -> int:
+    tile_a = _safe_invoke(site_a, "getTile", default=None)
+    tile_b = _safe_invoke(site_b, "getTile", default=None)
+    if tile_a is None or tile_b is None:
+        return 0
+    return int(tile_a.getManhattanDistance(tile_b))
+
+
+def _get_hard_block_cells(design, selected_types: set[str]) -> dict[str, HardBlockCellNode]:
+    nodes: dict[str, HardBlockCellNode] = {}
+    for cell in design.getCells():
+        if not _safe_invoke(cell, "isPlaced", default=False):
+            continue
+
+        cell_type = str(cell.getType())
+        hard_block_type = _normalize_hard_block_type(cell_type)
+        if hard_block_type is None or hard_block_type not in selected_types:
+            continue
+
+        site = cell.getSite()
+        if site is None:
+            continue
+
+        cell_name = str(cell.getName())
+        node = HardBlockCellNode(
+            name=cell_name,
+            hard_block_type=hard_block_type,
+            cell_type=cell_type,
+            current_site_name=str(site.getName()),
+            site_type=str(site.getSiteTypeEnum()),
+            column_id=_site_column_id(site),
+            y_index=_site_instance_y(site),
+            clock_region=_site_clock_region_name(site),
+            slr=_site_slr_name(site),
+            fixed=_cell_is_fixed(cell),
+            parent_hierarchy=_get_parent_hierarchy(cell_name),
+        )
+        nodes[cell_name] = node
+    return nodes
+
+
+def _iter_hard_block_pin_records(design, cell):
+    hier_cell = _safe_invoke(cell, "getEDIFHierCellInst", default=None)
+    if hier_cell is None:
+        return []
+
+    pin_records = []
+    for hier_port in hier_cell.getHierPortInsts():
+        net = _safe_invoke(hier_port, "getRoutedPhysicalNet", design, default=None)
+        if net is None or net.isStaticNet() or net.isClockNet():
+            continue
+
+        port_inst = _safe_invoke(hier_port, "getPortInst", default=None)
+        pin_name = str(port_inst.getName()) if port_inst is not None else str(hier_port)
+        is_output = bool(
+            _safe_invoke(hier_port, "isOutput", default=False)
+            or _safe_invoke(port_inst, "isOutput", default=False)
+        )
+        pin_records.append({
+            "net_name": str(net.getName()),
+            "pin_name": pin_name,
+            "is_output": is_output,
+        })
+    return pin_records
+
+
+def _get_cascade_pin_sets(hard_block_type: str) -> tuple[set[str], set[str]]:
+    if hard_block_type == "DSP":
+        return (
+            {"PCOUT", "ACOUT", "BCOUT"},
+            {"PCIN", "ACIN", "BCIN"},
+        )
+    if hard_block_type == "BRAM":
+        return (
+            {"CASDOUTA", "CASDOUTB", "CASDOUTPA", "CASDOUTPB"},
+            {"CASDINA", "CASDINB", "CASDINPA", "CASDINPB"},
+        )
+    if hard_block_type == "URAM":
+        return (
+            {"CAS_OUT_ADDR_A", "CAS_OUT_ADDR_B", "CAS_OUT_BWE", "CAS_OUT_DBITERR"},
+            {"CAS_IN_ADDR_A", "CAS_IN_ADDR_B", "CAS_IN_BWE", "CAS_IN_DBITERR"},
+        )
+    return set(), set()
+
+
+def _build_hard_block_graph(design, hard_block_nodes: dict[str, HardBlockCellNode], fallback_neighbor_gap: int = 1):
+    pin_map: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    cell_to_net_names: dict[str, set[str]] = defaultdict(set)
+
+    for cell_name, node in hard_block_nodes.items():
+        cell = design.getCell(cell_name)
+        if cell is None:
+            continue
+        for record in _iter_hard_block_pin_records(design, cell):
+            record["cell_name"] = cell_name
+            record["hard_block_type"] = node.hard_block_type
+            pin_map[record["net_name"]].append(record)
+            cell_to_net_names[cell_name].add(record["net_name"])
+
+    cascade_edges: list[dict[str, str]] = []
+    adjacency: dict[str, set[str]] = defaultdict(set)
+
+    for net_name, pin_records in pin_map.items():
+        outputs = [p for p in pin_records if p["is_output"]]
+        inputs = [p for p in pin_records if not p["is_output"]]
+        for source in outputs:
+            source_out_pins, _ = _get_cascade_pin_sets(source["hard_block_type"])
+            if source["pin_name"] not in source_out_pins:
+                continue
+            for sink in inputs:
+                if sink["hard_block_type"] != source["hard_block_type"]:
+                    continue
+                _, sink_in_pins = _get_cascade_pin_sets(sink["hard_block_type"])
+                if sink["pin_name"] not in sink_in_pins:
+                    continue
+                edge = {
+                    "src": source["cell_name"],
+                    "dst": sink["cell_name"],
+                    "edge_type": "cascade_to",
+                    "net_name": net_name,
+                    "cascade_direction": f"{source['pin_name']}->{sink['pin_name']}",
+                }
+                cascade_edges.append(edge)
+                adjacency[source["cell_name"]].add(sink["cell_name"])
+                adjacency[sink["cell_name"]].add(source["cell_name"])
+                hard_block_nodes[source["cell_name"]].cascade_direction = source["pin_name"]
+                hard_block_nodes[sink["cell_name"]].cascade_direction = sink["pin_name"]
+
+    grouped_cells: dict[tuple[str, str, str], list[HardBlockCellNode]] = defaultdict(list)
+    for node in hard_block_nodes.values():
+        grouped_cells[(node.hard_block_type, node.parent_hierarchy, node.column_id)].append(node)
+
+    for grouped in grouped_cells.values():
+        grouped.sort(key=lambda n: n.y_index)
+        for left, right in zip(grouped, grouped[1:]):
+            if abs(right.y_index - left.y_index) > fallback_neighbor_gap:
+                continue
+            if right.name in adjacency[left.name]:
+                continue
+            edge = {
+                "src": left.name,
+                "dst": right.name,
+                "edge_type": "cascade_to",
+                "net_name": "",
+                "cascade_direction": "fallback_nearby_stack",
+            }
+            cascade_edges.append(edge)
+            adjacency[left.name].add(right.name)
+            adjacency[right.name].add(left.name)
+
+    visited: set[str] = set()
+    macros: list[HardBlockMacro] = []
+    for cell_name, node in hard_block_nodes.items():
+        if cell_name in visited:
+            continue
+
+        stack = [cell_name]
+        component: list[str] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            stack.extend(sorted(adjacency.get(current, ())))
+
+        ordered = sorted(component, key=lambda name: hard_block_nodes[name].y_index)
+        base_y = hard_block_nodes[ordered[0]].y_index
+        relative_offsets = {name: hard_block_nodes[name].y_index - base_y for name in ordered}
+        current_columns = sorted({hard_block_nodes[name].column_id for name in ordered})
+        macro_edges = [
+            edge for edge in cascade_edges
+            if edge["src"] in component and edge["dst"] in component
+        ]
+        boundary_nets = sorted({
+            net_name
+            for member in component
+            for net_name in cell_to_net_names.get(member, set())
+        })
+        macro = HardBlockMacro(
+            macro_id=f"macro_{len(macros):03d}",
+            hard_block_type=node.hard_block_type,
+            cell_names=component,
+            ordered_cell_names=ordered,
+            relative_y_offsets=relative_offsets,
+            current_sites={name: hard_block_nodes[name].current_site_name for name in ordered},
+            current_columns=current_columns,
+            boundary_nets=boundary_nets,
+            cascade_edges=macro_edges,
+            fixed=any(hard_block_nodes[name].fixed for name in ordered),
+            adjacency_span=max(relative_offsets.values()) if relative_offsets else 0,
+        )
+        macros.append(macro)
+
+    return {
+        "pin_map": pin_map,
+        "cell_to_net_names": cell_to_net_names,
+        "cascade_edges": cascade_edges,
+        "macros": macros,
+    }
+
+
+def _compute_macro_boundary_data(design, macro: HardBlockMacro):
+    macro_site_names = set(macro.current_sites.values())
+    macro_cell_names = set(macro.cell_names)
+    boundary_net_names: set[str] = set()
+    net_external_tiles: dict[str, list[Any]] = defaultdict(list)
+    net_internal_cells: dict[str, list[str]] = defaultdict(list)
+
+    for cell_name in macro.ordered_cell_names:
+        cell = design.getCell(cell_name)
+        if cell is None:
+            continue
+        for net in _get_cell_physical_nets(design, cell):
+            net_name = str(net.getName())
+            net_internal_cells[net_name].append(cell_name)
+            external_found = False
+            for pin in net.getPins():
+                site = _safe_invoke(pin, "getSite", default=None)
+                if site is None:
+                    continue
+                site_name = str(site.getName())
+                if site_name in macro_site_names:
+                    continue
+                external_found = True
+                tile = _safe_invoke(site, "getTile", default=None)
+                if tile is not None:
+                    net_external_tiles[net_name].append(tile)
+            if external_found:
+                boundary_net_names.add(net_name)
+
+    return {
+        "boundary_net_names": sorted(boundary_net_names),
+        "net_external_tiles": net_external_tiles,
+        "net_internal_cells": net_internal_cells,
+    }
+
+
+def _score_macro_candidate(design, hard_block_nodes, macro: HardBlockMacro, target_sites: dict[str, Any], boundary_data):
+    boundary_cost = 0.0
+    for net_name in boundary_data["boundary_net_names"]:
+        external_tiles = boundary_data["net_external_tiles"].get(net_name, [])
+        if not external_tiles:
+            continue
+        for cell_name in boundary_data["net_internal_cells"].get(net_name, []):
+            target_tile = _safe_invoke(target_sites[cell_name], "getTile", default=None)
+            if target_tile is None:
+                continue
+            boundary_cost += min(target_tile.getManhattanDistance(ext_tile) for ext_tile in external_tiles)
+
+    move_distance = 0
+    clock_region_changes = 0
+    slr_changes = 0
+    current_clock_regions = set()
+    target_clock_regions = set()
+
+    for cell_name, site in target_sites.items():
+        current_site = design.getCell(cell_name).getSite()
+        move_distance += _site_manhattan_distance(current_site, site)
+
+        current_clock_region = _site_clock_region_name(current_site)
+        target_clock_region = _site_clock_region_name(site)
+        current_clock_regions.add(current_clock_region)
+        target_clock_regions.add(target_clock_region)
+        if current_clock_region != target_clock_region:
+            clock_region_changes += 1
+
+        if _site_slr_name(current_site) != _site_slr_name(site):
+            slr_changes += 1
+
+    reroute_scope = len(macro.boundary_nets)
+    unique_region_growth = max(0, len(target_clock_regions) - len(current_clock_regions))
+
+    total_score = (
+        boundary_cost
+        + (move_distance * 2.0)
+        + (reroute_scope * 5.0)
+        + (clock_region_changes * 25.0)
+        + (unique_region_growth * 40.0)
+        + (slr_changes * 1000.0)
+    )
+
+    return {
+        "total_score": float(total_score),
+        "boundary_cost": float(boundary_cost),
+        "move_distance": int(move_distance),
+        "clock_region_changes": int(clock_region_changes),
+        "slr_changes": int(slr_changes),
+        "reroute_scope": int(reroute_scope),
+    }
+
+
+def _enumerate_macro_candidates(
+    design,
+    hard_block_nodes: dict[str, HardBlockCellNode],
+    macro: HardBlockMacro,
+    max_candidates_per_macro: int,
+    preserve_slr: bool,
+):
+    device = design.getDevice()
+    base_cell_name = macro.ordered_cell_names[0]
+    base_cell = design.getCell(base_cell_name)
+    base_site = base_cell.getSite()
+    site_type = base_site.getSiteTypeEnum()
+    original_sites = {name: design.getCell(name).getSite() for name in macro.ordered_cell_names}
+    original_site_names = {str(site.getName()) for site in original_sites.values()}
+    original_scores_data = _compute_macro_boundary_data(design, macro)
+    current_score = _score_macro_candidate(design, hard_block_nodes, macro, original_sites, original_scores_data)
+
+    compatible_sites = device.getAllCompatibleSites(site_type)
+    column_sites: dict[str, dict[int, Any]] = defaultdict(dict)
+    for site in compatible_sites:
+        column_sites[_site_column_id(site)][_site_instance_y(site)] = site
+
+    candidates: list[HardBlockRelocationCandidate] = []
+    rejected: list[dict[str, Any]] = []
+
+    for column_id, sites_by_y in column_sites.items():
+        for anchor_y, anchor_site in sorted(sites_by_y.items()):
+            target_sites = {}
+            rejection_reasons = []
+            for cell_name in macro.ordered_cell_names:
+                offset = macro.relative_y_offsets[cell_name]
+                target_y = anchor_y + offset
+                target_site = sites_by_y.get(target_y)
+                if target_site is None:
+                    rejection_reasons.append(f"missing_site_y{target_y}")
+                    break
+
+                current_site = original_sites[cell_name]
+                if preserve_slr and _site_slr_name(target_site) != _site_slr_name(current_site):
+                    rejection_reasons.append("slr_changed")
+                    break
+
+                if str(target_site.getSiteTypeEnum()) != str(current_site.getSiteTypeEnum()):
+                    rejection_reasons.append("site_type_mismatch")
+                    break
+
+                occupant = design.getSiteInstFromSite(target_site)
+                if occupant is not None and str(target_site.getName()) not in original_site_names:
+                    rejection_reasons.append(f"occupied:{target_site.getName()}")
+                    break
+
+                target_bel = _safe_invoke(target_site, "getBEL", str(design.getCell(cell_name).getBELName()), default=None)
+                if target_bel is None:
+                    rejection_reasons.append(f"missing_bel:{target_site.getName()}")
+                    break
+
+                target_sites[cell_name] = target_site
+
+            if rejection_reasons:
+                rejected.append({
+                    "macro_id": macro.macro_id,
+                    "column_id": column_id,
+                    "anchor_site": str(anchor_site.getName()),
+                    "reasons": rejection_reasons,
+                })
+                continue
+
+            if all(str(target_sites[name].getName()) == macro.current_sites[name] for name in macro.ordered_cell_names):
+                continue
+
+            score = _score_macro_candidate(design, hard_block_nodes, macro, target_sites, original_scores_data)
+            candidates.append(
+                HardBlockRelocationCandidate(
+                    macro_id=macro.macro_id,
+                    anchor_site=str(anchor_site.getName()),
+                    column_id=column_id,
+                    target_sites={name: str(site.getName()) for name, site in target_sites.items()},
+                    current_score=current_score["total_score"],
+                    candidate_score=score["total_score"],
+                    boundary_cost_before=current_score["boundary_cost"],
+                    boundary_cost_after=score["boundary_cost"],
+                    move_distance=score["move_distance"],
+                    clock_region_changes=score["clock_region_changes"],
+                    slr_changes=score["slr_changes"],
+                    reroute_scope_nets=score["reroute_scope"],
+                )
+            )
+
+    candidates.sort(key=lambda c: c.candidate_score)
+    return {
+        "current_score": current_score,
+        "candidates": candidates[:max_candidates_per_macro],
+        "rejected": rejected[:max_candidates_per_macro * 4],
+    }
+
+
+def _apply_macro_relocation(design, macro: HardBlockMacro, candidate: HardBlockRelocationCandidate):
+    from com.xilinx.rapidwright.design import DesignTools
+
+    old_state = []
+    affected_nets = set()
+    cells = []
+    for cell_name in macro.ordered_cell_names:
+        cell = design.getCell(cell_name)
+        if cell is None:
+            return {"status": "error", "message": f"Cell '{cell_name}' not found during apply"}
+        cells.append(cell)
+        old_state.append((cell, cell.getSite(), str(cell.getBELName())))
+        for net in _get_cell_physical_nets(design, cell):
+            affected_nets.add(net)
+
+    try:
+        for cell, _, _ in old_state:
+            DesignTools.fullyUnplaceCell(cell, None)
+
+        for net in affected_nets:
+            try:
+                net.unroute()
+            except Exception:
+                pass
+
+        for cell, _, bel_name in old_state:
+            target_site_name = candidate.target_sites[str(cell.getName())]
+            target_site = design.getDevice().getSite(target_site_name)
+            if target_site is None:
+                raise RuntimeError(f"Missing target site '{target_site_name}'")
+            target_bel = target_site.getBEL(bel_name)
+            if target_bel is None:
+                raise RuntimeError(f"Missing BEL '{bel_name}' at site '{target_site_name}'")
+            design.placeCell(cell, target_site, target_bel)
+            site_inst = cell.getSiteInst()
+            if site_inst is not None:
+                site_inst.routeSite()
+
+        return {
+            "status": "success",
+            "affected_nets": sorted(str(net.getName()) for net in affected_nets),
+        }
+    except Exception as exc:
+        for cell, old_site, old_bel_name in old_state:
+            try:
+                if not cell.isPlaced():
+                    design.placeCell(cell, old_site, old_site.getBEL(old_bel_name))
+                    site_inst = cell.getSiteInst()
+                    if site_inst is not None:
+                        site_inst.routeSite()
+            except Exception:
+                pass
+        return {"status": "error", "message": str(exc)}
+
+
+def hard_block_column_cascade_relocation(
+    hard_block_types: Optional[list[str]] = None,
+    max_macros: int = 50,
+    max_candidates_per_macro: int = 25,
+    min_score_improvement: float = 5.0,
+    preserve_slr: bool = True,
+    dry_run: bool = False,
+    fallback_neighbor_gap: int = 1,
+) -> Dict[str, Any]:
+    """
+    Relocate hard-block macros across compatible columns while preserving
+    vertical macro shape and conservative cascade legality.
+
+    This is a localized ECO-style pass for placed DCPs. The implementation is
+    intentionally conservative:
+      1. Only DSP/BRAM/URAM cells are considered.
+      2. Fixed/locked cells are never moved.
+      3. Cascade-connected or nearby stacked cells are moved as one macro.
+      4. Candidates must preserve site type, vertical offsets, and occupancy.
+      5. If any legality rule is uncertain, the candidate is rejected.
+
+    TODO: Refine BRAM/URAM cascade detection with more device-specific pin and
+    property handling, and incorporate true timing criticality when timing APIs
+    are exposed in this layer.
+    """
+    if not _initialized:
+        return {"error": "RapidWright not initialized. Call initialize_rapidwright first."}
+
+    if _current_design is None:
+        return {"error": "No design loaded. Use read_checkpoint first."}
+
+    selected_types = set(hard_block_types or ["DSP", "BRAM", "URAM"])
+
+    try:
+        design = _current_design
+        hard_block_nodes = _get_hard_block_cells(design, selected_types)
+        graph_data = _build_hard_block_graph(design, hard_block_nodes, fallback_neighbor_gap=fallback_neighbor_gap)
+        macros: list[HardBlockMacro] = sorted(
+            graph_data["macros"],
+            key=lambda macro: (-len(macro.ordered_cell_names), macro.macro_id),
+        )
+
+        for macro in macros:
+            boundary_data = _compute_macro_boundary_data(design, macro)
+            macro.boundary_nets = boundary_data["boundary_net_names"]
+            for cell_name in macro.ordered_cell_names:
+                hard_block_nodes[cell_name].relative_y_offset = macro.relative_y_offsets[cell_name]
+                hard_block_nodes[cell_name].boundary_net_count = len(boundary_data["boundary_net_names"])
+
+        graph_dict = {
+            "nodes": {
+                "hard_block_cells": [asdict(node) for node in hard_block_nodes.values()],
+                "macros": [asdict(macro) for macro in macros],
+            },
+            "edges": {
+                "macro_contains": [
+                    {"macro_id": macro.macro_id, "cell_name": cell_name}
+                    for macro in macros
+                    for cell_name in macro.ordered_cell_names
+                ],
+                "cascade_to": graph_data["cascade_edges"],
+                "placed_on": [
+                    {"cell_name": node.name, "site_name": node.current_site_name}
+                    for node in hard_block_nodes.values()
+                ],
+                "inside_column": [
+                    {"site_name": node.current_site_name, "column_id": node.column_id}
+                    for node in hard_block_nodes.values()
+                ],
+                "inside_region": [
+                    {
+                        "site_name": node.current_site_name,
+                        "clock_region": node.clock_region,
+                        "slr": node.slr,
+                    }
+                    for node in hard_block_nodes.values()
+                ],
+                "candidate_move": [],
+            },
+        }
+
+        macro_evaluations = []
+        best_choice = None
+
+        for macro in macros[:max_macros]:
+            if macro.fixed:
+                macro_evaluations.append({
+                    "macro_id": macro.macro_id,
+                    "status": "rejected",
+                    "reason": "contains_fixed_cell",
+                    "cell_names": macro.ordered_cell_names,
+                })
+                continue
+
+            enumeration = _enumerate_macro_candidates(
+                design,
+                hard_block_nodes,
+                macro,
+                max_candidates_per_macro=max_candidates_per_macro,
+                preserve_slr=preserve_slr,
+            )
+            candidates: list[HardBlockRelocationCandidate] = enumeration["candidates"]
+            graph_dict["edges"]["candidate_move"].extend([
+                {
+                    "from_site": macro.current_sites[cell_name],
+                    "to_site": candidate.target_sites[cell_name],
+                    "macro_id": macro.macro_id,
+                }
+                for candidate in candidates
+                for cell_name in macro.ordered_cell_names
+            ])
+
+            improved = [
+                candidate for candidate in candidates
+                if (candidate.current_score - candidate.candidate_score) >= min_score_improvement
+            ]
+            best_candidate = improved[0] if improved else None
+            macro_evaluations.append({
+                "macro_id": macro.macro_id,
+                "cell_names": macro.ordered_cell_names,
+                "hard_block_type": macro.hard_block_type,
+                "candidate_columns_evaluated": len(candidates),
+                "rejected_candidates": enumeration["rejected"],
+                "best_candidate": asdict(best_candidate) if best_candidate is not None else None,
+                "current_score": enumeration["current_score"]["total_score"],
+            })
+
+            if best_candidate is None:
+                continue
+
+            improvement = best_candidate.current_score - best_candidate.candidate_score
+            if best_choice is None or improvement > best_choice["improvement"]:
+                best_choice = {
+                    "macro": macro,
+                    "candidate": best_candidate,
+                    "improvement": improvement,
+                }
+
+        if best_choice is None:
+            return {
+                "status": "no_improvement",
+                "message": "No legal hard-block macro relocation improved the conservative score.",
+                "hard_block_cells_found": len(hard_block_nodes),
+                "macros_detected": len(macros),
+                "graph": graph_dict,
+                "macro_evaluations": macro_evaluations,
+            }
+
+        macro = best_choice["macro"]
+        candidate = best_choice["candidate"]
+        apply_result = {
+            "status": "dry_run",
+            "affected_nets": macro.boundary_nets,
+        }
+        if not dry_run:
+            apply_result = _apply_macro_relocation(design, macro, candidate)
+            if apply_result.get("status") != "success":
+                return {
+                    "status": "error",
+                    "message": f"Failed to apply relocation: {apply_result.get('message')}",
+                    "graph": graph_dict,
+                    "macro_evaluations": macro_evaluations,
+                }
+
+        return {
+            "status": "success",
+            "recipe_name": "hard_block_column_cascade_relocation",
+            "dry_run": dry_run,
+            "hard_block_cells_found": len(hard_block_nodes),
+            "macros_detected": len(macros),
+            "candidate_columns_evaluated": sum(m.get("candidate_columns_evaluated", 0) for m in macro_evaluations),
+            "selected_move": {
+                "macro_id": macro.macro_id,
+                "hard_block_type": macro.hard_block_type,
+                "ordered_cells": macro.ordered_cell_names,
+                "current_sites": macro.current_sites,
+                "target_sites": candidate.target_sites,
+                "estimated_score_before": candidate.current_score,
+                "estimated_score_after": candidate.candidate_score,
+                "estimated_improvement": round(candidate.current_score - candidate.candidate_score, 3),
+                "boundary_cost_before": candidate.boundary_cost_before,
+                "boundary_cost_after": candidate.boundary_cost_after,
+                "move_distance": candidate.move_distance,
+                "clock_region_changes": candidate.clock_region_changes,
+                "slr_changes": candidate.slr_changes,
+                "reroute_scope_nets": candidate.reroute_scope_nets,
+            },
+            "affected_nets": {
+                "count": len(apply_result.get("affected_nets", [])),
+                "nets": apply_result.get("affected_nets", []),
+                "boundary_nets": macro.boundary_nets,
+                "cascade_nets": [edge["net_name"] for edge in macro.cascade_edges if edge["net_name"]],
+            },
+            "graph": graph_dict,
+            "macro_evaluations": macro_evaluations,
+            "notes": [
+                "Conservative fallback grouping is used when exact cascade pin detection is insufficient.",
+                "TODO: Incorporate true timing criticality and device-specific BRAM/URAM legality refinements.",
+                "Moved-cell nets are left unrouted for downstream Vivado route_design validation.",
+            ],
+        }
+    except Exception as e:
+        logger.error(f"Error in hard-block relocation recipe: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
 
 
 def optimize_cell_placement(
