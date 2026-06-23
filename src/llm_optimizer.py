@@ -781,6 +781,7 @@ Return ONLY JSON.
         self,
         hard_block_types: Optional[list[str]] = None,
         min_score_improvement: float = 5.0,
+        validate_in_vivado: bool = True,
     ) -> str:
         """Execute the hard-block column/cascade relocation recipe once."""
         baseline_checkpoint = Path(self.temp_dir) / "hard_block_baseline.dcp"
@@ -817,6 +818,12 @@ Return ONLY JSON.
         )
 
         await self.v("open_checkpoint", {"dcp_path": str(temp_dcp.resolve())})
+        if validate_in_vivado:
+            validation_ok, validation_summary = await self._validate_hard_block_candidate_in_vivado()
+            if not validation_ok:
+                logger.warning("Rejecting hard-block candidate after Vivado validation: %s", validation_summary)
+                await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
+                return baseline_report
         report, _ = await self._reroute_and_measure()
         current_metrics = await self._measure_current_metrics(report)
 
@@ -825,6 +832,68 @@ Return ONLY JSON.
 
         await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
         return baseline_report
+
+    async def _validate_hard_block_candidate_in_vivado(self) -> tuple[bool, dict]:
+        """Run lightweight Vivado checks before accepting a hard-block candidate."""
+        validation = {
+            "open_clean": True,
+            "unplaced_cells": None,
+            "route_status_excerpt": "",
+            "drc_excerpt": "",
+            "log_keywords_found": [],
+        }
+
+        unplaced_result = await self.v(
+            "run_tcl",
+            {
+                "command": (
+                    "set unplaced [get_cells -quiet -filter {IS_PRIMITIVE && IS_LOC_FIXED == 0 && LOC == \"\"}]; "
+                    "puts [llength $unplaced]"
+                )
+            },
+        )
+        try:
+            validation["unplaced_cells"] = int(unplaced_result.strip().splitlines()[-1])
+        except Exception:
+            validation["unplaced_cells"] = None
+
+        route_status = await self.v("report_route_status", {})
+        validation["route_status_excerpt"] = route_status[:2000]
+
+        drc_result = await self.v(
+            "run_tcl",
+            {
+                "command": "report_drc -return_string"
+            },
+        )
+        validation["drc_excerpt"] = drc_result[:2000]
+
+        vivado_log = self.run_dir / "vivado.log"
+        if vivado_log.exists():
+            log_text = vivado_log.read_text(errors="ignore")
+            for needle in [
+                "failed to restore",
+                "partially restored",
+                "unplaced non vcc/gnd instance",
+                "design is not fully placed",
+            ]:
+                if needle.lower() in log_text.lower():
+                    validation["log_keywords_found"].append(needle)
+
+        failed_nets_match = re.search(r"Number of Failed Nets\s*=\s*(\d+)", route_status)
+        unrouted_match = re.search(r"Number of Unrouted Nets\s*=\s*(\d+)", route_status)
+        partial_match = re.search(r"Number of Partially Routed Nets\s*=\s*(\d+)", route_status)
+        failed_nets = int(failed_nets_match.group(1)) if failed_nets_match else 0
+        unrouted_nets = int(unrouted_match.group(1)) if unrouted_match else 0
+        partial_nets = int(partial_match.group(1)) if partial_match else 0
+        route_status_has_errors = failed_nets > 0 or unrouted_nets > 0 or partial_nets > 0
+
+        validation_ok = (
+            (validation["unplaced_cells"] in (0, None))
+            and not validation["log_keywords_found"]
+            and not route_status_has_errors
+        )
+        return validation_ok, validation
 
     def parse_utilization(self, report: str) -> dict:
         """Extract LUT and FF counts from the pblock utilization report."""
