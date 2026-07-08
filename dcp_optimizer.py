@@ -19,6 +19,59 @@ from src.llm_optimizer import DCPOptimizer, DEFAULT_MODEL, SUPPORTED_SINGLE_METH
 from src.search import GenerationSearchConfig
 from src.test_modes import run_test_mode
 
+SEARCH_PROFILE_DEFAULTS = {
+    "fast": {
+        "branches": 1,
+        "beam_width": 1,
+        "generations": 2,
+        "steps_per_branch": 1,
+        "steps_without_improvement": 1,
+        "max_llm_calls": 8,
+        "min_wns_delta": 0.02,
+        "min_wns_per_minute": 0.0,
+        "strategy_effort": "fast",
+    },
+    "balanced": {
+        "branches": 2,
+        "beam_width": 2,
+        "generations": 3,
+        "steps_per_branch": 3,
+        "steps_without_improvement": 3,
+        "max_llm_calls": 50,
+        "min_wns_delta": 0.001,
+        "min_wns_per_minute": 0.0,
+        "strategy_effort": "balanced",
+    },
+    "cost": {
+        "branches": 1,
+        "beam_width": 1,
+        "generations": 2,
+        "steps_per_branch": 2,
+        "steps_without_improvement": 1,
+        "max_llm_calls": 6,
+        "min_wns_delta": 0.01,
+        "min_wns_per_minute": 0.001,
+        "strategy_effort": "fast",
+    },
+    "quality": {
+        "branches": 3,
+        "beam_width": 2,
+        "generations": 4,
+        "steps_per_branch": 3,
+        "steps_without_improvement": 3,
+        "max_llm_calls": 80,
+        "min_wns_delta": 0.001,
+        "min_wns_per_minute": 0.0,
+        "strategy_effort": "thorough",
+    },
+}
+
+
+def resolve_profile_value(args, profile_defaults: dict, attr: str):
+    value = getattr(args, attr)
+    return profile_defaults[attr] if value is None else value
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -36,6 +89,8 @@ Examples:
   python dcp_optimizer.py input.dcp --output output.dcp
   python dcp_optimizer.py input.dcp --model anthropic/claude-sonnet-4
   python dcp_optimizer.py input.dcp --branches 3 --beam-width 2 --generations 4 --steps-without-improvement 3
+  python dcp_optimizer.py input.dcp --budget-profile fast
+  python dcp_optimizer.py input.dcp --budget-profile cost --max-runtime-minutes 45
   python dcp_optimizer.py input.dcp --search-mode linear
   python dcp_optimizer.py input.dcp --single-method PBLOCK
   python dcp_optimizer.py input.dcp --single-method FANOUT --top-n-nets 3
@@ -66,6 +121,12 @@ Examples:
         help=f"LLM model to use (default: {DEFAULT_MODEL})",
     )
     parser.add_argument(
+        "--system-prompt",
+        type=Path,
+        default=None,
+        help="Path to the base system prompt to use for planner decisions (default: SYSTEM_PROMPT.TXT)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode (verbose logging, save intermediate checkpoints)",
@@ -88,46 +149,82 @@ Examples:
         help="LLM search controller to use in full agent mode (default: generations)",
     )
     parser.add_argument(
+        "--budget-profile",
+        choices=["fast", "balanced", "cost", "quality"],
+        default="balanced",
+        help=(
+            "Default search/recipe budget profile. fast prioritizes wall-clock time, "
+            "cost limits LLM/tool spend, quality broadens search (default: balanced)"
+        ),
+    )
+    parser.add_argument(
+        "--strategy-effort",
+        choices=["fast", "balanced", "thorough"],
+        default=None,
+        help="Override how many internal Vivado/RapidWright attempts each recipe may run",
+    )
+    parser.add_argument(
         "--branches",
         type=int,
-        default=2,
-        help="Number of child branches to try from each active candidate in generation mode (default: 2)",
+        default=None,
+        help="Number of child branches to try from each active candidate in generation mode (profile default)",
     )
     parser.add_argument(
         "--beam-width",
         type=int,
-        default=2,
-        help="Number of best current candidates to keep for the next generation (default: 2)",
+        default=None,
+        help="Number of best current candidates to keep for the next generation (profile default)",
     )
     parser.add_argument(
         "--generations",
         type=int,
-        default=3,
-        help="Maximum number of search generations (default: 3)",
+        default=None,
+        help="Maximum number of search generations (profile default)",
     )
     parser.add_argument(
         "--steps-per-branch",
         type=int,
-        default=3,
-        help="Maximum LLM steps to take along each branch before pruning (default: 3)",
+        default=None,
+        help="Maximum LLM steps to take along each branch before pruning (profile default)",
     )
     parser.add_argument(
         "--steps-without-improvement",
         type=int,
-        default=3,
-        help="Stop a branch after this many steps without beating that branch's highest WNS (default: 3)",
+        default=None,
+        help="Stop a branch after this many steps without beating that branch's highest WNS (profile default)",
     )
     parser.add_argument(
         "--max-llm-calls",
         type=int,
-        default=50,
-        help="Safety cap on total LLM calls in full agent mode (default: 50)",
+        default=None,
+        help="Safety cap on total LLM calls in full agent mode (profile default)",
     )
     parser.add_argument(
         "--min-wns-delta",
         type=float,
-        default=0.001,
-        help="Minimum WNS delta in ns counted as an improvement (default: 0.001)",
+        default=None,
+        help="Minimum WNS delta in ns counted as a search-continuing improvement (profile default)",
+    )
+    parser.add_argument(
+        "--min-wns-per-minute",
+        type=float,
+        default=None,
+        help=(
+            "Minimum WNS improvement in ns per elapsed recipe minute needed to reset search patience "
+            "(profile default)"
+        ),
+    )
+    parser.add_argument(
+        "--max-runtime-minutes",
+        type=float,
+        default=None,
+        help="Stop starting new search steps after this wall-clock runtime budget",
+    )
+    parser.add_argument(
+        "--max-cost",
+        type=float,
+        default=None,
+        help="Stop starting new LLM-guided search steps after this OpenRouter cost in USD",
     )
     parser.add_argument(
         "--continue-after-timing-met",
@@ -295,6 +392,16 @@ Examples:
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+    profile_defaults = SEARCH_PROFILE_DEFAULTS[args.budget_profile]
+    branches = resolve_profile_value(args, profile_defaults, "branches")
+    beam_width = resolve_profile_value(args, profile_defaults, "beam_width")
+    generations = resolve_profile_value(args, profile_defaults, "generations")
+    steps_per_branch = resolve_profile_value(args, profile_defaults, "steps_per_branch")
+    steps_without_improvement = resolve_profile_value(args, profile_defaults, "steps_without_improvement")
+    max_llm_calls = resolve_profile_value(args, profile_defaults, "max_llm_calls")
+    min_wns_delta = resolve_profile_value(args, profile_defaults, "min_wns_delta")
+    min_wns_per_minute = resolve_profile_value(args, profile_defaults, "min_wns_per_minute")
+    strategy_effort = args.strategy_effort or profile_defaults["strategy_effort"]
 
     print("FPGA Design Optimization Agent")
     print("================================")
@@ -302,26 +409,41 @@ Examples:
     print(f"Output:      {args.output_dcp.resolve()}")
     print(f"Run dir:     {run_dir}")
     print(f"Model:       {args.model}")
+    if args.system_prompt:
+        print(f"Prompt:      {args.system_prompt.resolve()}")
     print(f"Search mode: {args.search_mode}")
     print(f"Wall clock:  {args.wall_clock_limit_seconds:.0f} seconds")
+    print(f"Budget:      {args.budget_profile} (recipe effort: {strategy_effort})")
+    if args.max_runtime_minutes is not None:
+        print(f"Runtime cap: {args.max_runtime_minutes:.1f} minutes")
+    if args.max_cost is not None:
+        print(f"Cost cap:    ${args.max_cost:.4f}")
     if args.search_mode == "generations":
-        print(f"Branches:    {args.branches}")
-        print(f"Beam width:  {args.beam_width}")
-        print(f"Generations: {args.generations}")
-        print(f"Patience:    {args.steps_without_improvement} steps without branch-peak improvement")
+        print(f"Branches:    {branches}")
+        print(f"Beam width:  {beam_width}")
+        print(f"Generations: {generations}")
+        print(f"Patience:    {steps_without_improvement} steps without branch-peak improvement")
+    print(f"Min WNS gain:{min_wns_delta:.3f} ns")
+    if min_wns_per_minute > 0:
+        print(f"Min ROI:     {min_wns_per_minute:.4f} ns/minute")
     if force_strategy:
         print(f"Forced recipe: {force_strategy}")
     print()
 
     generation_config = GenerationSearchConfig(
         enabled=args.search_mode == "generations",
-        branch_factor=max(1, args.branches),
-        beam_width=max(1, args.beam_width),
-        max_generations=max(1, args.generations),
-        max_steps_per_branch=max(1, args.steps_per_branch),
-        max_steps_without_improvement=max(1, args.steps_without_improvement),
-        max_llm_calls=max(1, args.max_llm_calls),
-        min_wns_delta=max(0.0, args.min_wns_delta),
+        budget_profile=args.budget_profile,
+        strategy_effort=strategy_effort,
+        branch_factor=max(1, branches),
+        beam_width=max(1, beam_width),
+        max_generations=max(1, generations),
+        max_steps_per_branch=max(1, steps_per_branch),
+        max_steps_without_improvement=max(1, steps_without_improvement),
+        max_llm_calls=max(1, max_llm_calls),
+        min_wns_delta=max(0.0, min_wns_delta),
+        min_wns_per_minute=max(0.0, min_wns_per_minute),
+        max_runtime_minutes=args.max_runtime_minutes if args.max_runtime_minutes and args.max_runtime_minutes > 0 else None,
+        max_cost=args.max_cost if args.max_cost and args.max_cost > 0 else None,
         stop_when_timing_met=not args.continue_after_timing_met,
         wall_clock_limit_seconds=max(0.0, args.wall_clock_limit_seconds),
     )
@@ -332,6 +454,7 @@ Examples:
         debug=args.debug,
         run_dir=run_dir,
         generation_config=generation_config,
+        system_prompt_path=args.system_prompt,
         force_strategy=force_strategy,
     )
 

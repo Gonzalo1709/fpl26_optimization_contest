@@ -26,6 +26,7 @@ An example LLM-powered autonomous agent that optimizes FPGA designs for timing u
 - [RapidWrightMCP Server](#rapidwrightmcp-server)
 - [Optimization Strategies](#optimization-strategies)
 - [Optimization Workflow](#optimization-workflow)
+- [Prompt Optimization Workflow](#prompt-optimization-workflow)
 - [Example Session](#example-session)
 - [Troubleshooting](#troubleshooting)
 - [Project Structure](#project-structure)
@@ -267,11 +268,20 @@ python3 dcp_optimizer.py input.dcp
 # Or specify API key and custom output name
 python3 dcp_optimizer.py input.dcp --output output.dcp --api-key "your-key"
 
-# Use a different model (default: x-ai/grok-4.1-fast)
+# Use a different model (default: ~openai/gpt-latest)
 python3 dcp_optimizer.py input.dcp --model anthropic/claude-sonnet-4
+
+# Use a candidate planner prompt
+python3 dcp_optimizer.py input.dcp --system-prompt prompt_optimization_runs/best_SYSTEM_PROMPT.TXT
 
 # Tune generation search
 python3 dcp_optimizer.py input.dcp --branches 3 --beam-width 2 --generations 4 --steps-without-improvement 3
+
+# Prioritize wall-clock time over broad exploration
+python3 dcp_optimizer.py input.dcp --budget-profile fast
+
+# Stop when additional WNS gain is not worth the runtime/cost budget
+python3 dcp_optimizer.py input.dcp --budget-profile cost --max-runtime-minutes 45 --min-wns-per-minute 0.002
 
 # Compare against the original single-line loop
 python3 dcp_optimizer.py input.dcp --search-mode linear
@@ -286,25 +296,69 @@ By default, full agent mode uses a generation search controller. It saves checkp
 | `input_dcp` | Input design checkpoint (.dcp) file | Required |
 | `--output`, `-o` | Output optimized checkpoint (.dcp) file | `<input>_optimized-<timestamp>.dcp` |
 | `--api-key` | OpenRouter API key | `OPENROUTER_API_KEY` env var |
-| `--model` | LLM model to use | `x-ai/grok-4.1-fast` |
+| `--model` | LLM model to use | `~openai/gpt-latest` |
+| `--system-prompt` | Base planner prompt file. A JSON planner contract is appended automatically | `SYSTEM_PROMPT.TXT` |
 | `--debug` | Enable debug mode (verbose logging, preserve all files) | False |
 | `--test` | Test mode: run without LLM. Pblock for LogicNets, cell re-placement for VexRiscv | False |
 | `--max-nets` | Max high-fanout nets to optimize in test mode (high fanout flow only) | 5 |
 | `--search-mode` | Full-agent search mode: `generations` or `linear` | `generations` |
-| `--branches` | Child branches to try from each active candidate | 2 |
-| `--beam-width` | Best current candidates kept for the next generation | 2 |
-| `--generations` | Maximum number of search generations | 3 |
-| `--steps-per-branch` | Maximum LLM steps along each branch | 3 |
-| `--steps-without-improvement` | Branch patience measured from that branch's highest WNS, not the previous step | 3 |
-| `--max-llm-calls` | Safety cap on total full-agent LLM calls | 50 |
-| `--min-wns-delta` | Minimum WNS delta in ns counted as an improvement | 0.001 |
+| `--budget-profile` | Preset for search breadth and recipe effort: `fast`, `balanced`, `cost`, or `quality` | `balanced` |
+| `--strategy-effort` | Override internal recipe effort: `fast`, `balanced`, or `thorough` | Profile default |
+| `--branches` | Child branches to try from each active candidate | Profile default |
+| `--beam-width` | Best current candidates kept for the next generation | Profile default |
+| `--generations` | Maximum number of search generations | Profile default |
+| `--steps-per-branch` | Maximum LLM steps along each branch | Profile default |
+| `--steps-without-improvement` | Branch patience measured from that branch's highest WNS, not the previous step | Profile default |
+| `--max-llm-calls` | Safety cap on total full-agent LLM calls | Profile default |
+| `--min-wns-delta` | Minimum WNS delta in ns counted as a search-continuing improvement | Profile default |
+| `--min-wns-per-minute` | Minimum WNS gain per recipe runtime minute needed to reset patience | Profile default |
+| `--max-runtime-minutes` | Stop starting new search steps after this wall-clock budget | None |
+| `--max-cost` | Stop starting new LLM-guided search steps after this OpenRouter cost in USD | None |
 | `--continue-after-timing-met` | Continue search after WNS reaches 0 | False |
 
 With `make run_optimizer`, pass generation controls through `OPT_ARGS`:
 
 ```bash
 make run_optimizer DCP=input.dcp OPT_ARGS="--branches 3 --beam-width 2 --generations 4"
+make run_optimizer DCP=input.dcp OPT_ARGS="--budget-profile fast --max-runtime-minutes 30"
 ```
+
+Budget profiles tune both the search tree and the cost of individual recipes. `fast` uses one branch, one step per branch, higher minimum WNS improvement, and single-attempt recipes. `cost` is similar but allows a little more sequential exploration with runtime ROI gating. `balanced` preserves the existing defaults. `quality` broadens search and uses more thorough recipe attempts.
+
+## Prompt Optimization Workflow
+
+`SYSTEM_PROMPT.TXT` is the base planner prompt for LLM recipe selection. The optimizer appends a strict JSON contract at runtime, so prompt candidates should focus on FPGA strategy guidance rather than output formatting.
+
+The prompt workflow is offline by default: it scores candidate prompts against planner decision examples without launching Vivado or RapidWright.
+
+```bash
+# Optional: install DSPy/GEPA support
+pip install -r requirements-prompt-opt.txt
+
+# Score the current SYSTEM_PROMPT.TXT on starter planner examples
+export OPENROUTER_API_KEY="your-openrouter-api-key"
+python3 prompt_optimizer.py evaluate \
+  --examples prompt_eval_examples/planner_examples.jsonl \
+  --candidate SYSTEM_PROMPT.TXT \
+  --output prompt_eval_current.json
+
+# Run a lightweight GEPA-style reflective search with only core dependencies
+python3 prompt_optimizer.py gepa-lite \
+  --examples prompt_eval_examples/planner_examples.jsonl \
+  --iterations 5
+
+# Or run DSPy GEPA if optional dependencies are installed
+python3 prompt_optimizer.py dspy-gepa \
+  --examples prompt_eval_examples/planner_examples.jsonl \
+  --seed-prompt SYSTEM_PROMPT.TXT \
+  --output optimized_SYSTEM_PROMPT.TXT \
+  --auto light
+
+# Validate the best prompt in the real optimizer
+python3 dcp_optimizer.py input.dcp --system-prompt optimized_SYSTEM_PROMPT.TXT
+```
+
+The starter examples live in `prompt_eval_examples/planner_examples.jsonl`. Add rows from real runs when a candidate makes a poor recipe choice: include the `decision_input`, the expected strategy, and a concise feedback hint. GEPA works best when the metric provides domain feedback, not just a scalar score.
 
 ## Validating Optimized Designs
 

@@ -10,6 +10,8 @@ class GenerationSearchConfig:
     """Configuration for branch-and-generation LLM search."""
 
     enabled: bool = True
+    budget_profile: str = "balanced"
+    strategy_effort: str = "balanced"
     branch_factor: int = 2
     beam_width: int = 2
     max_generations: int = 3
@@ -17,6 +19,9 @@ class GenerationSearchConfig:
     max_steps_without_improvement: int = 3
     max_llm_calls: int = 50
     min_wns_delta: float = 0.001
+    min_wns_per_minute: float = 0.0
+    max_runtime_minutes: Optional[float] = None
+    max_cost: Optional[float] = None
     stop_when_timing_met: bool = True
     wall_clock_limit_seconds: float = 3600.0
 
