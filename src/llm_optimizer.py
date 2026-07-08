@@ -20,7 +20,7 @@ from src.search import GenerationSearchConfig, SearchCandidate
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "~openai/gpt-latest"
-SUPPORTED_SINGLE_METHODS = ("PBLOCK", "FANOUT", "PHYS_OPT", "HARD_BLOCK")
+SUPPORTED_SINGLE_METHODS = ("PBLOCK", "FANOUT", "CELL_RELOCATE", "PHYS_OPT", "HARD_BLOCK")
 PLANNER_MAX_TOKENS = 320
 PLANNER_RETRY_MAX_TOKENS = 512
 
@@ -43,6 +43,7 @@ class DCPOptimizer(DCPOptimizerBase):
         debug: bool = False,
         run_dir: Optional[Path] = None,
         generation_config: Optional[GenerationSearchConfig] = None,
+        force_strategy: Optional[str] = None,
     ):
         super().__init__(debug=debug, run_dir=run_dir)
 
@@ -50,6 +51,7 @@ class DCPOptimizer(DCPOptimizerBase):
         self.model = model
         self.generation_config = generation_config or GenerationSearchConfig()
         self.system_prompt = load_system_prompt()
+        self.force_strategy = force_strategy
         self.openai = OpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
@@ -207,7 +209,7 @@ class DCPOptimizer(DCPOptimizerBase):
         return (
             "Choose exactly one optimization action.\n"
             "Return exactly one JSON object and nothing else.\n"
-            'Schema: {"strategy":"PBLOCK|FANOUT|PHYS_OPT|HARD_BLOCK","args":{...}}\n'
+            'Schema: {"strategy":"PBLOCK|FANOUT|CELL_RELOCATE|PHYS_OPT|HARD_BLOCK","args":{...}}\n'
             "Keep args minimal. Do not use markdown, code fences, or explanation.\n"
             f"{retry_line}"
             "Decision input JSON follows:\n"
@@ -616,11 +618,40 @@ class DCPOptimizer(DCPOptimizerBase):
             top_n = max(1, min(10, top_n))
             return strategy, {"top_n_nets": top_n}
 
+        if strategy == "CELL_RELOCATE":
+            try:
+                num_paths = int(args.get("num_paths", 10))
+            except (TypeError, ValueError):
+                num_paths = 10
+            num_paths = max(3, min(20, num_paths))
+
+            try:
+                detour_threshold = float(args.get("detour_threshold", 2.0))
+            except (TypeError, ValueError):
+                detour_threshold = 2.0
+            detour_threshold = max(1.2, min(4.0, detour_threshold))
+
+            try:
+                max_cells = int(args.get("max_cells", 3))
+            except (TypeError, ValueError):
+                max_cells = 3
+            max_cells = max(1, min(5, max_cells))
+
+            return strategy, {
+                "num_paths": num_paths,
+                "detour_threshold": detour_threshold,
+                "max_cells": max_cells,
+            }
+
         if strategy == "PHYS_OPT":
             directive = args.get("directive", "Default")
             if directive not in ["Explore", "AggressiveExplore", "Default"]:
                 directive = "Default"
             return strategy, {"directive": directive}
+
+        if strategy == "HARD_BLOCK":
+            hard_block_types = args.get("hard_block_types") or ["DSP", "BRAM", "URAM"]
+            return strategy, {"hard_block_types": [str(item) for item in hard_block_types]}
 
         if strategy == "PBLOCK":
             return strategy, {}
@@ -655,6 +686,7 @@ class DCPOptimizer(DCPOptimizerBase):
             )
         candidates.extend(
             [
+                ("CELL_RELOCATE", {"num_paths": 10, "detour_threshold": 2.0, "max_cells": 3}),
                 ("PBLOCK", {}),
                 ("PHYS_OPT", {"directive": "Default"}),
                 ("PHYS_OPT", {"directive": "Explore"}),
@@ -801,6 +833,7 @@ class DCPOptimizer(DCPOptimizerBase):
         forced_strategies.extend(
             [
                 ("PBLOCK", {}),
+                ("CELL_RELOCATE", {"num_paths": 10, "detour_threshold": 2.0, "max_cells": 3}),
                 ("PHYS_OPT", {"directive": "Explore"}),
             ]
         )
@@ -947,6 +980,87 @@ class DCPOptimizer(DCPOptimizerBase):
                 await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
 
         return best_report
+
+    async def run_cell_relocation_flow(
+        self,
+        num_paths: int = 10,
+        detour_threshold: float = 2.0,
+        max_cells: int = 3,
+    ) -> str:
+        """Relocate detour-heavy cells identified on critical paths."""
+        pins_file = Path(self.temp_dir) / f"critical_path_pins_iter_{self.iteration}.json"
+
+        await self.v(
+            "extract_critical_path_pins",
+            {
+                "num_paths": num_paths,
+                "output_file": str(pins_file),
+            },
+        )
+
+        detour_report = await self.rw(
+            "analyze_net_detour",
+            {
+                "input_file": str(pins_file),
+                "detour_threshold": detour_threshold,
+            },
+        )
+        detour_data = json.loads(detour_report)
+        if "error" in detour_data:
+            raise RuntimeError(f"analyze_net_detour failed: {detour_data['error']}")
+
+        candidates = detour_data.get("candidates", [])
+        if not candidates:
+            print("No detour-heavy critical cells found; measuring without relocation.")
+            return await self.v("report_timing_summary")
+
+        prioritized_candidates = sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.get("path", float("inf")),
+                -float(candidate.get("max_detour_ratio", 0.0)),
+            ),
+        )
+
+        prioritized_cells: list[str] = []
+        seen_cells: set[str] = set()
+        for candidate in prioritized_candidates:
+            cell_name = str(candidate.get("cell", "")).strip()
+            if not cell_name or cell_name in seen_cells:
+                continue
+            prioritized_cells.append(cell_name)
+            seen_cells.add(cell_name)
+            if len(prioritized_cells) >= max_cells:
+                break
+
+        if not prioritized_cells:
+            print("Detour analysis returned candidates, but no valid cells were selected.")
+            return await self.v("report_timing_summary")
+
+        print("Relocating detour-heavy cells: " + ", ".join(prioritized_cells))
+        relocation_report = await self.rw(
+            "optimize_cell_placement",
+            {
+                "cell_names": prioritized_cells,
+                "max_candidates": max_cells,
+            },
+        )
+        relocation_data = json.loads(relocation_report)
+        if "error" in relocation_data:
+            raise RuntimeError(f"optimize_cell_placement failed: {relocation_data['error']}")
+
+        for cell_result in relocation_data.get("results", []):
+            print(
+                f"  {cell_result.get('cell')}: "
+                f"{cell_result.get('status')} - {cell_result.get('message')}"
+            )
+
+        temp_dcp = Path(self.temp_dir) / f"cell_relocate_iter_{self.iteration}.dcp"
+        await self.rw("write_checkpoint", {"dcp_path": str(temp_dcp.resolve())})
+
+        await self.v("open_checkpoint", {"dcp_path": str(temp_dcp.resolve())})
+        report, _ = await self._reroute_and_measure()
+        return report
 
     async def run_phys_opt_flow(self, directive: str = "Default") -> str:
         """Execute a multi-pass Vivado phys_opt recipe."""
@@ -1138,6 +1252,8 @@ class DCPOptimizer(DCPOptimizerBase):
             result = await self.run_pblock_flow()
         elif strategy == "FANOUT":
             result = await self.run_fanout_flow(**args)
+        elif strategy == "CELL_RELOCATE":
+            result = await self.run_cell_relocation_flow(**args)
         elif strategy == "HARD_BLOCK":
             result = await self.run_hard_block_flow(**args)
         else:
@@ -1167,6 +1283,11 @@ class DCPOptimizer(DCPOptimizerBase):
             "available_strategies": {
                 "PBLOCK": {},
                 "FANOUT": {"top_n_nets": "int (1-10)"},
+                "CELL_RELOCATE": {
+                    "num_paths": "int (3-20)",
+                    "detour_threshold": "float (1.2-4.0)",
+                    "max_cells": "int (1-5)",
+                },
                 "PHYS_OPT": {"directive": ["Explore", "AggressiveExplore", "Default"]},
                 "HARD_BLOCK": {"hard_block_types": ["DSP", "BRAM", "URAM"]},
             },
@@ -1318,6 +1439,8 @@ class DCPOptimizer(DCPOptimizerBase):
                 strategy_args = {}
             elif method == "FANOUT":
                 strategy_args = {"top_n_nets": top_n_nets}
+            elif method == "CELL_RELOCATE":
+                strategy_args = {"num_paths": 10, "detour_threshold": 2.0, "max_cells": 3}
             elif method == "HARD_BLOCK":
                 strategy_args = {"hard_block_types": ["DSP", "BRAM", "URAM"]}
             else:
@@ -1399,8 +1522,12 @@ class DCPOptimizer(DCPOptimizerBase):
                     stagnation,
                     self.history[-5:],
                 )
-                action = await self.choose_action_llm(decision_input)
-                strategy, args = self.sanitize_action(action)
+                if self.force_strategy:
+                    strategy, args = self.sanitize_action({"strategy": self.force_strategy, "args": {}})
+                    print(f"Forced strategy: {strategy} with args {args}")
+                else:
+                    action = await self.choose_action_llm(decision_input)
+                    strategy, args = self.sanitize_action(action)
                 strategy, args, deduped = self._dedupe_action_choice(strategy, args, used_action_signatures)
                 if deduped:
                     print(f"Chosen action repeated in current search state; using fallback: {strategy} with args {args}")
@@ -1689,7 +1816,10 @@ class DCPOptimizer(DCPOptimizerBase):
             )
 
             forced_action = self._forced_branch_strategy(generation, parent, branch_index, step)
-            if forced_action is not None:
+            if self.force_strategy:
+                strategy, args = self.sanitize_action({"strategy": self.force_strategy, "args": {}})
+                print(f"[SEARCH] Forced CLI choice: {strategy} with args {args}")
+            elif forced_action is not None:
                 strategy, args = forced_action
                 print(f"[SEARCH] Forced diversity choice: {strategy} with args {args}")
             else:
