@@ -10,6 +10,7 @@ This server enables AI assistants like Cursor to interact with FPGA designs, que
 - **Design Checkpoint Analysis**: Load Vivado .dcp files, inspect design statistics, search for cells
 - **Device Architecture Exploration**: Get tile/site information, query device resources
 - **Design Optimization**: LUT input cone optimization and high fanout net splitting
+- **Hard-Block ECO Relocation**: Column/cascade-aware DSP/BRAM/URAM macro relocation with dry-run analysis
 
 ## Quick Start
 
@@ -82,6 +83,7 @@ Restart Cursor after saving.
 | `search_sites` | Search for sites by type on a device |
 | `optimize_lut_input_cone` | Optimize LUT chains by combining into single LUTs |
 | `optimize_fanout` | Split high fanout nets by replicating drivers |
+| `hard_block_column_cascade_relocation` | Relocate compatible hard-block macros across columns and unroute affected nets |
 
 ## Example Usage
 
@@ -312,4 +314,3 @@ tail -f rapidwright_mcp.log
 - [RapidWright Javadoc](https://www.rapidwright.io/javadoc/)
 - [RapidWright GitHub](https://github.com/Xilinx/RapidWright)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
-

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from src.llm_optimizer import DCPOptimizer, DEFAULT_MODEL
+from src.llm_optimizer import DCPOptimizer, DEFAULT_MODEL, SUPPORTED_SINGLE_METHODS
 from src.search import GenerationSearchConfig
 from src.test_modes import run_test_mode
 
@@ -92,6 +92,9 @@ Examples:
   python dcp_optimizer.py input.dcp --budget-profile fast
   python dcp_optimizer.py input.dcp --budget-profile cost --max-runtime-minutes 45
   python dcp_optimizer.py input.dcp --search-mode linear
+  python dcp_optimizer.py input.dcp --single-method PBLOCK
+  python dcp_optimizer.py input.dcp --single-method FANOUT --top-n-nets 3
+  python dcp_optimizer.py input.dcp --single-method PHYS_OPT --phys-opt-directive Explore
   python dcp_optimizer.py input.dcp --debug
   python dcp_optimizer.py fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp --test
   python dcp_optimizer.py fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp --test
@@ -228,6 +231,50 @@ Examples:
         action="store_true",
         help="Keep searching after WNS reaches 0 instead of stopping at timing closure",
     )
+    parser.add_argument(
+        "--wall-clock-limit-seconds",
+        type=float,
+        default=3600.0,
+        help="Wall-clock runtime limit in seconds for optimizer search (default: 3600)",
+    )
+    parser.add_argument(
+        "--single-method",
+        choices=SUPPORTED_SINGLE_METHODS,
+        help="Run exactly one selected optimization method once, without LLM search.",
+    )
+    parser.add_argument(
+        "--top-n-nets",
+        type=int,
+        default=5,
+        help="When using --single-method FANOUT, optimize this many high-fanout nets (default: 5)",
+    )
+    parser.add_argument(
+        "--phys-opt-directive",
+        choices=["Default", "Explore", "AggressiveExplore"],
+        default="Default",
+        help="When using --single-method PHYS_OPT, use this phys_opt_design directive (default: Default)",
+    )
+    force_group = parser.add_mutually_exclusive_group()
+    force_group.add_argument(
+        "--force-pblock",
+        action="store_true",
+        help="Force the PBLOCK recipe every iteration",
+    )
+    force_group.add_argument(
+        "--force-fanout",
+        action="store_true",
+        help="Force the FANOUT recipe every iteration",
+    )
+    force_group.add_argument(
+        "--force-cell-relocate",
+        action="store_true",
+        help="Force the detour-aware CELL_RELOCATE recipe every iteration",
+    )
+    force_group.add_argument(
+        "--force-phys-opt",
+        action="store_true",
+        help="Force the PHYS_OPT recipe every iteration",
+    )
 
     args = parser.parse_args()
 
@@ -265,6 +312,65 @@ Examples:
         )
         sys.exit(exit_code)
 
+    if args.single_method:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+
+        print("FPGA Design Optimization - SINGLE METHOD MODE")
+        print("==============================================")
+        print(f"Input:        {args.input_dcp.resolve()}")
+        print(f"Output:       {args.output_dcp.resolve()}")
+        print(f"Run dir:      {run_dir}")
+        print(f"Method:       {args.single_method}")
+        if args.single_method == "FANOUT":
+            print(f"Top nets:     {args.top_n_nets}")
+        elif args.single_method == "PHYS_OPT":
+            print(f"Directive:    {args.phys_opt_directive}")
+        print()
+
+        generation_config = GenerationSearchConfig(
+            enabled=False,
+            wall_clock_limit_seconds=max(0.0, args.wall_clock_limit_seconds),
+        )
+        optimizer = DCPOptimizer(
+            api_key=args.api_key or "",
+            model=args.model,
+            debug=args.debug,
+            run_dir=run_dir,
+            generation_config=generation_config,
+        )
+
+        try:
+            await optimizer.start_servers()
+            success = await optimizer.run_single_method(
+                args.input_dcp,
+                args.output_dcp,
+                args.single_method,
+                top_n_nets=max(1, args.top_n_nets),
+                phys_opt_directive=args.phys_opt_directive,
+            )
+
+            if success:
+                print("\n✓ Single-method optimization completed successfully")
+                print("\nOutput files:")
+                print(f"  Optimized DCP: {args.output_dcp.name}")
+                sys.exit(0)
+
+            print("\n✗ Single-method optimization did not complete successfully")
+            print(f"\nRun directory preserved at: {run_dir}")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            print("\n\nInterrupted by user")
+            print(f"Run directory preserved at: {run_dir}")
+            sys.exit(130)
+        except Exception as exc:
+            logging.exception("Fatal error")
+            print(f"\n✗ Fatal error: {exc}")
+            print(f"Run directory preserved at: {run_dir}")
+            sys.exit(1)
+        finally:
+            await optimizer.cleanup()
+
     if not args.api_key:
         print("Error: OpenRouter API key required. Set OPENROUTER_API_KEY or use --api-key", file=sys.stderr)
         print("       Use --test flag to run in test mode without LLM", file=sys.stderr)
@@ -273,6 +379,16 @@ Examples:
     if OpenAI is None:
         print("Error: openai package not installed. Run: pip install openai", file=sys.stderr)
         sys.exit(1)
+
+    force_strategy = None
+    if args.force_pblock:
+        force_strategy = "PBLOCK"
+    elif args.force_fanout:
+        force_strategy = "FANOUT"
+    elif args.force_cell_relocate:
+        force_strategy = "CELL_RELOCATE"
+    elif args.force_phys_opt:
+        force_strategy = "PHYS_OPT"
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
@@ -296,6 +412,7 @@ Examples:
     if args.system_prompt:
         print(f"Prompt:      {args.system_prompt.resolve()}")
     print(f"Search mode: {args.search_mode}")
+    print(f"Wall clock:  {args.wall_clock_limit_seconds:.0f} seconds")
     print(f"Budget:      {args.budget_profile} (recipe effort: {strategy_effort})")
     if args.max_runtime_minutes is not None:
         print(f"Runtime cap: {args.max_runtime_minutes:.1f} minutes")
@@ -309,6 +426,8 @@ Examples:
     print(f"Min WNS gain:{min_wns_delta:.3f} ns")
     if min_wns_per_minute > 0:
         print(f"Min ROI:     {min_wns_per_minute:.4f} ns/minute")
+    if force_strategy:
+        print(f"Forced recipe: {force_strategy}")
     print()
 
     generation_config = GenerationSearchConfig(
@@ -326,6 +445,7 @@ Examples:
         max_runtime_minutes=args.max_runtime_minutes if args.max_runtime_minutes and args.max_runtime_minutes > 0 else None,
         max_cost=args.max_cost if args.max_cost and args.max_cost > 0 else None,
         stop_when_timing_met=not args.continue_after_timing_met,
+        wall_clock_limit_seconds=max(0.0, args.wall_clock_limit_seconds),
     )
 
     optimizer = DCPOptimizer(
@@ -335,6 +455,7 @@ Examples:
         run_dir=run_dir,
         generation_config=generation_config,
         system_prompt_path=args.system_prompt,
+        force_strategy=force_strategy,
     )
 
     try:
@@ -344,8 +465,7 @@ Examples:
         if success:
             print("\n✓ Optimization completed successfully")
             print("\nOutput files:")
-            print(f"  Optimized DCP: {args.output_dcp}")
-            print(f"  Run directory: {run_dir}")
+            print(f"  Optimized DCP: {args.output_dcp.name}")
             sys.exit(0)
 
         print("\n✗ Optimization did not complete successfully")

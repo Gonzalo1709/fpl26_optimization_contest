@@ -23,6 +23,7 @@ class GenerationSearchConfig:
     max_runtime_minutes: Optional[float] = None
     max_cost: Optional[float] = None
     stop_when_timing_met: bool = True
+    wall_clock_limit_seconds: float = 3600.0
 
 
 @dataclass

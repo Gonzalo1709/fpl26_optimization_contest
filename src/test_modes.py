@@ -568,6 +568,125 @@ class FPGAOptimizerTest(DCPOptimizerBase):
             print(f"Exception: {type(e).__name__}: {e}")
             return False
 
+    async def run_test_hard_blocks(self, input_dcp: Path, output_dcp: Path) -> bool:
+        overall_start = time.time()
+
+        try:
+            print("=" * 60)
+            print("Step 1  Vivado baseline")
+            print("=" * 60)
+
+            result = await self.call_vivado_tool("open_checkpoint", {"dcp_path": str(input_dcp.resolve())}, timeout=600.0)
+            logger.info(f"Open checkpoint result: {result}")
+
+            self.clock_period = await self.fetch_clock_period()
+            target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+            if target_wns is not None:
+                self.initial_wns = target_wns
+            else:
+                ts = await self.call_vivado_tool("report_timing_summary", {}, timeout=300.0)
+                self.initial_wns = self.parse_wns_from_timing_report(ts)
+
+            baseline_fmax = self.calculate_fmax(self.initial_wns, self.clock_period)
+            print(f"  Clock period:   {self.clock_period} ns")
+            print(f"  Baseline WNS:   {self.initial_wns} ns")
+            if baseline_fmax is not None:
+                print(f"  Baseline Fmax:  {baseline_fmax:.2f} MHz")
+
+            print("\n" + "=" * 60)
+            print("Step 2  RapidWright hard-block relocation")
+            print("=" * 60)
+
+            result = await self.call_rapidwright_tool("initialize_rapidwright", {"jvm_max_memory": "8G"}, timeout=120.0)
+            logger.info(f"RapidWright init: {result}")
+
+            result = await self.call_rapidwright_tool("read_checkpoint", {"dcp_path": str(input_dcp.resolve())}, timeout=600.0)
+            logger.info(f"RapidWright read checkpoint: {result}")
+
+            result = await self.call_rapidwright_tool("hard_block_column_cascade_relocation", {
+                "hard_block_types": ["DSP", "BRAM", "URAM"],
+                "max_macros": 50,
+                "max_candidates_per_macro": 25,
+                "min_score_improvement": 5.0,
+                "preserve_slr": True,
+                "dry_run": False,
+            }, timeout=600.0)
+            logger.info(f"hard_block_column_cascade_relocation: {result}")
+
+            relocation_result = json.loads(result) if isinstance(result, str) else result
+            if "error" in relocation_result:
+                raise RuntimeError(f"hard_block_column_cascade_relocation failed: {relocation_result['error']}")
+
+            print(f"  Hard blocks found: {relocation_result.get('hard_block_cells_found', '?')}")
+            print(f"  Macros detected:   {relocation_result.get('macros_detected', '?')}")
+            print(f"  Candidate columns: {relocation_result.get('candidate_columns_evaluated', '?')}")
+
+            selected_move = relocation_result.get("selected_move")
+            if not selected_move:
+                print("  No improving legal move found; preserving original placement.")
+                await self.call_vivado_tool("write_checkpoint", {"dcp_path": str(output_dcp.resolve()), "force": True}, timeout=600.0)
+                self.final_wns = self.initial_wns
+                return True
+
+            print(f"  Selected macro:    {selected_move['macro_id']} ({selected_move['hard_block_type']})")
+            print(f"  Score before/after:{selected_move['estimated_score_before']:.2f} -> {selected_move['estimated_score_after']:.2f}")
+            print(f"  Affected nets:     {relocation_result.get('affected_nets', {}).get('count', 0)}")
+
+            rw_output = Path(self.temp_dir) / "hard_block_rw_optimized.dcp"
+            await self.call_rapidwright_tool("write_checkpoint", {"dcp_path": str(rw_output), "overwrite": True}, timeout=600.0)
+            print(f"  Wrote {rw_output.name}")
+
+            print("\n" + "=" * 60)
+            print("Step 3  Vivado verification")
+            print("=" * 60)
+
+            result = await self.call_vivado_tool("open_checkpoint", {"dcp_path": str(rw_output)}, timeout=600.0)
+            logger.info(f"Open optimized checkpoint: {result}")
+
+            result = await self.call_vivado_tool("route_design", {"directive": "Default"}, timeout=3600.0)
+            logger.info(f"Route design: {result}")
+
+            route_result = await self.call_vivado_tool("report_route_status", {}, timeout=300.0)
+            error_match = re.search(r"# of nets with routing errors.*?:\s+(\d+)", route_result)
+            error_count = int(error_match.group(1)) if error_match else -1
+
+            target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+            if target_wns is not None:
+                self.final_wns = target_wns
+            else:
+                ts = await self.call_vivado_tool("report_timing_summary", {}, timeout=300.0)
+                self.final_wns = self.parse_wns_from_timing_report(ts)
+
+            new_fmax = self.calculate_fmax(self.final_wns, self.clock_period)
+
+            print(f"  Routing errors:  {error_count}")
+            if baseline_fmax is not None and new_fmax is not None:
+                print(f"  Baseline WNS:    {self.initial_wns} ns  ->  Fmax {baseline_fmax:.2f} MHz")
+                print(f"  Optimized WNS:   {self.final_wns} ns  ->  Fmax {new_fmax:.2f} MHz")
+                print(f"  Fmax improvement: {new_fmax - baseline_fmax:+.2f} MHz")
+            else:
+                print(f"  Baseline WNS:  {self.initial_wns} ns")
+                print(f"  Optimized WNS: {self.final_wns} ns")
+
+            print(f"\nWriting final DCP to: {output_dcp}")
+            await self.call_vivado_tool("write_checkpoint", {"dcp_path": str(output_dcp.resolve()), "force": True}, timeout=600.0)
+
+            elapsed = time.time() - overall_start
+            self.print_test_summary(
+                title="TEST SUMMARY - HARD-BLOCK RELOCATION",
+                elapsed_seconds=elapsed,
+                initial_wns=self.initial_wns,
+                final_wns=self.final_wns,
+                clock_period=self.clock_period,
+                extra_info=f"Selected macro: {selected_move['macro_id']}",
+            )
+            return True
+        except Exception as e:
+            logger.exception(f"Hard-block test failed with exception: {e}")
+            print(f"\n*** TEST FAILED ***")
+            print(f"Exception: {type(e).__name__}: {e}")
+            return False
+
     async def cleanup(self):
         print("\n[TEST] Cleaning up...")
         await super().cleanup()
@@ -583,11 +702,15 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
     elif "vexriscv" in dcp_name:
         design_type = "vexriscv"
         print(f"[TEST] Detected VexRiscv design - using cell re-placement flow")
+    elif any(token in dcp_name for token in ("radioml", "mini-isp", "digit-recognition", "optical-flow", "spam-filter")):
+        design_type = "hardblocks"
+        print(f"[TEST] Detected hard-block-heavy design - using hard-block relocation flow")
     else:
         print(f"\n[TEST] ERROR: Unsupported DCP file: {input_dcp.name}")
         print(f"[TEST] Test mode supports these benchmark DCPs:")
         print(f"[TEST]   - fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp")
         print(f"[TEST]   - fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp")
+        print(f"[TEST]   - hard-block-heavy benchmarks such as finn_radioml_2025.1.dcp")
         print(f"[TEST]")
         print(f"[TEST] For custom DCPs, run without --test to use the LLM-guided optimizer.")
         return 1
@@ -599,8 +722,10 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
 
         if design_type == "logicnets":
             success = await tester.run_test_logicnets(input_dcp, output_dcp)
-        else:
+        elif design_type == "vexriscv":
             success = await tester.run_test_vexriscv(input_dcp, output_dcp)
+        else:
+            success = await tester.run_test_hard_blocks(input_dcp, output_dcp)
 
         if success:
             print("\n[TEST] Test completed successfully")
