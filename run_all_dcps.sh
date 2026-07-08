@@ -289,6 +289,8 @@ if [[ ! -d "${BENCH_DIR}" ]]; then
   exit 1
 fi
 
+BENCH_DIR="$(realpath "${BENCH_DIR}")"
+
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "Error: Python executable not found: ${PYTHON_BIN}" >&2
   exit 1
@@ -305,7 +307,7 @@ validate_rclone_destination "${RCLONE_DEST}"
 
 mkdir -p "${LOG_DIR}"
 
-mapfile -t DCP_FILES < <(find "${BENCH_DIR}" -maxdepth 1 -type f -name "*.dcp" | sort)
+mapfile -t DCP_FILES < <(find "${BENCH_DIR}" -maxdepth 1 -type f -name "*.dcp" -print0 | sort -z | xargs -0 realpath)
 
 if [[ ${#DCP_FILES[@]} -eq 0 ]]; then
   echo "Error: no .dcp files found in ${BENCH_DIR}" >&2

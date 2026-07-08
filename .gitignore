@@ -13,3 +13,5 @@ fpl26contest
 
 dcp_optimizer_*
 batch_logs/
+
+branching_sweep_logs/*

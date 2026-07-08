@@ -18,6 +18,7 @@ class GenerationSearchConfig:
     max_llm_calls: int = 50
     min_wns_delta: float = 0.001
     stop_when_timing_met: bool = True
+    wall_clock_limit_seconds: float = 3600.0
 
 
 @dataclass

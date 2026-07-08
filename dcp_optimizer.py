@@ -135,6 +135,12 @@ Examples:
         help="Keep searching after WNS reaches 0 instead of stopping at timing closure",
     )
     parser.add_argument(
+        "--wall-clock-limit-seconds",
+        type=float,
+        default=3600.0,
+        help="Wall-clock runtime limit in seconds for optimizer search (default: 3600)",
+    )
+    parser.add_argument(
         "--single-method",
         choices=SUPPORTED_SINGLE_METHODS,
         help="Run exactly one selected optimization method once, without LLM search.",
@@ -204,7 +210,10 @@ Examples:
             print(f"Directive:    {args.phys_opt_directive}")
         print()
 
-        generation_config = GenerationSearchConfig(enabled=False)
+        generation_config = GenerationSearchConfig(
+            enabled=False,
+            wall_clock_limit_seconds=max(0.0, args.wall_clock_limit_seconds),
+        )
         optimizer = DCPOptimizer(
             api_key=args.api_key or "",
             model=args.model,
@@ -226,8 +235,7 @@ Examples:
             if success:
                 print("\n✓ Single-method optimization completed successfully")
                 print("\nOutput files:")
-                print(f"  Optimized DCP: {args.output_dcp}")
-                print(f"  Run directory: {run_dir}")
+                print(f"  Optimized DCP: {args.output_dcp.name}")
                 sys.exit(0)
 
             print("\n✗ Single-method optimization did not complete successfully")
@@ -264,6 +272,7 @@ Examples:
     print(f"Run dir:     {run_dir}")
     print(f"Model:       {args.model}")
     print(f"Search mode: {args.search_mode}")
+    print(f"Wall clock:  {args.wall_clock_limit_seconds:.0f} seconds")
     if args.search_mode == "generations":
         print(f"Branches:    {args.branches}")
         print(f"Beam width:  {args.beam_width}")
@@ -281,6 +290,7 @@ Examples:
         max_llm_calls=max(1, args.max_llm_calls),
         min_wns_delta=max(0.0, args.min_wns_delta),
         stop_when_timing_met=not args.continue_after_timing_met,
+        wall_clock_limit_seconds=max(0.0, args.wall_clock_limit_seconds),
     )
 
     optimizer = DCPOptimizer(
@@ -298,8 +308,7 @@ Examples:
         if success:
             print("\n✓ Optimization completed successfully")
             print("\nOutput files:")
-            print(f"  Optimized DCP: {args.output_dcp}")
-            print(f"  Run directory: {run_dir}")
+            print(f"  Optimized DCP: {args.output_dcp.name}")
             sys.exit(0)
 
         print("\n✗ Optimization did not complete successfully")

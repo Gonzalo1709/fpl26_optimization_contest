@@ -1860,6 +1860,42 @@ def _is_bram_site_type_name(site_type_name: str) -> bool:
     return site_type_name.startswith("RAMB") or site_type_name.startswith("RAMBFIFO")
 
 
+def _get_compatible_bel_names(site, bel_name: str, cell_type: str = "") -> list[str]:
+    """
+    Return candidate BEL names for a placed cell on the provided site.
+
+    BRAM sites are inconsistent between placed cell BEL names (for example
+    RAMB36E2) and site BEL names (for example RAMBFIFO36E2), so we normalize
+    the common variants here before legality/application checks.
+    """
+    candidates: list[str] = []
+    for name in (bel_name, cell_type):
+        if name and name not in candidates:
+            candidates.append(name)
+
+    site_type_name = str(site.getSiteTypeEnum())
+    if _is_bram_site_type_name(site_type_name):
+        normalized = []
+        for name in list(candidates):
+            if name.startswith("RAMB36") and "RAMBFIFO36E2" not in normalized:
+                normalized.append("RAMBFIFO36E2")
+            elif name.startswith("RAMB18") and "RAMB18E2_U" not in normalized:
+                # RAMB18 placement can land on either half BEL; compatibility
+                # checks will accept any matching available half on the site.
+                normalized.extend([n for n in ("RAMB18E2_U", "RAMB18E2_L") if n not in normalized])
+        candidates.extend([name for name in normalized if name not in candidates])
+
+    return candidates
+
+
+def _resolve_site_bel(site, bel_name: str, cell_type: str = ""):
+    for candidate_name in _get_compatible_bel_names(site, bel_name, cell_type):
+        bel = _safe_invoke(site, "getBEL", candidate_name, default=None)
+        if bel is not None:
+            return bel
+    return None
+
+
 def _iter_related_bram_sites(site) -> list[Any]:
     tile = _safe_invoke(site, "getTile", default=None)
     if tile is None:
@@ -1962,7 +1998,7 @@ def _is_target_site_clean_for_macro(design, target_site, macro: HardBlockMacro) 
 
 
 def _get_bel_signature(site, bel_name: str) -> Optional[dict[str, Any]]:
-    bel = _safe_invoke(site, "getBEL", bel_name, default=None)
+    bel = _resolve_site_bel(site, bel_name)
     if bel is None:
         return None
     bel_class = _safe_invoke(bel, "getBELClass", default=None)
@@ -1988,10 +2024,11 @@ def _check_bel_compatibility(design, cell_node: HardBlockCellNode, source_site, 
     if str(source_site.getSiteTypeEnum()) != str(target_site.getSiteTypeEnum()):
         return False, "site_type_not_identical"
 
+    compatible_target_bels = set(_get_compatible_bel_names(target_site, source_bel_name, cell_node.cell_type))
     target_site_inst = design.getSiteInstFromSite(target_site)
     if target_site_inst is not None:
         for cell in list(_safe_invoke(target_site_inst, "getCells", default=[])):
-            if str(_safe_invoke(cell, "getBELName", default="")) != source_bel_name:
+            if str(_safe_invoke(cell, "getBELName", default="")) not in compatible_target_bels:
                 continue
             if str(cell.getName()) not in set(macro.cell_names):
                 return False, f"target_bel_occupied:{source_bel_name}"
@@ -2390,6 +2427,13 @@ def _enumerate_macro_candidates(
 
     candidates: list[HardBlockRelocationCandidate] = []
     rejected: list[dict[str, Any]] = []
+    counters = {
+        "columns_scanned": len(column_sites),
+        "anchor_sites_scanned": 0,
+        "anchors_with_rejection": 0,
+        "anchors_with_candidate": 0,
+        "rejection_counts": defaultdict(int),
+    }
 
     source_site_checks = {}
     for cell_name in macro.ordered_cell_names:
@@ -2417,6 +2461,7 @@ def _enumerate_macro_candidates(
 
     for column_id, sites_by_y in column_sites.items():
         for anchor_y, anchor_site in sorted(sites_by_y.items()):
+            counters["anchor_sites_scanned"] += 1
             target_sites = {}
             rejection_reasons = []
             rejection_debug = {
@@ -2482,6 +2527,9 @@ def _enumerate_macro_candidates(
                 target_sites[cell_name] = target_site
 
             if rejection_reasons:
+                counters["anchors_with_rejection"] += 1
+                for reason in rejection_reasons:
+                    counters["rejection_counts"][reason.split(":", 1)[0]] += 1
                 rejection_debug["reasons"] = rejection_reasons
                 rejected.append(rejection_debug)
                 continue
@@ -2506,12 +2554,20 @@ def _enumerate_macro_candidates(
                     reroute_scope_nets=score["reroute_scope"],
                 )
             )
+            counters["anchors_with_candidate"] += 1
 
     candidates.sort(key=lambda c: c.candidate_score)
     return {
         "current_score": current_score,
         "candidates": candidates[:max_candidates_per_macro],
         "rejected": rejected[:max_candidates_per_macro * 4],
+        "stats": {
+            "columns_scanned": counters["columns_scanned"],
+            "anchor_sites_scanned": counters["anchor_sites_scanned"],
+            "anchors_with_rejection": counters["anchors_with_rejection"],
+            "anchors_with_candidate": counters["anchors_with_candidate"],
+            "rejection_counts": dict(sorted(counters["rejection_counts"].items())),
+        },
     }
 
 
@@ -2566,7 +2622,7 @@ def _apply_macro_relocation(design, macro: HardBlockMacro, candidate: HardBlockR
             target_site = design.getDevice().getSite(target_site_name)
             if target_site is None:
                 raise RuntimeError(f"Missing target site '{target_site_name}'")
-            target_bel = target_site.getBEL(bel_name)
+            target_bel = _resolve_site_bel(target_site, bel_name, str(cell.getType()))
             if target_bel is None:
                 raise RuntimeError(f"Missing BEL '{bel_name}' at site '{target_site_name}'")
             design.placeCell(cell, target_site, target_bel)
@@ -2587,7 +2643,10 @@ def _apply_macro_relocation(design, macro: HardBlockMacro, candidate: HardBlockR
         for cell, old_site, old_bel_name in old_state:
             try:
                 if not cell.isPlaced():
-                    design.placeCell(cell, old_site, old_site.getBEL(old_bel_name))
+                    restore_bel = _resolve_site_bel(old_site, old_bel_name, str(cell.getType()))
+                    if restore_bel is None:
+                        continue
+                    design.placeCell(cell, old_site, restore_bel)
                     site_inst = cell.getSiteInst()
                     if site_inst is not None:
                         site_inst.routeSite()
@@ -2725,6 +2784,7 @@ def hard_block_column_cascade_relocation(
                 "cell_names": macro.ordered_cell_names,
                 "hard_block_type": macro.hard_block_type,
                 "candidate_columns_evaluated": len(candidates),
+                "enumeration_stats": enumeration.get("stats", {}),
                 "rejected_candidates": enumeration["rejected"],
                 "best_candidate": asdict(best_candidate) if best_candidate is not None else None,
                 "current_score": enumeration["current_score"]["total_score"],
