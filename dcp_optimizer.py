@@ -151,10 +151,10 @@ Examples:
     parser.add_argument(
         "--budget-profile",
         choices=["fast", "balanced", "cost", "quality"],
-        default="balanced",
+        default="fast",
         help=(
             "Default search/recipe budget profile. fast prioritizes wall-clock time, "
-            "cost limits LLM/tool spend, quality broadens search (default: balanced)"
+            "cost limits LLM/tool spend, quality broadens search (default: fast)"
         ),
     )
     parser.add_argument(

@@ -37,17 +37,17 @@ class WallClockLimitReached(RuntimeError):
 class DCPOptimizer(DCPOptimizerBase):
     """FPGA Design Optimization Agent using recipe selection plus generation search."""
 
-        def __init__(
-            self,
-            api_key: str,
-            model: str = DEFAULT_MODEL,
-            debug: bool = False,
-            run_dir: Optional[Path] = None,
-            generation_config: Optional[GenerationSearchConfig] = None,
-            force_strategy: Optional[str] = None,
-            system_prompt: Optional[str] = None,
-            system_prompt_path: Optional[Path] = None,
-        ):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = DEFAULT_MODEL,
+        debug: bool = False,
+        run_dir: Optional[Path] = None,
+        generation_config: Optional[GenerationSearchConfig] = None,
+        force_strategy: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        system_prompt_path: Optional[Path] = None,
+    ):
         super().__init__(debug=debug, run_dir=run_dir)
 
         self.api_key = api_key
@@ -61,10 +61,6 @@ class DCPOptimizer(DCPOptimizerBase):
         self.system_prompt_hash = prompt_sha256(self.planner_system_prompt)
         self.system_prompt = self.planner_system_prompt
         self.force_strategy = force_strategy
-        self.openai = OpenAI(
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1",
-        )
         self.openai = OpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
@@ -212,20 +208,88 @@ class DCPOptimizer(DCPOptimizerBase):
         return Path(path).name
 
     @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        """Trim verbose text fields to a bounded size for planner prompts."""
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."
+
+    def _compact_analysis_summary(self, analysis_summary: str) -> str:
+        """Keep only the most decision-relevant parts of the initial analysis."""
+        kept_lines: list[str] = []
+        high_fanout_count = 0
+        for raw_line in analysis_summary.splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                if kept_lines and kept_lines[-1] != "":
+                    kept_lines.append("")
+                continue
+            if stripped.startswith("Clock period:") or stripped.startswith("WNS:") or stripped.startswith("TNS:"):
+                kept_lines.append(line)
+            elif stripped.startswith("Failing endpoints:") or stripped.startswith("Achievable fmax:"):
+                kept_lines.append(line)
+            elif stripped.startswith("Max cell distance:") or stripped.startswith("Avg cell distance:"):
+                kept_lines.append(line)
+            elif stripped.startswith("RECOMMENDATION:"):
+                kept_lines.append(line)
+            elif re.match(r"^\d+\.\s", stripped):
+                if high_fanout_count < 3:
+                    kept_lines.append(line)
+                    high_fanout_count += 1
+            elif stripped.startswith("Fanout:") and high_fanout_count <= 3:
+                kept_lines.append(line)
+            elif stripped.startswith("Total nets available for optimization:"):
+                kept_lines.append(line)
+
+        compact = "\n".join(kept_lines).strip()
+        return self._truncate_text(compact or analysis_summary, 1400)
+
+    def _compact_history(self, recent_history: list[dict]) -> list[dict]:
+        """Reduce planner history to the fields needed for next-step choice."""
+        compact_history: list[dict] = []
+        for entry in recent_history[-4:]:
+            compact_entry = {
+                "iteration": entry.get("iteration") or entry.get("step"),
+                "strategy": entry.get("strategy"),
+                "wns": entry.get("wns"),
+                "delta_wns": entry.get("delta_wns"),
+                "error": self._truncate_text(str(entry["error"]), 120) if entry.get("error") else None,
+            }
+            args = entry.get("args")
+            if args:
+                compact_entry["args"] = args
+            if entry.get("delta_vs_best") is not None:
+                compact_entry["delta_vs_best"] = entry.get("delta_vs_best")
+            compact_history.append({key: value for key, value in compact_entry.items() if value is not None})
+        return compact_history
+
+    def _compact_branch_context(self, branch_context: str) -> str:
+        """Shorten branch context to a compact summary."""
+        return self._truncate_text(branch_context.strip(), 260) if branch_context else ""
+
+    def _compact_candidate_summaries(self, tried_summaries: str) -> str:
+        """Keep only the most recent candidate summaries."""
+        if not tried_summaries:
+            return ""
+        lines = [line for line in tried_summaries.splitlines() if line.strip()]
+        return self._truncate_text("\n".join(lines[-6:]), 500)
+
+    @staticmethod
     def _planner_user_message(decision_input: dict, retry: bool = False) -> str:
         """Build a compact planner prompt that strongly requests raw JSON only."""
         retry_line = (
-            "Previous attempt was truncated or malformed. Keep the answer shorter and output JSON only.\n"
+            "Previous attempt was truncated or malformed. Reply with shorter JSON only.\n"
             if retry
             else ""
         )
         return (
-            "Choose exactly one optimization action.\n"
-            "Return exactly one JSON object and nothing else.\n"
+            "Choose one optimization action.\n"
+            "Return one JSON object only.\n"
             'Schema: {"strategy":"PBLOCK|FANOUT|CELL_RELOCATE|PHYS_OPT|HARD_BLOCK","args":{...}}\n'
-            "Keep args minimal. Do not use markdown, code fences, or explanation.\n"
+            "Keep args minimal. No markdown or explanation.\n"
             f"{retry_line}"
-            "Decision input JSON follows:\n"
+            "Decision input:\n"
             f"{json.dumps(decision_input, separators=(',', ':'))}"
         )
 
@@ -427,7 +491,7 @@ class DCPOptimizer(DCPOptimizerBase):
             "vivado_get_critical_high_fanout_nets",
             {"num_paths": 50, "min_fanout": 100},
         )
-hayt        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
+        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
         print(f"✓ Found {len(self.high_fanout_nets)} high fanout nets (>100 fanout)\n")
 
         critical_path_spread_info = None
@@ -456,7 +520,7 @@ hayt        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
                     "avg_distance": spread_data.get("avg_max_distance", 0),
                     "paths_analyzed": spread_data.get("paths_analyzed", 0),
                 }
-                print("✓ Critical path spread analyzed:")hayt
+                print("✓ Critical path spread analyzed:")
                 print(f"  - Max distance: {critical_path_spread_info['max_distance']} tiles")
                 print(f"  - Avg distance: {critical_path_spread_info['avg_distance']:.1f} tiles")
                 print(f"  - Paths analyzed: {critical_path_spread_info['paths_analyzed']}")
@@ -1323,14 +1387,23 @@ hayt        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
     ) -> dict:
         """Assemble the planner input for one recipe-selection decision."""
         return {
-            "analysis": analysis_summary,
-            "history": recent_history,
+            "analysis": self._compact_analysis_summary(analysis_summary),
+            "history": self._compact_history(recent_history),
             "best_wns": self.best_wns,
             "stagnation": stagnation,
-            "branch_context": branch_context,
-            "recent_candidates": tried_summaries,
-            "fanout_blacklist": self.fanout_blacklist,
-            "search_settings": asdict(self.generation_config),
+            "branch_context": self._compact_branch_context(branch_context),
+            "recent_candidates": self._compact_candidate_summaries(tried_summaries),
+            "fanout_blacklist": {
+                "count": len(self.fanout_blacklist),
+                "examples": list(self.fanout_blacklist.keys())[:3],
+            },
+            "search_settings": {
+                "branch_factor": self.generation_config.branch_factor,
+                "beam_width": self.generation_config.beam_width,
+                "max_generations": self.generation_config.max_generations,
+                "max_steps_per_branch": self.generation_config.max_steps_per_branch,
+                "max_steps_without_improvement": self.generation_config.max_steps_without_improvement,
+            },
             "available_strategies": {
                 "PBLOCK": {},
                 "FANOUT": {"top_n_nets": "int (1-10)"},
@@ -1629,7 +1702,9 @@ hayt        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
                 previous_wns = previous_metrics["wns"]
 
                 try:
+                    step_start_time = time.time()
                     result_report, current_wns = await self._execute_strategy(strategy, args)
+                    step_elapsed_time = time.time() - step_start_time
                 except Exception as exc:
                     logger.exception("Error during linear iteration %s", index + 1)
                     self.history.append(
@@ -1651,33 +1726,14 @@ hayt        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
                         break
                     continue
 
-            try:
-                step_start_time = time.time()
-                result_report, current_wns = await self._execute_strategy(strategy, args)
-                step_elapsed_time = time.time() - step_start_time
-            except Exception as exc:
-                logger.exception("Error during linear iteration %s", index + 1)
-                self.history.append(
-                    {
-                        "iteration": index + 1,
-                        "strategy": strategy,
-                        "args": args,
-                        "wns": None,
-                        "error": str(exc),
-                        "stagnation_count": stagnation,
-                    }
+                current_metrics = await self._measure_current_metrics(result_report)
+                delta = current_wns - previous_wns if (current_wns is not None and previous_wns is not None) else None
+                delta_vs_best = (
+                    current_wns - best_metrics["wns"]
+                    if current_wns is not None and best_metrics.get("wns") is not None
+                    else None
                 )
-                print(f"Iteration failed: {exc}")
-                used_action_signatures.add(self._action_signature(strategy, args))
-                stagnation += 1
-
-                if stagnation >= self.generation_config.max_steps_without_improvement:
-                    print("No improvement. Stopping.")
-                    break
-                continue
-
-            current_metrics = await self._measure_current_metrics(result_report)
-            delta = current_wns - previous_wns if (current_wns is not None and previous_wns is not None) else None
+                roi_accepted = self._is_step_roi_acceptable(delta_vs_best, step_elapsed_time)
                 self.history.append(
                     {
                         "iteration": index + 1,
@@ -1687,6 +1743,9 @@ hayt        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
                         "tns": current_metrics.get("tns"),
                         "failing_endpoints": current_metrics.get("failing_endpoints"),
                         "delta_wns": delta,
+                        "delta_vs_best": delta_vs_best,
+                        "elapsed_seconds": step_elapsed_time,
+                        "roi_accepted": roi_accepted,
                         "previous_wns": previous_wns,
                         "delta_tns": (
                             current_metrics.get("tns") - previous_metrics["tns"]
@@ -1704,88 +1763,32 @@ hayt        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
                 )
 
                 print(f"WNS: {self._format_wns(current_wns)}")
+                print(f"Step cost: {self._format_step_roi(delta_vs_best, step_elapsed_time)}")
                 used_action_signatures.add(self._action_signature(strategy, args))
 
                 if self._is_metrics_improvement(current_metrics, best_metrics):
                     best_wns = current_wns
                     best_metrics = current_metrics
-                    stagnation = 0
-                    used_action_signatures.clear()
                     best_dcp_path = await self._save_best_checkpoint(
                         Path(self.temp_dir) / f"best_iter_{index + 1:03d}.dcp"
                     )
                     last_best_iteration = index + 1
+                    used_action_signatures.clear()
+                    if roi_accepted:
+                        stagnation = 0
+                    else:
+                        stagnation += 1
+                        print("Improvement saved, but below configured WNS/runtime ROI; patience was not reset.")
                 else:
                     stagnation += 1
 
                 if best_wns is not None and best_wns >= 0:
                     print("Timing met.")
                     break
+
                 if stagnation >= self.generation_config.max_steps_without_improvement:
                     print("No improvement. Stopping.")
                     break
-                continue
-
-            current_metrics = await self._measure_current_metrics(result_report)
-            delta = current_wns - previous_wns if (current_wns is not None and previous_wns is not None) else None
-            delta_vs_best = (
-                current_wns - best_metrics["wns"]
-                if current_wns is not None and best_metrics.get("wns") is not None
-                else None
-            )
-            roi_accepted = self._is_step_roi_acceptable(delta_vs_best, step_elapsed_time)
-            self.history.append(
-                {
-                    "iteration": index + 1,
-                    "strategy": strategy,
-                    "args": args,
-                    "wns": current_wns,
-                    "tns": current_metrics.get("tns"),
-                    "failing_endpoints": current_metrics.get("failing_endpoints"),
-                    "delta_wns": delta,
-                    "delta_vs_best": delta_vs_best,
-                    "elapsed_seconds": step_elapsed_time,
-                    "roi_accepted": roi_accepted,
-                    "previous_wns": previous_wns,
-                    "delta_tns": (
-                        current_metrics.get("tns") - previous_metrics["tns"]
-                        if current_metrics.get("tns") is not None and previous_metrics["tns"] is not None
-                        else None
-                    ),
-                    "delta_failing_endpoints": (
-                        current_metrics.get("failing_endpoints") - previous_metrics["failing_endpoints"]
-                        if current_metrics.get("failing_endpoints") is not None
-                        and previous_metrics["failing_endpoints"] is not None
-                        else None
-                    ),
-                    "stagnation_count": stagnation,
-                }
-            )
-
-            print(f"WNS: {self._format_wns(current_wns)}")
-            print(f"Step cost: {self._format_step_roi(delta_vs_best, step_elapsed_time)}")
-
-            if self._is_metrics_improvement(current_metrics, best_metrics):
-                best_wns = current_wns
-                best_metrics = current_metrics
-                best_dcp_path = await self._save_best_checkpoint(
-                    Path(self.temp_dir) / f"best_iter_{index + 1:03d}.dcp"
-                )
-                last_best_iteration = index + 1
-                if roi_accepted:
-                    stagnation = 0
-                else:
-                    stagnation += 1
-                    print("Improvement saved, but below configured WNS/runtime ROI; patience was not reset.")
-            else:
-                stagnation += 1
-
-            if best_wns is not None and best_wns >= 0:
-                print("Timing met.")
-                break
-
-            if stagnation >= self.generation_config.max_steps_without_improvement:
-                print("No improvement. Stopping.")
             except WallClockLimitReached as exc:
                 print(f"{exc} Stopping search and keeping the best checkpoint saved so far.")
                 hit_wall_clock_limit = True
@@ -1859,10 +1862,6 @@ hayt        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
                 if self.llm_call_count >= cfg.max_llm_calls:
                     print(f"[SEARCH] Reached max LLM calls ({cfg.max_llm_calls}); stopping search.")
                     break
-
-                print(f"\n{'=' * 70}")
-                print(f"GENERATION {generation}/{cfg.max_generations}")
-                print(f"{'=' * 70}")
 
                 branch_results: list[SearchCandidate] = []
                 tried_summaries = "\n".join(
