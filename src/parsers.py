@@ -7,6 +7,49 @@ from typing import Any
 from src.prompting import load_system_prompt
 
 
+def parse_critical_route_net_report(timing_report: str) -> list[dict]:
+	"""Aggregate net-delay evidence from Vivado's text timing-path report."""
+	aggregate = {}
+	for path_section in re.split(r"Slack \(", timing_report)[1:]:
+		seen_on_path = set()
+		for line in path_section.splitlines():
+			stripped = line.strip()
+			if not (stripped.startswith("net (") or stripped.startswith("net(")):
+				continue
+			fields = stripped.split()
+			if len(fields) < 3:
+				continue
+			net_name = fields[-1]
+			numeric_tokens = []
+			for token in fields[1:-1]:
+				try:
+					numeric_tokens.append(float(token))
+				except ValueError:
+					continue
+			if not numeric_tokens:
+				continue
+			net_delay_ns = numeric_tokens[0]
+			item = aggregate.setdefault(
+				net_name,
+				{
+					"net_name": net_name,
+					"critical_path_count": 0,
+					"net_delay_ns": net_delay_ns,
+					"is_route_fixed": False,
+					"is_clock": False,
+				},
+			)
+			item["net_delay_ns"] = max(item["net_delay_ns"], net_delay_ns)
+			if net_name not in seen_on_path:
+				item["critical_path_count"] += 1
+				seen_on_path.add(net_name)
+	return sorted(
+		aggregate.values(),
+		key=lambda item: (item["net_delay_ns"], item["critical_path_count"]),
+		reverse=True,
+	)
+
+
 def parse_target_clock_report(report: str) -> tuple[str | None, float | None]:
 	"""Parse the explicit clock marker and period returned by Vivado Tcl."""
 	clock_name = None

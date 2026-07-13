@@ -8,6 +8,55 @@ from src.analysis import DesignSignature
 from src.scoring import ValidationStatus
 
 
+MAX_ROUTE_PRESERVE_NETS = 8
+
+
+def validate_route_net_set(
+    net_names: Iterable[str],
+    hard_limit: int = MAX_ROUTE_PRESERVE_NETS,
+) -> tuple[str, ...]:
+    """Validate the bounded net set accepted by the preserved-reroute tool."""
+    names = tuple(dict.fromkeys(str(name) for name in net_names if str(name)))
+    if len(names) > hard_limit:
+        raise ValueError(f"Preserved reroute accepts at most {hard_limit} nets")
+    if any(any(character in name for character in "{};\r\n") for name in names):
+        raise ValueError("Route net names contain unsupported Tcl characters")
+    return names
+
+
+def select_route_preserve_nets(
+    candidates: Iterable[dict],
+    *,
+    max_nets: int = 4,
+    min_net_delay_ns: float = 0.2,
+) -> tuple[str, ...]:
+    """Select unlocked target-clock nets with delay or congestion evidence."""
+    if max_nets < 1 or max_nets > MAX_ROUTE_PRESERVE_NETS:
+        raise ValueError(f"max_nets must be between 1 and {MAX_ROUTE_PRESERVE_NETS}")
+    eligible = [
+        dict(candidate)
+        for candidate in candidates
+        if candidate.get("net_name")
+        and int(candidate.get("critical_path_count", 0)) > 0
+        and not bool(candidate.get("is_route_fixed"))
+        and not bool(candidate.get("is_clock"))
+        and (
+            float(candidate.get("net_delay_ns", 0.0)) >= min_net_delay_ns
+            or bool(candidate.get("congestion_evidence"))
+        )
+    ]
+    eligible.sort(
+        key=lambda candidate: (
+            float(candidate.get("net_delay_ns", 0.0)),
+            int(candidate.get("critical_path_count", 0)),
+        ),
+        reverse=True,
+    )
+    return validate_route_net_set(
+        [candidate["net_name"] for candidate in eligible[:max_nets]]
+    )
+
+
 def rank_fanout_candidates(
     candidates: Iterable[dict],
     blacklist: Iterable[str] = (),
@@ -170,6 +219,33 @@ def gate_actions(
             reason="low-risk physical optimization remains the deterministic fallback",
         )
     ]
+
+    if (
+        signature.wns_ns is not None
+        and signature.wns_ns < 0
+        and budget.remaining_runtime_seconds >= budget.validation_reserve_seconds + 120
+    ):
+        actions.append(
+            EligibleAction(
+                strategy="CRITICAL_PIN",
+                reason="the target clock has negative-slack paths eligible for bounded pin swapping",
+            )
+        )
+
+    if (
+        signature.wns_ns is not None
+        and signature.wns_ns < 0
+        and signature.congestion
+        and bool(signature.congestion.get("severe"))
+        and budget.remaining_runtime_seconds >= budget.validation_reserve_seconds + 240
+    ):
+        actions.append(
+            EligibleAction(
+                strategy="ROUTE_PRESERVE",
+                default_args={"max_nets": 4, "min_net_delay_ns": 0.2},
+                reason="target-clock violations coincide with severe routing congestion",
+            )
+        )
 
     if signature.high_fanout_candidates:
         actions.append(

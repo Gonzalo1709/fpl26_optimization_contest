@@ -121,7 +121,7 @@ class RecipePolicyTests(unittest.TestCase):
 
         self.assertEqual(
             set(decision_input["available_strategies"]),
-            {"PHYS_OPT", "CELL_RELOCATE"},
+            {"PHYS_OPT", "CRITICAL_PIN", "CELL_RELOCATE"},
         )
         self.assertEqual(strategy, "PHYS_OPT")
         self.assertEqual(args, {"directive": "RuntimeOptimized"})

@@ -17,7 +17,13 @@ from openai import OpenAI
 from src.analysis import DesignSignature, require_target_clock_wns
 from src.base import DCPOptimizerBase
 from src.parsers import parse_spread_analysis, parse_timing_summary_static, spread_recommends_pblock
-from src.policy import BudgetState, EligibleAction, gate_actions, rank_fanout_candidates
+from src.policy import (
+    BudgetState,
+    EligibleAction,
+    gate_actions,
+    rank_fanout_candidates,
+    select_route_preserve_nets,
+)
 from src.prompting import DEFAULT_SYSTEM_PROMPT_PATH, build_planner_system_prompt, prompt_sha256
 from src.scoring import ContestScoreInput, ValidationStatus, calculate_contest_score
 from src.search import GenerationSearchConfig, SearchCandidate
@@ -780,6 +786,25 @@ class DCPOptimizer(DCPOptimizerBase):
                 directive = "RuntimeOptimized"
             return strategy, {"directive": directive}
 
+        if strategy == "CRITICAL_PIN":
+            return strategy, {}
+
+        if strategy == "ROUTE_PRESERVE":
+            try:
+                max_nets = int(args.get("max_nets", 4))
+            except (TypeError, ValueError):
+                max_nets = 4
+            max_nets = max(1, min(8, max_nets))
+            try:
+                min_net_delay_ns = float(args.get("min_net_delay_ns", 0.2))
+            except (TypeError, ValueError):
+                min_net_delay_ns = 0.2
+            min_net_delay_ns = max(0.05, min(2.0, min_net_delay_ns))
+            return strategy, {
+                "max_nets": max_nets,
+                "min_net_delay_ns": min_net_delay_ns,
+            }
+
         if strategy == "HARD_BLOCK":
             hard_block_types = args.get("hard_block_types") or ["DSP", "BRAM", "URAM"]
             if isinstance(hard_block_types, str):
@@ -1365,6 +1390,59 @@ class DCPOptimizer(DCPOptimizerBase):
         await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
         return baseline_report
 
+    async def run_critical_pin_flow(self) -> str:
+        """Run only Vivado's target-timing critical pin-swapping optimization."""
+        return await self.run_phys_opt_flow(directive="CriticalPin")
+
+    async def run_route_preserve_flow(
+        self,
+        max_nets: int = 4,
+        min_net_delay_ns: float = 0.2,
+    ) -> str:
+        """Reroute a bounded critical-net set, then preserve it while routing."""
+        baseline_checkpoint = Path(self.temp_dir) / "route_preserve_baseline.dcp"
+        await self.v(
+            "write_checkpoint",
+            {"dcp_path": str(baseline_checkpoint.resolve()), "force": True},
+        )
+        baseline_report = await self.v("report_timing_summary")
+        baseline_metrics = await self._measure_current_metrics(baseline_report)
+
+        evidence_report = await self.v(
+            "extract_critical_route_nets",
+            {"num_paths": 20, "max_nets": 8},
+        )
+        try:
+            evidence = json.loads(evidence_report)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Could not parse critical route-net evidence") from exc
+        if isinstance(evidence, dict) and evidence.get("error"):
+            raise RuntimeError(evidence["error"])
+        if not isinstance(evidence, list):
+            raise RuntimeError("Critical route-net evidence was not a list")
+
+        net_names = select_route_preserve_nets(
+            evidence,
+            max_nets=max_nets,
+            min_net_delay_ns=min_net_delay_ns,
+        )
+        if not net_names:
+            logger.info("No unlocked target-clock nets met the preserved-reroute evidence gate.")
+            return baseline_report
+
+        await self.v(
+            "route_design",
+            {"nets": list(net_names), "auto_delay": True},
+        )
+        await self.v("route_design", {"preserve": True})
+        report = await self.v("report_timing_summary")
+        current_metrics = await self._measure_current_metrics(report)
+        if self._is_metrics_improvement(current_metrics, baseline_metrics):
+            return report
+
+        await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
+        return baseline_report
+
     async def run_hard_block_flow(
         self,
         hard_block_types: Optional[list[str]] = None,
@@ -1525,6 +1603,10 @@ class DCPOptimizer(DCPOptimizerBase):
             result = await self.run_cell_relocation_flow(**args)
         elif strategy == "HARD_BLOCK":
             result = await self.run_hard_block_flow(**args)
+        elif strategy == "CRITICAL_PIN":
+            result = await self.run_critical_pin_flow()
+        elif strategy == "ROUTE_PRESERVE":
+            result = await self.run_route_preserve_flow(**args)
         else:
             result = await self.run_phys_opt_flow(**args)
 
@@ -1552,6 +1634,11 @@ class DCPOptimizer(DCPOptimizerBase):
             },
             "PHYS_OPT": {"directive": ["RuntimeOptimized"]},
             "HARD_BLOCK": {"hard_block_types": ["DSP", "BRAM", "URAM"]},
+            "CRITICAL_PIN": {},
+            "ROUTE_PRESERVE": {
+                "max_nets": "int (1-8)",
+                "min_net_delay_ns": "float (0.05-2.0)",
+            },
             "NO_OP": {},
         }
         available_strategies = {}

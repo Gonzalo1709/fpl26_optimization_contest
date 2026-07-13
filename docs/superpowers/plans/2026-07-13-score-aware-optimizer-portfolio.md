@@ -153,11 +153,11 @@
 
 **Produces:** a first-wave critical-pin phys-opt action and a small-set critical-net reroute action, both measured through the existing Vivado MCP interface.
 
-- [ ] Add tests that reject locked-pin candidates and reroute sets above a small configured limit.
-- [ ] Expose only the required Vivado Tcl arguments for `phys_opt_design -critical_pin_opt` and `route_design -nets ... -auto_delay/-preserve`; do not add arbitrary Tcl access to the planner.
-- [ ] Add action gates from target-clock path membership and net-delay/congestion evidence.
-- [ ] Run remote A/B experiments on at least VexRiscv, LogicNets, and one Rosetta benchmark.
-- [ ] Commit: `feat: add critical-pin and preserved-reroute actions`.
+- [x] Add tests that reject locked-pin candidates and reroute sets above a small configured limit.
+- [x] Expose only the required Vivado Tcl arguments for `phys_opt_design -critical_pin_opt` and `route_design -nets ... -auto_delay/-preserve`; do not add arbitrary Tcl access to the planner.
+- [x] Add action gates from target-clock path membership and net-delay/congestion evidence.
+- [x] Run remote A/B experiments on at least VexRiscv, LogicNets, and one Rosetta benchmark.
+- [x] Commit: `feat: add critical-pin and preserved-reroute actions`.
 
 ### Task 9: Gate specialist transforms instead of broadening defaults
 

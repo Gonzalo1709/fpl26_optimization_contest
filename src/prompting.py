@@ -34,6 +34,8 @@ Rules for the controller interface:
 - PBLOCK args: {}
 - CELL_RELOCATE args: {"num_paths": int from 3 to 20, "detour_threshold": float from 1.2 to 4.0, "max_cells": int from 1 to 5, "max_move_distance": int from 5 to 80 tiles}
 - HARD_BLOCK args: {"hard_block_types": subset of the provided eligible resource types}
+- CRITICAL_PIN args: {}
+- ROUTE_PRESERVE args: {"max_nets": int from 1 to 8, "min_net_delay_ns": float from 0.05 to 2.0}
 - NO_OP args: {}
 - Return ONLY JSON.
 """.strip()
