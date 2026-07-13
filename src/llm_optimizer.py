@@ -16,6 +16,7 @@ from openai import OpenAI
 from src.base import DCPOptimizerBase
 from src.parsers import parse_timing_summary_static
 from src.prompting import DEFAULT_SYSTEM_PROMPT_PATH, build_planner_system_prompt, prompt_sha256
+from src.scoring import ContestScoreInput, ValidationStatus, calculate_contest_score
 from src.search import GenerationSearchConfig, SearchCandidate
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ class DCPOptimizer(DCPOptimizerBase):
 
         self.history: list[dict] = []
         self.fanout_blacklist: dict[str, str] = {}
+        self.validation_status = ValidationStatus()
 
     def _extract_llm_text(self, response) -> str:
         """Best-effort extraction of text content from a chat completion response."""
@@ -2189,6 +2191,24 @@ class DCPOptimizer(DCPOptimizerBase):
         initial_fmax = self.calculate_fmax(self.initial_wns, self.clock_period)
         best_fmax = self.calculate_fmax(self.best_wns, self.clock_period) if self.best_wns > float("-inf") else None
         fmax_improvement = (best_fmax - initial_fmax) if (initial_fmax is not None and best_fmax is not None) else None
+        contest_score = None
+        if fmax_improvement is not None and total_runtime is not None:
+            contest_score = calculate_contest_score(
+                ContestScoreInput(
+                    delta_fmax_mhz=fmax_improvement,
+                    llm_cost_usd=self.total_cost,
+                    runtime_seconds=total_runtime,
+                    validation=self.validation_status,
+                )
+            )
+
+        validation_summary = asdict(self.validation_status)
+        validation_summary.update(
+            {
+                "complete": self.validation_status.complete,
+                "passed": self.validation_status.passed,
+            }
+        )
 
         report = {
             "model": self.model,
@@ -2227,6 +2247,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 "total_reasoning_tokens": total_reasoning,
                 "total_cost": self.total_cost,
                 "total_llm_cost": self.total_cost,
+                "target_clock": self.target_clock,
                 "clock_period_ns": self.clock_period,
                 "initial_wns": self.initial_wns,
                 "best_wns": self.best_wns,
@@ -2236,6 +2257,11 @@ class DCPOptimizer(DCPOptimizerBase):
                 "final_fmax_mhz": best_fmax,
                 "fmax_improvement_mhz": fmax_improvement,
                 "delta_fmax_mhz": fmax_improvement,
+                "score_runtime_hours": contest_score.runtime_hours if contest_score else None,
+                "score_penalty_multiplier": contest_score.penalty_multiplier if contest_score else None,
+                "projected_contest_score": contest_score.projected_score if contest_score else None,
+                "validated_contest_score": contest_score.validated_score if contest_score else None,
+                "validation": validation_summary,
                 "total_tool_calls": len(self.tool_call_details),
                 "total_tool_time_seconds": total_tool_time,
                 "tool_call_counts": tool_counts,
