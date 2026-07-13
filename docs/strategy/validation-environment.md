@@ -40,6 +40,46 @@ The subprocess also receives:
 - `RAPIDWRIGHT_PATH=<repo>/RapidWright`
 - `CLASSPATH=<repo>/RapidWright/bin:<repo>/RapidWright/jars/*` on Linux
 
+## SCP transfer workflow
+
+SCP is the expected transport between the workstation and the disposable
+contest instance. Do not deploy from a dirty working tree and do not put DCPs,
+logs, reports, credentials, or instance keys in Git.
+
+From PowerShell, package the exact committed branch as a Git bundle and send it
+to the instance with SCP:
+
+```powershell
+git bundle create C:\tmp\fpl26-beta.bundle HEAD
+$scp = Join-Path $env:SystemRoot 'System32\OpenSSH\scp.exe'
+& $scp -i .\fpl26contest-key.pem C:\tmp\fpl26-beta.bundle ubuntu@<instance-ip>:/home/ubuntu/
+& $scp -i .\fpl26contest-key.pem .\.env ubuntu@<instance-ip>:/home/ubuntu/fpl26.env
+```
+
+On the instance, clone the bundle, initialize the pinned submodule, and protect
+the separately transferred environment file:
+
+```bash
+git clone /home/ubuntu/fpl26-beta.bundle /home/ubuntu/fpl26_full
+cd /home/ubuntu/fpl26_full
+git submodule update --init RapidWright
+mv /home/ubuntu/fpl26.env .env
+chmod 600 .env
+```
+
+Retrieve generated evidence with SCP into a non-repository workstation
+directory. For example:
+
+```powershell
+& $scp -i .\fpl26contest-key.pem ubuntu@<instance-ip>:/home/ubuntu/fpl26_full/<run>/token_usage.json C:\tmp\
+& $scp -i .\fpl26contest-key.pem ubuntu@<instance-ip>:/home/ubuntu/fpl26_full/<run>/validation_report.json C:\tmp\
+```
+
+The same transfer direction can be expressed through the contest client's
+`scp` command. The beta sprint used OpenSSH SCP directly with the private key
+issued by `fpl26contest start`; SSH was used only to execute commands after the
+files had been sent.
+
 ## Contest-instance command
 
 ```bash

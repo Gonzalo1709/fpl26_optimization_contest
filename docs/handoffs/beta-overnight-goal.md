@@ -43,19 +43,19 @@ Prompt optimization is not a priority: the current production prompt beat both G
 
 | Field | Result |
 | --- | --- |
-| Final branch / commit | `feat/score-aware-optimizer-portfolio` / `f7101eb` (`feat: explain optimizer score status`) |
-| Instance status / remaining budget | Running instance `i-0058deec95f879b31` at `100.31.235.29`; 20.74 h remained after 11.06 session hours at the latest API check |
+| Final branch / commit | `feat/score-aware-optimizer-portfolio` / `9a2ba92` (`fix: apply extended timeout to elaboration`) |
+| Instance status / remaining budget | Fresh instance `i-00322722584e0ce88` at `54.90.157.179`; launched with 20.66 h remaining |
 | Public benchmarks completed | 3/12 characterized before this sprint |
-| Newly validated positive benchmarks | pending |
-| Best validated aggregate public score | 111.216 before this sprint |
+| Newly validated positive benchmarks | `boom_soc`: PBLOCK, +5.755825 MHz, validated score 5.460046 |
+| Best validated aggregate public score | 116.676046 |
 | Promoted policy/search changes | Score-status reporting added without changing score calculation or candidate promotion |
 | Rejected experiments and evidence | pending |
-| Unit test result | 53/53 passed with `.venv/Scripts/python.exe`; score-status targeted tests also pass after TDD implementation |
+| Unit test result | 57/57 passed locally; remote validator timeout target passed after SCP deployment |
 | Beta archive path / SHA256 / size | Final archive pending. `upload270426.zip` is explicitly rejected: wrong root layout and contains `.git`, DCPs, and an SSH private key |
 | Clean `make setup` result | pending |
 | Clean default non-test optimizer result | pending |
-| Remaining blocker | Authorized SSH access must be recovered, or the running disposable VM must be explicitly approved for termination/relaunch; the duplicate-start HTTP 409 body overwrote the local ephemeral contest key |
-| Exact next command | After access recovery, run the nine-design Task 2 production loop exactly as written in the beta sprint plan |
+| Remaining blocker | None; SSH, setup, remote tests, and same-DCP validation are working |
+| Exact next command | Continue Task 2 with `corescore_500_mod_2025.1.dcp`, then validate any positive incumbent before advancing |
 
 ## Safety and Recovery
 
@@ -65,3 +65,5 @@ Prompt optimization is not a priority: the current production prompt beat both G
 - `make validate` should discover Vivado's bundled JRE. If Java/RapidWright fails and bundled Java is unavailable, use the documented disposable-instance fallback `sudo apt install default-jre` and record that it was required.
 - A regressed candidate must be rolled back. A regressed code experiment must be reverted or left unpromoted rather than stacked with more speculation.
 - Never upload `upload270426.zip`; the read-only preflight in `docs/experiments/2026-07-13-beta-submission-rehearsal.md` proves it contains forbidden artifacts.
+- Use SCP for workstation/instance deployment and artifact retrieval. Transfer a Git bundle rather than the dirty working tree; transfer `.env` separately; copy DCPs, logs, and token reports back outside Git.
+- Follow the exact, secret-free SCP command sequence in `docs/strategy/validation-environment.md`; SSH is for remote execution, not for synthesizing file contents on the VM.
