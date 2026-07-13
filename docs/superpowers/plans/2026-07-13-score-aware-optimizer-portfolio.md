@@ -187,11 +187,11 @@
 
 **Produces:** reproducible offline DSPy/GEPA evaluation, prompt provenance, and a morning-ready handoff.
 
-- [ ] Add real decision examples from rejected PBLOCK and accepted/rejected recipe runs, without secrets or raw DCP contents.
-- [ ] Run `python3 prompt_optimizer.py evaluate`, `gepa-lite`, and, after installing optional dependencies, `dspy-gepa`; capture prompt hash, examples hash, model, and offline score.
-- [ ] Promote only candidate prompts that outperform the baseline offline and do not regress a fixed remote benchmark subset under identical budget/search controls.
-- [ ] Update the handoff goal with committed SHA, branch, commands, scorecard table, failures, artifact locations, remaining instance budget, and next recommended ticket.
-- [ ] Commit: `feat: add offline planner prompt optimization` and `docs: add optimizer portfolio handoff`.
+- [x] Add real decision examples from rejected PBLOCK and accepted/rejected recipe runs, without secrets or raw DCP contents.
+- [x] Run `python3 prompt_optimizer.py evaluate`, `gepa-lite`, and, after installing optional dependencies, `dspy-gepa`; capture prompt hash, examples hash, model, and offline score.
+- [x] Promote only candidate prompts that outperform the baseline offline and do not regress a fixed remote benchmark subset under identical budget/search controls. Neither generated prompt passed the real promotion gate, so production stayed on the shorter prompt.
+- [x] Update the handoff goal with committed SHA, branch, commands, scorecard table, failures, artifact locations, remaining instance budget, and next recommended ticket.
+- [x] Commit: `feat: add offline planner prompt optimization` and `docs: add optimizer portfolio handoff`.
 
 ## Plan Self-Review
 

@@ -54,6 +54,22 @@ make validate \
 Use the same DCP for `GOLDEN` and `REVISED` as an environment smoke test. A
 real optimized result must be checked against its original benchmark DCP.
 
+## Final Vivado legality check
+
+After equivalence validation, run the repository legality script on the exact
+candidate DCP:
+
+```bash
+vivado -mode batch -notrace \
+  -log legality.log -journal legality.jou \
+  -source scripts/check_dcp_legality.tcl \
+  -tclargs revised.dcp
+```
+
+The script checks non-virtual primitive placement, complete route status,
+error-severity DRCs, worst hold slack, and pulse-width violators. VCC/GND
+pseudo-cells are excluded from the placement count; they do not require LOCs.
+
 Direct invocation is also supported after setting `VIVADO_EXEC` or making
 Vivado discoverable on `PATH`:
 
