@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import time
@@ -16,6 +17,7 @@ from openai import OpenAI
 from src.analysis import DesignSignature, require_target_clock_wns
 from src.base import DCPOptimizerBase
 from src.parsers import parse_spread_analysis, parse_timing_summary_static, spread_recommends_pblock
+from src.policy import BudgetState, EligibleAction, gate_actions
 from src.prompting import DEFAULT_SYSTEM_PROMPT_PATH, build_planner_system_prompt, prompt_sha256
 from src.scoring import ContestScoreInput, ValidationStatus, calculate_contest_score
 from src.search import GenerationSearchConfig, SearchCandidate
@@ -721,10 +723,12 @@ class DCPOptimizer(DCPOptimizerBase):
         )
         return {"strategy": "PHYS_OPT", "args": {"directive": "Default"}}
 
-    def sanitize_action(self, action: dict) -> tuple[str, dict]:
-        """Validate strategy output from the LLM."""
+    def _sanitize_action_shape(self, action: dict) -> tuple[str, dict]:
+        """Normalize the shape and bounded arguments of one proposed action."""
         strategy = action.get("strategy", "PHYS_OPT")
         args = action.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
 
         if strategy == "FANOUT":
             top_n = int(args.get("top_n_nets", 5))
@@ -764,12 +768,86 @@ class DCPOptimizer(DCPOptimizerBase):
 
         if strategy == "HARD_BLOCK":
             hard_block_types = args.get("hard_block_types") or ["DSP", "BRAM", "URAM"]
+            if isinstance(hard_block_types, str):
+                hard_block_types = [hard_block_types]
             return strategy, {"hard_block_types": [str(item) for item in hard_block_types]}
 
         if strategy == "PBLOCK":
             return strategy, {}
 
+        if strategy == "NO_OP":
+            return strategy, {}
+
         return "PHYS_OPT", {"directive": "Default"}
+
+    def _current_budget_state(self) -> BudgetState:
+        """Translate configured run limits into the recipe policy budget model."""
+        remaining_runtime = math.inf
+        if self.start_time is not None:
+            elapsed_seconds = time.time() - self.start_time
+            configured_limits = []
+            if self.generation_config.max_runtime_minutes is not None:
+                configured_limits.append(self.generation_config.max_runtime_minutes * 60.0)
+            if self.generation_config.wall_clock_limit_seconds > 0:
+                configured_limits.append(self.generation_config.wall_clock_limit_seconds)
+            if configured_limits:
+                remaining_runtime = min(configured_limits) - elapsed_seconds
+
+        remaining_cost = math.inf
+        if self.generation_config.max_cost is not None:
+            remaining_cost = self.generation_config.max_cost - self.total_cost
+
+        return BudgetState(
+            remaining_runtime_seconds=remaining_runtime,
+            remaining_cost_usd=remaining_cost,
+        )
+
+    def _eligible_actions(self) -> tuple[EligibleAction, ...]:
+        """Return the single authoritative allow-list for the current state."""
+        if self.design_signature is None:
+            return (
+                EligibleAction(
+                    strategy="PHYS_OPT",
+                    default_args={"directive": "Default"},
+                    reason="design signature is unavailable; use the conservative fallback",
+                ),
+            )
+        actions = gate_actions(
+            self.design_signature,
+            budget=self._current_budget_state(),
+            history=self.history,
+        )
+        if self.fanout_blacklist:
+            available_fanout_names = {
+                candidate.net_name
+                for candidate in self.design_signature.high_fanout_candidates
+                if candidate.net_name not in self.fanout_blacklist
+            }
+            if not available_fanout_names:
+                actions = tuple(action for action in actions if action.strategy != "FANOUT")
+        return actions
+
+    def sanitize_action(self, action: dict) -> tuple[str, dict]:
+        """Normalize a proposed action and enforce deterministic eligibility gates."""
+        strategy, args = self._sanitize_action_shape(action)
+        eligible = {item.strategy: item for item in self._eligible_actions()}
+        if strategy not in eligible:
+            fallback = next(iter(eligible.values()))
+            logger.info(
+                "Rejected ineligible strategy %s; using %s (%s)",
+                strategy,
+                fallback.strategy,
+                fallback.reason,
+            )
+            return self._sanitize_action_shape(
+                {"strategy": fallback.strategy, "args": fallback.default_args}
+            )
+
+        if strategy == "HARD_BLOCK":
+            allowed_types = set(eligible[strategy].default_args.get("hard_block_types", []))
+            requested_types = [item for item in args["hard_block_types"] if item in allowed_types]
+            args["hard_block_types"] = requested_types or sorted(allowed_types)
+        return strategy, args
 
     def _canonicalize_action_args(self, strategy: str, args: dict) -> dict:
         """Normalize strategy args so equivalent choices map to one signature."""
@@ -786,26 +864,18 @@ class DCPOptimizer(DCPOptimizerBase):
 
     def _fallback_action_candidates(self, preferred_strategy: str, preferred_args: dict) -> list[tuple[str, dict]]:
         """Return a small ordered list of alternative actions to avoid branch-local repeats."""
-        candidates = [
-            (preferred_strategy, preferred_args),
-            ("HARD_BLOCK", {"hard_block_types": ["DSP", "BRAM", "URAM"]}),
-        ]
-        if self._fanout_candidates_available():
-            candidates.extend(
-                [
-                    ("FANOUT", {"top_n_nets": 3}),
-                    ("FANOUT", {"top_n_nets": 5}),
-                ]
-            )
-        candidates.extend(
-            [
-                ("CELL_RELOCATE", {"num_paths": 10, "detour_threshold": 2.0, "max_cells": 3}),
-                ("PBLOCK", {}),
-                ("PHYS_OPT", {"directive": "Default"}),
-                ("PHYS_OPT", {"directive": "Explore"}),
-                ("PHYS_OPT", {"directive": "AggressiveExplore"}),
-            ]
-        )
+        candidates = [(preferred_strategy, preferred_args)]
+        for eligible in self._eligible_actions():
+            candidates.append((eligible.strategy, eligible.default_args))
+            if eligible.strategy == "FANOUT":
+                candidates.extend([("FANOUT", {"top_n_nets": 3}), ("FANOUT", {"top_n_nets": 5})])
+            elif eligible.strategy == "PHYS_OPT":
+                candidates.extend(
+                    [
+                        ("PHYS_OPT", {"directive": "Explore"}),
+                        ("PHYS_OPT", {"directive": "AggressiveExplore"}),
+                    ]
+                )
 
         seen: set[str] = set()
         ordered: list[tuple[str, dict]] = []
@@ -1399,7 +1469,9 @@ class DCPOptimizer(DCPOptimizerBase):
 
     async def _execute_strategy(self, strategy: str, args: dict) -> tuple[str, Optional[float]]:
         """Run a chosen recipe and return the timing report plus measured WNS."""
-        if strategy == "PBLOCK":
+        if strategy == "NO_OP":
+            result = await self.v("report_timing_summary")
+        elif strategy == "PBLOCK":
             result = await self.run_pblock_flow()
         elif strategy == "FANOUT":
             result = await self.run_fanout_flow(**args)
@@ -1422,8 +1494,28 @@ class DCPOptimizer(DCPOptimizerBase):
         tried_summaries: str = "",
     ) -> dict:
         """Assemble the planner input for one recipe-selection decision."""
+        eligible_actions = self._eligible_actions()
+        schemas = {
+            "PBLOCK": {},
+            "FANOUT": {"top_n_nets": "int (1-10)"},
+            "CELL_RELOCATE": {
+                "num_paths": "int (3-20)",
+                "detour_threshold": "float (1.2-4.0)",
+                "max_cells": "int (1-5)",
+            },
+            "PHYS_OPT": {"directive": ["Explore", "AggressiveExplore", "Default"]},
+            "HARD_BLOCK": {"hard_block_types": ["DSP", "BRAM", "URAM"]},
+            "NO_OP": {},
+        }
+        available_strategies = {}
+        for action in eligible_actions:
+            schema = dict(schemas[action.strategy])
+            if action.strategy == "HARD_BLOCK":
+                schema["hard_block_types"] = action.default_args["hard_block_types"]
+            available_strategies[action.strategy] = schema
         return {
             "analysis": self._compact_analysis_summary(analysis_summary),
+            "design_signature": self.design_signature.to_dict() if self.design_signature else None,
             "history": self._compact_history(recent_history),
             "best_wns": self.best_wns,
             "stagnation": stagnation,
@@ -1440,16 +1532,9 @@ class DCPOptimizer(DCPOptimizerBase):
                 "max_steps_per_branch": self.generation_config.max_steps_per_branch,
                 "max_steps_without_improvement": self.generation_config.max_steps_without_improvement,
             },
-            "available_strategies": {
-                "PBLOCK": {},
-                "FANOUT": {"top_n_nets": "int (1-10)"},
-                "CELL_RELOCATE": {
-                    "num_paths": "int (3-20)",
-                    "detour_threshold": "float (1.2-4.0)",
-                    "max_cells": "int (1-5)",
-                },
-                "PHYS_OPT": {"directive": ["Explore", "AggressiveExplore", "Default"]},
-                "HARD_BLOCK": {"hard_block_types": ["DSP", "BRAM", "URAM"]},
+            "available_strategies": available_strategies,
+            "eligibility_reasons": {
+                action.strategy: action.reason for action in eligible_actions
             },
         }
 

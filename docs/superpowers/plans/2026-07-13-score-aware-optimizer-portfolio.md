@@ -37,11 +37,11 @@
 
 **Produces:** a reusable Java/Vivado environment builder used by direct validation and documented `make validate` behavior.
 
-- [ ] Write a failing `unittest` that verifies the validator subprocess environment contains `JAVA_HOME`, `RAPIDWRIGHT_PATH`, and a classpath rooted at the local `RapidWright` directory.
-- [ ] Extract environment construction from `src/mcp.py` or add a narrowly scoped helper so `DCPValidator.start_servers()` uses the same environment as `DCPOptimizerBase.start_servers()`.
-- [ ] Run `python -m unittest tests.test_validation_environment -v` and confirm it passes.
-- [ ] On the contest instance, run `make validate GOLDEN=<same-dcp> REVISED=<same-dcp> VECTORS=1000 VIVADO_EXEC=/tools/Xilinx/2025.1/Vivado/bin/vivado`; confirm structural and simulation phases pass.
-- [ ] Commit: `fix: configure Java runtime for direct validation`.
+- [x] Write a failing `unittest` that verifies the validator subprocess environment contains `JAVA_HOME`, `RAPIDWRIGHT_PATH`, and a classpath rooted at the local `RapidWright` directory.
+- [x] Extract environment construction from `src/mcp.py` or add a narrowly scoped helper so `DCPValidator.start_servers()` uses the same environment as `DCPOptimizerBase.start_servers()`.
+- [x] Run `python -m unittest tests.test_validation_environment -v` and confirm it passes.
+- [x] On the contest instance, run `make validate GOLDEN=<same-dcp> REVISED=<same-dcp> VECTORS=1000 VIVADO_EXEC=/tools/Xilinx/2025.1/Vivado/bin/vivado`; confirm structural and simulation phases pass.
+- [x] Commit: `fix: configure Java runtime for direct validation`.
 
 ### Task 2: Add reproducible experiment records and score calculation
 
@@ -54,12 +54,12 @@
 
 **Produces:** `ContestScoreInput`, `ContestScore`, and a JSON/Markdown record containing Fmax delta, runtime, LLM cost, validation status, and projected score.
 
-- [ ] Write failing tests for zero delta, the official 50 MHz / $0.25 / 1,200-second example, negative score clamping, and target-clock Fmax conversion.
-- [ ] Implement pure functions in `src/scoring.py`; do not call Vivado or OpenRouter from this module.
-- [ ] Extend the existing `token_usage.json` summary with `projected_contest_score` and required validation status fields.
-- [ ] Add the experiment template with command, commit SHA, prompt hash, profile/search controls, timing, cost, route/hold/pulse, structural/simulation, accepted/rejected reason, and artifact paths.
-- [ ] Run `python -m unittest tests.test_scoring -v` and inspect a real run report.
-- [ ] Commit: `feat: record target-clock experiment scorecards`.
+- [x] Write failing tests for zero delta, the official 50 MHz / $0.25 / 1,200-second example, negative score clamping, and target-clock Fmax conversion.
+- [x] Implement pure functions in `src/scoring.py`; do not call Vivado or OpenRouter from this module.
+- [x] Extend the existing `token_usage.json` summary with `projected_contest_score` and required validation status fields.
+- [x] Add the experiment template with command, commit SHA, prompt hash, profile/search controls, timing, cost, route/hold/pulse, structural/simulation, accepted/rejected reason, and artifact paths.
+- [x] Run `python -m unittest tests.test_scoring -v` and inspect a real run report.
+- [x] Commit: `feat: record target-clock experiment scorecards`.
 
 ### Task 3: Create the target-clock design signature
 
@@ -71,12 +71,12 @@
 
 **Produces:** a serializable `DesignSignature` with target-clock timing, path spread, high-fanout candidates, congestion/hard-block flags, and analysis duration.
 
-- [ ] Write fixture-driven parser tests for target clock, fanout rows, spread recommendation, and missing reports.
-- [ ] Implement a bounded `collect_design_signature()` that reuses `get_clock_period`, `get_wns_for_target_clock`, `get_critical_high_fanout_nets`, `extract_critical_path_cells`, and RapidWright spread analysis.
-- [ ] Add optional, timeout-bounded congestion and QoR report collection through existing Vivado Tcl access; record an unavailable value rather than failing the run.
-- [ ] Include the signature in the existing `initial_analysis` summary and token report.
-- [ ] Run unit tests, then collect signatures on VexRiscv, LogicNets, one Rosetta benchmark, and one large benchmark; record analysis seconds.
-- [ ] Commit: `feat: collect target-clock design signatures`.
+- [x] Write fixture-driven parser tests for target clock, fanout rows, spread recommendation, and missing reports.
+- [x] Implement a bounded `collect_design_signature()` that reuses `get_clock_period`, `get_wns_for_target_clock`, `get_critical_high_fanout_nets`, `extract_critical_path_cells`, and RapidWright spread analysis.
+- [x] Add optional, timeout-bounded congestion and QoR report collection through existing Vivado Tcl access; record an unavailable value rather than failing the run.
+- [x] Include the signature in the existing `initial_analysis` summary and token report.
+- [x] Run unit tests, then collect signatures on VexRiscv, LogicNets, one Rosetta benchmark, and one large benchmark; record analysis seconds.
+- [x] Commit: `feat: collect target-clock design signatures`.
 
 ### Task 4: Add deterministic recipe admissibility gates
 
@@ -88,12 +88,12 @@
 
 **Produces:** `EligibleAction`, `gate_actions(signature, budget, history)`, and an explicit no-op fallback.
 
-- [ ] Write failing tests proving: PBLOCK is rejected for a one-path/local-detour signature; FANOUT is rejected without a critical non-clock high-fanout net; HARD_BLOCK is rejected without critical hard-block incidence; PHYS_OPT remains eligible on ambiguous inputs.
-- [ ] Implement gates for existing `PBLOCK`, `FANOUT`, `CELL_RELOCATION`, `PHYS_OPT`, and `HARD_BLOCK` actions without changing their executors.
-- [ ] Pass only eligible actions to `_build_decision_input()` and update the planner contract so it returns only one allowed action.
-- [ ] Make `_fallback_action_candidates()` choose a deterministic eligible action when LLM output is invalid, over budget, or unavailable.
-- [ ] Run `python -m unittest tests.test_policy -v` and offline prompt evaluation.
-- [ ] Commit: `feat: gate recipes by design signature`.
+- [x] Write failing tests proving: PBLOCK is rejected for a one-path/local-detour signature; FANOUT is rejected without a critical non-clock high-fanout net; HARD_BLOCK is rejected without critical hard-block incidence; PHYS_OPT remains eligible on ambiguous inputs.
+- [x] Implement gates for existing `PBLOCK`, `FANOUT`, `CELL_RELOCATION`, `PHYS_OPT`, and `HARD_BLOCK` actions without changing their executors.
+- [x] Pass only eligible actions to `_build_decision_input()` and update the planner contract so it returns only one allowed action.
+- [x] Make `_fallback_action_candidates()` choose a deterministic eligible action when LLM output is invalid, over budget, or unavailable.
+- [x] Run `python -m unittest tests.test_policy -v` and offline prompt evaluation.
+- [x] Commit: `feat: gate recipes by design signature`.
 
 ### Task 5: Rank generation-search candidates by score-aware metrics
 
