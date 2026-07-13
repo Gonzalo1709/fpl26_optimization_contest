@@ -4,9 +4,13 @@ import unittest
 from pathlib import Path
 
 from src.mcp import build_rapidwright_mcp_env
+from validate_dcps import is_clock_port_name
 
 
 class ValidationEnvironmentTests(unittest.TestCase):
+    def test_recognizes_clock_word_in_port_name(self):
+        self.assertTrue(is_clock_port_name("clock_uncore_clock"))
+
     def test_builds_validator_environment_from_vivado_java(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo_root = Path(temporary_directory) / "repo"

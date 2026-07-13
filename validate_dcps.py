@@ -41,6 +41,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def is_clock_port_name(name: str) -> bool:
+    """Return whether an input port name uses a conventional clock token."""
+    normalized = name.lower()
+    return "clk" in normalized or "clock" in normalized
+
+
 class DCPValidator:
     """Validates functional equivalence between two DCPs."""
     
@@ -347,8 +353,8 @@ class DCPValidator:
             print("⚠ Warning: Design has no outputs - limited verification possible")
         
         # Filter out clock and reset (we'll drive those separately)
-        regular_inputs = [p for p in inputs if 'clk' not in p['name'].lower() and 'rst' not in p['name'].lower() and 'reset' not in p['name'].lower()]
-        clocks = [p for p in inputs if 'clk' in p['name'].lower()]
+        regular_inputs = [p for p in inputs if not is_clock_port_name(p['name']) and 'rst' not in p['name'].lower() and 'reset' not in p['name'].lower()]
+        clocks = [p for p in inputs if is_clock_port_name(p['name'])]
         resets = [p for p in inputs if 'rst' in p['name'].lower() or 'reset' in p['name'].lower()]
         
         if not clocks:
