@@ -51,11 +51,11 @@ Prompt optimization is not a priority: the current production prompt beat both G
 | Promoted policy/search changes | Score-status reporting added without changing score calculation or candidate promotion |
 | Rejected experiments and evidence | AMD FANOUT regressed; corescore and FINN PBLOCK each had 0 MHz gain; all restored their roots |
 | Unit test result | 57/57 passed locally and on the fresh contest instance |
-| Beta archive path / SHA256 / size | `C:/tmp/fpl26_beta_submission.zip` / `2443b5e50cc6118a14b26a54d78b9c6892b174ffa0db45958284c551508e8165` / 12,933,968 bytes |
+| Beta archive path / SHA256 / size | `C:/tmp/fpl26_beta_submission_runtime_v2.zip` / `bf12a10ab56986a275f3275e4e8589a185a582361fbd8388da82dec4a545f5a0` / 1,526,639 bytes |
 | Clean `make setup` result | Passed after extracting the exact archive on the contest instance |
 | Clean default non-test optimizer result | Not rerun from the archive because credential transfer was blocked; the packaged code has earlier full non-test evidence |
-| Remaining blocker | The execution safety gate prohibits transferring the OpenRouter credential to the new VM, so remaining remote screening cannot start from this session |
-| Exact next command | With OpenRouter configured on the VM, rerun `ispd16_example2`; otherwise submit the audited archive and inspect beta preview artifacts with `--all` |
+| Remaining blocker | Remaining ad-hoc VM screening is blocked because the execution safety gate prohibits transferring the OpenRouter credential; beta submission itself is confirmed |
+| Exact next command | Monitor beta preview attempt #2; when complete, download its scorecard, logs, and DCP results with `--preview --attempt 2 --all` and diagnose any zero-score row before the deadline |
 
 ## Safety and Recovery
 
