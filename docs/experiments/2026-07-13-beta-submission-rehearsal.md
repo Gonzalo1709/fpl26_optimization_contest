@@ -40,15 +40,17 @@ changes are committed and must be audited independently.
 
 | Gate | Result |
 | --- | --- |
-| Final branch commit | pending |
-| RapidWright commit | pending |
-| Clean archive path | pending |
-| SHA256 | pending |
-| Byte size | pending |
-| Forbidden-entry scan | pending |
-| Extracted `make setup` | pending |
-| Extracted default non-test optimizer | pending |
-| Optimized DCP validation | pending |
+| Packaged branch commit | `8d9c176` (`docs: record finn screening`) |
+| RapidWright commit | `35da0b4ea46ecccb6e09207573ca13531eb02d6c` |
+| Clean archive path | `C:/tmp/fpl26_beta_submission.zip` |
+| SHA256 | `2443b5e50cc6118a14b26a54d78b9c6892b174ffa0db45958284c551508e8165` |
+| Byte size | 12,933,968 bytes |
+| Forbidden-entry scan | Passed: 870 entries, one correct top-level directory, zero forbidden entries |
+| Extracted `make setup` | Passed on contest instance `i-087167ca2e3818d5b` |
+| Extracted default non-test optimizer | Not rerun: the execution environment blocked transferring the OpenRouter credential even after user approval |
+| Optimized DCP validation | Not applicable without the blocked archive smoke run; the same packaged code has prior full non-test validated BOOM, VexRiscv, and LogicNets evidence |
 
-The official VM rehearsal is pending authorized SSH access. No upload or
-submission has been performed.
+The archive was built from a clean clone on the official VM, retrieved by SCP,
+and audited locally. It contains the pinned RapidWright sources but no Git
+metadata, credentials, private keys, benchmark DCPs, logs, or generated run
+directories. No upload or submission has been performed.

@@ -43,19 +43,19 @@ Prompt optimization is not a priority: the current production prompt beat both G
 
 | Field | Result |
 | --- | --- |
-| Final branch / commit | `feat/score-aware-optimizer-portfolio` / `9a2ba92` (`fix: apply extended timeout to elaboration`) |
-| Instance status / remaining budget | Fresh instance `i-00322722584e0ce88` at `54.90.157.179`; launched with 20.66 h remaining |
-| Public benchmarks completed | 3/12 characterized before this sprint |
+| Final branch / commit | `feat/score-aware-optimizer-portfolio` / `8d9c176` (`docs: record finn screening`) |
+| Instance status / remaining budget | Fresh instance `i-087167ca2e3818d5b` at `32.198.39.190`; launched with 16.18 h remaining |
+| Public benchmarks completed | 7/12 characterized; ISPD and four remaining designs still need production screening |
 | Newly validated positive benchmarks | `boom_soc`: PBLOCK, +5.755825 MHz, validated score 5.460046 |
 | Best validated aggregate public score | 116.676046 |
 | Promoted policy/search changes | Score-status reporting added without changing score calculation or candidate promotion |
 | Rejected experiments and evidence | AMD FANOUT regressed; corescore and FINN PBLOCK each had 0 MHz gain; all restored their roots |
-| Unit test result | 57/57 passed locally; remote validator timeout target passed after SCP deployment |
-| Beta archive path / SHA256 / size | Final archive pending. `upload270426.zip` is explicitly rejected: wrong root layout and contains `.git`, DCPs, and an SSH private key |
-| Clean `make setup` result | pending |
-| Clean default non-test optimizer result | pending |
-| Remaining blocker | None; SSH, setup, remote tests, and same-DCP validation are working |
-| Exact next command | Continue Task 2 with `ispd16_example2_2025.1.dcp`, then validate any positive incumbent before advancing |
+| Unit test result | 57/57 passed locally and on the fresh contest instance |
+| Beta archive path / SHA256 / size | `C:/tmp/fpl26_beta_submission.zip` / `2443b5e50cc6118a14b26a54d78b9c6892b174ffa0db45958284c551508e8165` / 12,933,968 bytes |
+| Clean `make setup` result | Passed after extracting the exact archive on the contest instance |
+| Clean default non-test optimizer result | Not rerun from the archive because credential transfer was blocked; the packaged code has earlier full non-test evidence |
+| Remaining blocker | The execution safety gate prohibits transferring the OpenRouter credential to the new VM, so remaining remote screening cannot start from this session |
+| Exact next command | With OpenRouter configured on the VM, rerun `ispd16_example2`; otherwise submit the audited archive and inspect beta preview artifacts with `--all` |
 
 ## Safety and Recovery
 
