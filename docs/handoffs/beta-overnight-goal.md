@@ -43,19 +43,19 @@ Prompt optimization is not a priority: the current production prompt beat both G
 
 | Field | Result |
 | --- | --- |
-| Final branch / commit | pending |
-| Instance status / remaining budget | pending |
+| Final branch / commit | `feat/score-aware-optimizer-portfolio` / `f7101eb` (`feat: explain optimizer score status`) |
+| Instance status / remaining budget | Running instance `i-0058deec95f879b31` at `100.31.235.29`; 20.86 h remained at the latest API check |
 | Public benchmarks completed | 3/12 characterized before this sprint |
 | Newly validated positive benchmarks | pending |
 | Best validated aggregate public score | 111.216 before this sprint |
-| Promoted policy/search changes | pending |
+| Promoted policy/search changes | Score-status reporting added without changing score calculation or candidate promotion |
 | Rejected experiments and evidence | pending |
-| Unit test result | pending |
+| Unit test result | 53/53 passed with `.venv/Scripts/python.exe`; score-status targeted tests also pass after TDD implementation |
 | Beta archive path / SHA256 / size | pending |
 | Clean `make setup` result | pending |
 | Clean default non-test optimizer result | pending |
-| Remaining blocker | none recorded |
-| Exact next command | follow Task 1 in the beta sprint plan |
+| Remaining blocker | Authorized SSH access must be recovered, or the running disposable VM must be explicitly approved for termination/relaunch; the duplicate-start HTTP 409 body overwrote the local ephemeral contest key |
+| Exact next command | After access recovery, run the nine-design Task 2 production loop exactly as written in the beta sprint plan |
 
 ## Safety and Recovery
 
