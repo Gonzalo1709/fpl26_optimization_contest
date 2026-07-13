@@ -40,7 +40,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-XELAB_TIMEOUT_SECONDS = 900
+SIMULATION_TOOL_TIMEOUT_SECONDS = {
+    "xvlog": 300,
+    "xelab": 900,
+    "xsim": 600,
+}
+
+
+def simulation_tool_timeout(command) -> int:
+    """Return the bounded timeout for a Vivado simulation subprocess."""
+    tool_name = Path(command[0]).name
+    return SIMULATION_TOOL_TIMEOUT_SECONDS[tool_name]
 
 
 def is_clock_port_name(name: str) -> bool:
@@ -688,7 +698,7 @@ endmodule
                 cwd=xsim_dir,
                 capture_output=True,
                 text=True,
-                timeout=XELAB_TIMEOUT_SECONDS
+                timeout=simulation_tool_timeout(compile_cmd)
             )
             
             if result.returncode != 0:
@@ -716,7 +726,7 @@ endmodule
                 cwd=xsim_dir,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=simulation_tool_timeout(elab_cmd)
             )
             
             if result.returncode != 0:
@@ -760,7 +770,7 @@ endmodule
                 cwd=xsim_dir,
                 capture_output=True,
                 text=True,
-                timeout=600
+                timeout=simulation_tool_timeout(sim_cmd)
             )
             
             # Parse simulation output

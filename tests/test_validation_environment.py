@@ -4,15 +4,17 @@ import unittest
 from pathlib import Path
 
 from src.mcp import build_rapidwright_mcp_env
-from validate_dcps import XELAB_TIMEOUT_SECONDS, is_clock_port_name
+from validate_dcps import is_clock_port_name, simulation_tool_timeout
 
 
 class ValidationEnvironmentTests(unittest.TestCase):
     def test_recognizes_clock_word_in_port_name(self):
         self.assertTrue(is_clock_port_name("clock_uncore_clock"))
 
-    def test_large_design_elaboration_has_bounded_extended_timeout(self):
-        self.assertEqual(XELAB_TIMEOUT_SECONDS, 900)
+    def test_simulation_tool_timeouts_extend_elaboration_only(self):
+        self.assertEqual(simulation_tool_timeout(["xvlog"]), 300)
+        self.assertEqual(simulation_tool_timeout(["xelab"]), 900)
+        self.assertEqual(simulation_tool_timeout(["xsim"]), 600)
 
     def test_builds_validator_environment_from_vivado_java(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
