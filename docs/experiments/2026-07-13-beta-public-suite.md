@@ -24,7 +24,7 @@ classes; they do not replace these control rows.
 | amd_mini-isp | spread 56.88/80 tiles; 4 critical fanout nets; BRAM; severe congestion | `FANOUT top_n_nets=4` regressed to -1.756; root restored | -1.686 ns | -1.686 ns | 0 MHz | 178.788 s | $0.0122025 | 0 | Not required for rolled-back candidate | Rejected FANOUT; legal root retained |
 | boom_soc | spread 302.52/343 tiles; 6 critical fanout nets; severe congestion; no critical hard-block type | `PBLOCK` candidate retained | -19.162 ns | -16.952 ns | +5.755825 MHz | 1802.897 s | $0.0130725 | 5.460046 | Passed structural 4/4, 1,000 vectors/0 mismatches, and Vivado legality | Promoted validated PBLOCK incumbent |
 | corescore_500_mod | spread 232.36/448 tiles; no critical fanout nets; critical BRAM; severe congestion | `PBLOCK` produced no gain; root restored | -1.238 ns | -1.238 ns | 0 MHz | 771.041 s | $0.010335 | 0 | Not required for neutral rolled-back candidate | Rejected PBLOCK; legal root retained |
-| finn_radioml | pending | pending | | | | | | | pending | pending |
+| finn_radioml | spread 255.08/408 tiles; 4 critical fanout nets; no critical hard block; severe congestion | `PBLOCK` produced no gain; root restored | -1.910 ns | -1.910 ns | 0 MHz | 529.904 s | $0.01301 | 0 | Not required for neutral rolled-back candidate | Rejected PBLOCK; legal root retained |
 | ispd16_example2 | pending | pending | | | | | | | pending | pending |
 | rosetta_3d-rendering | pending | pending | | | | | | | pending | pending |
 | rosetta_optical-flow | pending | pending | | | | | | | pending | pending |
@@ -64,7 +64,7 @@ passed in 678.222 seconds. Evidence was retrieved outside Git to
 
 ## Cross-Design Findings
 
-Three of nine new control rows are complete. No policy change is justified from
+Four of nine new control rows are complete. No policy change is justified from
 this incomplete matrix, although PBLOCK now has one validated positive on an
-extreme multi-path-spread signature and one neutral result on another; it
+extreme multi-path-spread signature and two neutral results on others; it
 remains correctly gated and cannot yet be promoted more broadly.
