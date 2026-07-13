@@ -8,7 +8,8 @@ class PromptLoadingTests(unittest.TestCase):
         prompt = load_system_prompt()
 
         self.assertIn("FPGA", prompt)
-        self.assertIn("“no critical high-fanout nets available,”", prompt)
+        self.assertIn("clk_fpl26contest", prompt)
+        self.assertNotIn("\ufffd", prompt)
 
 
 if __name__ == "__main__":

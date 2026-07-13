@@ -169,12 +169,12 @@
 
 **Produces:** late-stage gates for PBLOCK, hard-block relocation, LUT cone merging, retiming, and congestion-aware spreading.
 
-- [ ] Document exact evidence thresholds and required validation for every specialist recipe.
-- [ ] Keep PBLOCK eligible only for multiple strongly spread target-clock paths and sufficient remaining place/route budget.
-- [ ] Keep hard-block relocation eligible only for DSP/BRAM/URAM-critical paths and a legal local candidate.
-- [ ] Keep LUT merge and retiming disabled by default until a local proof/validation gate exists.
-- [ ] Run focused benchmarks where each signature applies; record skipped cases as successful gate behavior.
-- [ ] Commit: `feat: gate specialist optimization recipes`.
+- [x] Document exact evidence thresholds and required validation for every specialist recipe.
+- [x] Keep PBLOCK eligible only for multiple strongly spread target-clock paths and sufficient remaining place/route budget.
+- [x] Keep hard-block relocation eligible only for DSP/BRAM/URAM-critical paths and a legal local candidate.
+- [x] Keep LUT merge and retiming disabled by default until a local proof/validation gate exists.
+- [x] Run focused benchmarks where each signature applies; record skipped cases as successful gate behavior.
+- [x] Commit: `feat: gate specialist optimization recipes`.
 
 ### Task 10: Optimize planner prompts with DSPy/GEPA and close the loop
 

@@ -15,6 +15,7 @@ def make_signature(
     high_fanout_report: str = "",
     spread: dict | None = None,
     critical_paths: list[list[str]] | None = None,
+    congestion_report: str | None = None,
 ) -> DesignSignature:
     return DesignSignature.from_reports(
         target_clock="clk_fpl26contest",
@@ -26,10 +27,65 @@ def make_signature(
         spread_report=json.dumps(spread) if spread else None,
         analysis_duration_seconds=1.0,
         critical_paths_report=json.dumps(critical_paths) if critical_paths else None,
+        congestion_report=congestion_report,
     )
 
 
 class RecipePolicyTests(unittest.TestCase):
+    def test_pblock_requires_extreme_spread_or_congestion_corroboration(self):
+        logicnets_like = make_signature(
+            spread={
+                "max_distance_found": 198,
+                "avg_max_distance": 111.86,
+                "paths_analyzed": 50,
+            }
+        )
+        rosetta_like = make_signature(
+            spread={
+                "max_distance_found": 283,
+                "avg_max_distance": 131.38,
+                "paths_analyzed": 50,
+            }
+        )
+        congested = make_signature(
+            spread={
+                "max_distance_found": 150,
+                "avg_max_distance": 85.0,
+                "paths_analyzed": 20,
+            },
+            congestion_report="Global Horizontal Congestion: 6",
+        )
+
+        self.assertNotIn(
+            "PBLOCK", {action.strategy for action in gate_actions(logicnets_like)}
+        )
+        self.assertIn(
+            "PBLOCK", {action.strategy for action in gate_actions(rosetta_like)}
+        )
+        self.assertIn(
+            "PBLOCK", {action.strategy for action in gate_actions(congested)}
+        )
+
+    def test_specialists_remain_disabled_without_proof_gate(self):
+        strategies = {
+            action.strategy
+            for action in gate_actions(
+                make_signature(
+                    spread={
+                        "max_distance_found": 300,
+                        "avg_max_distance": 150,
+                        "paths_analyzed": 50,
+                    },
+                    critical_paths=[["top/RAMB36E2", "top/out_reg"]],
+                    congestion_report="Global Horizontal Congestion: 6",
+                )
+            )
+        }
+
+        self.assertNotIn("LUT_MERGE", strategies)
+        self.assertNotIn("RETIME", strategies)
+        self.assertNotIn("CONGESTION_SPREAD", strategies)
+
     def test_rejects_pblock_for_local_moderate_spread(self):
         signature = make_signature(
             spread={
@@ -54,7 +110,14 @@ class RecipePolicyTests(unittest.TestCase):
         with_bram = {
             action.strategy
             for action in gate_actions(
-                make_signature(critical_paths=[["cache/RAMB36E2", "top/out_reg"]])
+                make_signature(
+                    critical_paths=[["cache/RAMB36E2", "top/out_reg"]],
+                    spread={
+                        "max_distance_found": 180,
+                        "avg_max_distance": 90,
+                        "paths_analyzed": 20,
+                    },
+                )
             )
         }
 

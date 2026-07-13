@@ -285,6 +285,11 @@ Examples:
         action="store_true",
         help="Force the bounded ROUTE_PRESERVE recipe every iteration",
     )
+    force_group.add_argument(
+        "--force-hard-block",
+        action="store_true",
+        help="Force the gated HARD_BLOCK relocation recipe every iteration",
+    )
 
     args = parser.parse_args()
 
@@ -403,6 +408,8 @@ Examples:
         force_strategy = "CRITICAL_PIN"
     elif args.force_route_preserve:
         force_strategy = "ROUTE_PRESERVE"
+    elif args.force_hard_block:
+        force_strategy = "HARD_BLOCK"
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
