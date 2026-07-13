@@ -69,8 +69,24 @@ archive produced.
 - Confirmed at: `2026-07-13T22:42:12Z`
 - Server MD5: `9b55acba24a3788449a2b0b175d77ec3`
 - Deadline reported by server: `2026-07-14T11:59:59Z`
-- Preview attempt: `#2`, latest submission, initially `provisioning`
+- Preview attempt: `#2`, latest submission, completed at
+  `2026-07-13T23:05:22Z` with score **7.539**
 - Replaced preview attempt `#1`, whose scorecard was `0.0` because both public
   benchmarks produced no Fmax improvement.
 - Attempt #1 scorecard, logs, and DCP results were downloaded before replacement
   to `C:/tmp/beta-preview-attempt1/` using the organizer's `--all` equivalent.
+- Attempt #2 scorecard, logs, and DCP results were downloaded to
+  `C:/tmp/beta-preview-attempt2/` using the same `--all` equivalent.
+
+### Preview attempt #2 scorecard
+
+| Benchmark | Delta Fmax | Runtime | OpenRouter cost | Score | Validation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `logicnets_jscl` | +7.633 MHz | 306.496 s | $0.0386 | 7.539 | All placement, DRC, hold, pulse-width, and simulation gates passed |
+| `vexriscv_re-place_v2` | 0 MHz | 99.215 s | $0.0098 | 0 | All gates passed; `RuntimeOptimized` PHYS_OPT produced no improvement on the v2 checkpoint |
+
+The preview had no global failure and both benchmarks produced legal validated
+outputs. No attempt #3 was submitted because the zero Vex row already selected
+the intended low-risk PHYS_OPT directive and there is no fixed evidence that a
+policy change would improve the distinct `v2` checkpoint without risking the
+confirmed positive LogicNets result.

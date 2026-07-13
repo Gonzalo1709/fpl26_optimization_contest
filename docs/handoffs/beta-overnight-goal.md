@@ -48,14 +48,15 @@ Prompt optimization is not a priority: the current production prompt beat both G
 | Public benchmarks completed | 7/12 characterized; ISPD and four remaining designs still need production screening |
 | Newly validated positive benchmarks | `boom_soc`: PBLOCK, +5.755825 MHz, validated score 5.460046 |
 | Best validated aggregate public score | 116.676046 |
+| Confirmed beta preview | Attempt #2, score 7.539; LogicNets +7.633 MHz and all gates passed; Vex v2 legal but neutral |
 | Promoted policy/search changes | Score-status reporting added without changing score calculation or candidate promotion |
 | Rejected experiments and evidence | AMD FANOUT regressed; corescore and FINN PBLOCK each had 0 MHz gain; all restored their roots |
 | Unit test result | 57/57 passed locally and on the fresh contest instance |
 | Beta archive path / SHA256 / size | `C:/tmp/fpl26_beta_submission_runtime_v2.zip` / `bf12a10ab56986a275f3275e4e8589a185a582361fbd8388da82dec4a545f5a0` / 1,526,639 bytes |
 | Clean `make setup` result | Passed after extracting the exact archive on the contest instance |
 | Clean default non-test optimizer result | Not rerun from the archive because credential transfer was blocked; the packaged code has earlier full non-test evidence |
-| Remaining blocker | Remaining ad-hoc VM screening is blocked because the execution safety gate prohibits transferring the OpenRouter credential; beta submission itself is confirmed |
-| Exact next command | Monitor beta preview attempt #2; when complete, download its scorecard, logs, and DCP results with `--preview --attempt 2 --all` and diagnose any zero-score row before the deadline |
+| Remaining blocker | None for beta eligibility: the latest submission and positive preview are confirmed. Remaining ad-hoc screening is blocked by credential-transfer policy. |
+| Exact next command | Preserve attempt #2 as the beta submission unless new fixed evidence justifies the risk of another preview before `2026-07-14T11:59:59Z` |
 
 ## Safety and Recovery
 
