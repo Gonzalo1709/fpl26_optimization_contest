@@ -7,6 +7,7 @@ fpl26_contest_benchmarks/*
 *.tar.gz
 
 .venv/
+.env
 
 key
 fpl26contest
