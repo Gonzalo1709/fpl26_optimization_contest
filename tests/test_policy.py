@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 from src.analysis import DesignSignature
 from src.llm_optimizer import DCPOptimizer
 from src.policy import BudgetState, gate_actions
+from src.search import SearchCandidate
 
 
 def make_signature(
@@ -124,6 +125,41 @@ class RecipePolicyTests(unittest.TestCase):
         )
         self.assertEqual(strategy, "PHYS_OPT")
         self.assertEqual(args, {"directive": "Default"})
+
+    def test_forced_branch_diversity_cannot_bypass_policy(self):
+        signature = make_signature(
+            spread={
+                "max_distance_found": 93,
+                "avg_max_distance": 53.5,
+                "paths_analyzed": 50,
+            }
+        )
+        root = SearchCandidate(
+            candidate_id="root",
+            dcp_path=Path("root.dcp"),
+            wns=-1.0,
+            tns=-100.0,
+            failing_endpoints=100,
+            peak_wns=-1.0,
+            generation=0,
+            parent_id=None,
+            branch_index=0,
+            steps_taken=0,
+            steps_since_peak=0,
+            summary="root",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            optimizer = DCPOptimizer(
+                api_key="test-key",
+                run_dir=Path(temporary_directory),
+                system_prompt="test planner prompt",
+            )
+            optimizer.design_signature = signature
+
+            strategy, _ = optimizer._forced_branch_strategy(1, root, 1, 1)
+
+        self.assertIn(strategy, {"PHYS_OPT", "CELL_RELOCATE"})
+        self.assertNotEqual(strategy, "PBLOCK")
 
 
 class NoOpExecutionTests(unittest.IsolatedAsyncioTestCase):

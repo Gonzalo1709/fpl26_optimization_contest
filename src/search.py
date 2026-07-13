@@ -1,8 +1,10 @@
 """Generation-search configuration and candidate state."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from src.scoring import ValidationStatus
 
 
 @dataclass
@@ -42,3 +44,8 @@ class SearchCandidate:
     steps_taken: int
     steps_since_peak: int
     summary: str
+    elapsed_seconds: float = 0.0
+    llm_cost_usd: float = 0.0
+    projected_score: float = 0.0
+    validation: ValidationStatus = field(default_factory=ValidationStatus)
+    validated_score: Optional[float] = None

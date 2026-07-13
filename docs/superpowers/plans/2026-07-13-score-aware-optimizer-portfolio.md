@@ -104,12 +104,12 @@
 
 **Produces:** candidate metadata for elapsed time, LLM cost, validation state, projected score, and a score-first pruning key.
 
-- [ ] Write failing tests where a smaller Fmax improvement with a much lower runtime wins projected score, and where an unvalidated candidate cannot replace a validated incumbent.
-- [ ] Extend `SearchCandidate` with explicit score/validation fields while retaining WNS, TNS, endpoints, branch, and checkpoint fields.
-- [ ] Replace the current WNS-only branch ranking with projected-score-first ranking and target-clock metrics as deterministic tie breakers.
-- [ ] Keep root checkpoint restoration; no branch may overwrite output until it wins the promotion gate.
-- [ ] Run search-ranking tests and one full remote VexRiscv smoke run with `--budget-profile fast`.
-- [ ] Commit: `feat: rank search candidates by projected score`.
+- [x] Write failing tests where a smaller Fmax improvement with a much lower runtime wins projected score, and where an unvalidated candidate cannot replace a validated incumbent.
+- [x] Extend `SearchCandidate` with explicit score/validation fields while retaining WNS, TNS, endpoints, branch, and checkpoint fields.
+- [x] Replace the current WNS-only branch ranking with projected-score-first ranking and target-clock metrics as deterministic tie breakers.
+- [x] Keep root checkpoint restoration; no branch may overwrite output until it wins the promotion gate.
+- [x] Run search-ranking tests and one full remote VexRiscv smoke run with `--budget-profile fast`.
+- [x] Commit: `feat: rank search candidates by projected score`.
 
 ### Task 6: Turn existing phys-opt support into a measured portfolio
 

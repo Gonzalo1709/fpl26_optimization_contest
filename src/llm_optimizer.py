@@ -1012,18 +1012,23 @@ class DCPOptimizer(DCPOptimizerBase):
         if generation != 1 or parent.candidate_id != "root" or step != 1:
             return None
 
+        eligible = {action.strategy: action for action in self._eligible_actions()}
+        preferred_order = ("FANOUT", "PBLOCK", "CELL_RELOCATE", "HARD_BLOCK", "PHYS_OPT")
         forced_strategies = []
-        if self._fanout_candidates_available():
-            forced_strategies.append(("FANOUT", {"top_n_nets": 3}))
-        forced_strategies.extend(
-            [
-                ("PBLOCK", {}),
-                ("CELL_RELOCATE", {"num_paths": 10, "detour_threshold": 2.0, "max_cells": 3}),
-                ("PHYS_OPT", {"directive": "Explore"}),
-            ]
-        )
+        for strategy in preferred_order:
+            if strategy not in eligible:
+                continue
+            args = eligible[strategy].default_args
+            if strategy == "FANOUT":
+                args = {"top_n_nets": 3}
+            elif strategy == "PHYS_OPT":
+                args = {"directive": "Explore"}
+            forced_strategies.append((strategy, args))
+        if not forced_strategies:
+            return None
         strategy_index = min(branch_index - 1, len(forced_strategies) - 1)
-        return forced_strategies[strategy_index]
+        strategy, args = forced_strategies[strategy_index]
+        return self.sanitize_action({"strategy": strategy, "args": args})
 
     async def run_pblock_flow(self) -> str:
         """Execute a staged PBLOCK recipe with progressively stronger constraints."""
@@ -1606,8 +1611,54 @@ class DCPOptimizer(DCPOptimizerBase):
         """Format WNS for logs."""
         return f"{wns:.3f} ns" if wns is not None else "unknown"
 
-    def _candidate_sort_key(self, candidate: SearchCandidate) -> tuple[tuple[float, float, float], float]:
-        """Score candidates for beam pruning. Current leaf score is primary."""
+    def _candidate_score_metadata(
+        self,
+        wns: Optional[float],
+        validation: Optional[ValidationStatus] = None,
+    ) -> dict:
+        """Calculate cumulative score metadata for a saved candidate."""
+        elapsed_seconds = (
+            max(0.0, time.time() - self.start_time)
+            if self.start_time is not None
+            else 0.0
+        )
+        initial_fmax = self.calculate_fmax(self.initial_wns, self.clock_period)
+        candidate_fmax = self.calculate_fmax(wns, self.clock_period)
+        delta_fmax = (
+            candidate_fmax - initial_fmax
+            if candidate_fmax is not None and initial_fmax is not None
+            else 0.0
+        )
+        status = validation or ValidationStatus()
+        score = calculate_contest_score(
+            ContestScoreInput(
+                delta_fmax_mhz=delta_fmax,
+                llm_cost_usd=self.total_cost,
+                runtime_seconds=elapsed_seconds,
+                validation=status,
+            )
+        )
+        return {
+            "elapsed_seconds": elapsed_seconds,
+            "llm_cost_usd": self.total_cost,
+            "projected_score": score.projected_score,
+            "validation": status,
+            "validated_score": score.validated_score,
+        }
+
+    @staticmethod
+    def _candidate_validation_rank(candidate: SearchCandidate) -> int:
+        """Order passed, speculative, and failed candidates conservatively."""
+        if candidate.validation.passed:
+            return 2
+        if candidate.validation.complete:
+            return 0
+        return 1
+
+    def _candidate_sort_key(
+        self, candidate: SearchCandidate
+    ) -> tuple[int, float, tuple[float, float, float], float, float, float]:
+        """Rank candidates by validation and contest score, then timing and cost."""
         current = self._metrics_sort_key(
             {
                 "wns": candidate.wns,
@@ -1616,7 +1667,27 @@ class DCPOptimizer(DCPOptimizerBase):
             }
         )
         peak = candidate.peak_wns if candidate.peak_wns is not None else float("-inf")
-        return current, peak
+        effective_score = (
+            candidate.validated_score
+            if candidate.validated_score is not None
+            else candidate.projected_score
+        )
+        return (
+            self._candidate_validation_rank(candidate),
+            effective_score,
+            current,
+            peak,
+            -candidate.elapsed_seconds,
+            -candidate.llm_cost_usd,
+        )
+
+    def _is_candidate_improvement(
+        self,
+        candidate: SearchCandidate,
+        incumbent: Optional[SearchCandidate],
+    ) -> bool:
+        """Return whether one candidate clears the score-aware promotion gate."""
+        return incumbent is None or self._candidate_sort_key(candidate) > self._candidate_sort_key(incumbent)
 
     def _budget_stop_reason(self) -> Optional[str]:
         """Return a human-readable stop reason when configured budgets are exhausted."""
@@ -1947,6 +2018,7 @@ class DCPOptimizer(DCPOptimizerBase):
             steps_taken=0,
             steps_since_peak=0,
             summary="Initial analyzed checkpoint",
+            **self._candidate_score_metadata(self.initial_wns),
         )
         self.search_candidates = [root]
         self.best_candidate = root
@@ -2008,21 +2080,7 @@ class DCPOptimizer(DCPOptimizerBase):
 
                         branch_results.append(candidate)
 
-                        candidate_metrics = {
-                            "wns": candidate.wns,
-                            "tns": candidate.tns,
-                            "failing_endpoints": candidate.failing_endpoints,
-                        }
-                        best_metrics = (
-                            {
-                                "wns": self.best_candidate.wns,
-                                "tns": self.best_candidate.tns,
-                                "failing_endpoints": self.best_candidate.failing_endpoints,
-                            }
-                            if self.best_candidate
-                            else None
-                        )
-                        if self._is_metrics_improvement(candidate_metrics, best_metrics):
+                        if self._is_candidate_improvement(candidate, self.best_candidate):
                             self.best_candidate = candidate
                             print(f"[SEARCH] New global best: {candidate.candidate_id} ({self._format_wns(candidate.wns)})")
 
@@ -2256,6 +2314,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 steps_taken=step,
                 steps_since_peak=steps_since_peak,
                 summary=f"{strategy} {args}",
+                **self._candidate_score_metadata(current_wns),
             )
             self.search_candidates.append(latest_candidate)
 
@@ -2265,18 +2324,7 @@ class DCPOptimizer(DCPOptimizerBase):
             )
             print(f"[SEARCH] Step cost: {self._format_step_roi(delta_vs_peak, step_elapsed_time)}")
 
-            if self._is_metrics_improvement(
-                current_metrics,
-                (
-                    {
-                        "wns": self.best_candidate.wns,
-                        "tns": self.best_candidate.tns,
-                        "failing_endpoints": self.best_candidate.failing_endpoints,
-                    }
-                    if self.best_candidate
-                    else None
-                ),
-            ):
+            if self._is_candidate_improvement(latest_candidate, self.best_candidate):
                 self.best_candidate = latest_candidate
                 print(f"[SEARCH] New global best inside branch: {latest_candidate.candidate_id}")
 
@@ -2352,6 +2400,11 @@ class DCPOptimizer(DCPOptimizerBase):
                         "steps_taken": candidate.steps_taken,
                         "steps_since_peak": candidate.steps_since_peak,
                         "summary": candidate.summary,
+                        "elapsed_seconds": candidate.elapsed_seconds,
+                        "llm_cost_usd": candidate.llm_cost_usd,
+                        "projected_score": candidate.projected_score,
+                        "validation": asdict(candidate.validation),
+                        "validated_score": candidate.validated_score,
                     }
                     for candidate in self.search_candidates
                 ],
