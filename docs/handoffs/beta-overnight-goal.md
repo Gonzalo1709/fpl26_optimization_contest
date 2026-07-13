@@ -49,13 +49,13 @@ Prompt optimization is not a priority: the current production prompt beat both G
 | Newly validated positive benchmarks | `boom_soc`: PBLOCK, +5.755825 MHz, validated score 5.460046 |
 | Best validated aggregate public score | 116.676046 |
 | Promoted policy/search changes | Score-status reporting added without changing score calculation or candidate promotion |
-| Rejected experiments and evidence | pending |
+| Rejected experiments and evidence | AMD FANOUT regressed and rolled back; corescore PBLOCK had 0 MHz gain and rolled back |
 | Unit test result | 57/57 passed locally; remote validator timeout target passed after SCP deployment |
 | Beta archive path / SHA256 / size | Final archive pending. `upload270426.zip` is explicitly rejected: wrong root layout and contains `.git`, DCPs, and an SSH private key |
 | Clean `make setup` result | pending |
 | Clean default non-test optimizer result | pending |
 | Remaining blocker | None; SSH, setup, remote tests, and same-DCP validation are working |
-| Exact next command | Continue Task 2 with `corescore_500_mod_2025.1.dcp`, then validate any positive incumbent before advancing |
+| Exact next command | Continue Task 2 with `finn_radioml_2025.1.dcp`, then validate any positive incumbent before advancing |
 
 ## Safety and Recovery
 
