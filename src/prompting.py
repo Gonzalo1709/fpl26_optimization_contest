@@ -32,7 +32,7 @@ Rules for the controller interface:
 - FANOUT args: {"top_n_nets": int from 1 to 10}
 - PHYS_OPT args: {"directive": one value provided by the PHYS_OPT schema}
 - PBLOCK args: {}
-- CELL_RELOCATE args: {"num_paths": int from 3 to 20, "detour_threshold": float from 1.2 to 4.0, "max_cells": int from 1 to 5}
+- CELL_RELOCATE args: {"num_paths": int from 3 to 20, "detour_threshold": float from 1.2 to 4.0, "max_cells": int from 1 to 5, "max_move_distance": int from 5 to 80 tiles}
 - HARD_BLOCK args: {"hard_block_types": subset of the provided eligible resource types}
 - NO_OP args: {}
 - Return ONLY JSON.

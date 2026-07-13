@@ -186,6 +186,21 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="analyze_fanout_geography",
+            description="Measure sink span and clock status for candidate high-fanout physical nets.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "net_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Candidate physical net names from target-clock timing analysis"
+                    }
+                },
+                "required": ["net_names"]
+            }
+        ),
+        Tool(
             name="optimize_fanout",
             description="Optimize high fanout nets by splitting them into multiple driven nets. This reduces fanout by replicating the source driver and can improve timing and routability.",
             inputSchema={
@@ -407,6 +422,11 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Maximum number of cells to process (default: 10)",
                         "default": 10
+                    },
+                    "max_move_distance": {
+                        "type": "integer",
+                        "description": "Maximum Manhattan tile distance for a local relocation (default: 30)",
+                        "default": 30
                     }
                 },
                 "required": ["cell_names"]
@@ -521,6 +541,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 hierarchical_input_pins=arguments["hierarchical_input_pins"]
             )
         
+        elif name == "analyze_fanout_geography":
+            result = rw.analyze_fanout_geography(
+                net_names=arguments["net_names"]
+            )
+
         elif name == "optimize_fanout":
             result = rw.optimize_fanout(
                 net_name=arguments["net_name"],
@@ -568,7 +593,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         elif name == "optimize_cell_placement":
             result = rw.optimize_cell_placement(
                 cell_names=arguments["cell_names"],
-                max_candidates=arguments.get("max_candidates", 10)
+                max_candidates=arguments.get("max_candidates", 10),
+                max_move_distance=arguments.get("max_move_distance", 30)
             )
 
         elif name == "hard_block_column_cascade_relocation":

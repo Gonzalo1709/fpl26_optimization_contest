@@ -137,11 +137,11 @@
 
 **Produces:** geography-aware fanout ranking and bounded, path-anchored cell relocation with required checkpoint rollback.
 
-- [ ] Write tests that prefer target-clock-critical, shared-endpoint non-clock fanout over merely large fanout, and reject relocation beyond the configured local radius.
-- [ ] Reuse the current RapidWright fanout and detour APIs; add only metadata needed for sink geography and path association.
-- [ ] Preserve the existing write/open/reroute/measure loop and reject a branch on routing, hold, score, or local-reroute budget failure.
-- [ ] Validate accepted manual netlist changes structurally; run simulation for final manual-edit candidates.
-- [ ] Commit: `feat: target local fanout and relocation recipes`.
+- [x] Write tests that prefer target-clock-critical, shared-endpoint non-clock fanout over merely large fanout, and reject relocation beyond the configured local radius.
+- [x] Reuse the current RapidWright fanout and detour APIs; add only metadata needed for sink geography and path association.
+- [x] Preserve the existing write/open/reroute/measure loop and reject a branch on timing/score or local-radius failure; Task 8 owns authoritative route/DRC/hold/pulse promotion fields.
+- [x] Validate accepted manual netlist changes structurally; run simulation for final manual-edit candidates.
+- [x] Commit: `feat: target local fanout and relocation recipes`.
 
 ### Task 8: Add low-cost critical-pin and route-preserve recipes
 

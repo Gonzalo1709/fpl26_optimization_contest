@@ -8,6 +8,30 @@ from src.analysis import DesignSignature
 from src.scoring import ValidationStatus
 
 
+def rank_fanout_candidates(
+    candidates: Iterable[dict],
+    blacklist: Iterable[str] = (),
+) -> tuple[dict, ...]:
+    """Rank non-clock fanout evidence by shared critical paths and geography."""
+    blocked = set(blacklist)
+    eligible = [
+        dict(candidate)
+        for candidate in candidates
+        if candidate.get("net_name") not in blocked
+        and not bool(candidate.get("is_clock"))
+        and int(candidate.get("critical_path_count", 0)) > 0
+    ]
+    eligible.sort(
+        key=lambda candidate: (
+            int(candidate.get("critical_path_count", 0)),
+            float(candidate.get("sink_span", 0.0)),
+            int(candidate.get("fanout", 0)),
+        ),
+        reverse=True,
+    )
+    return tuple(eligible)
+
+
 @dataclass(frozen=True)
 class BudgetState:
     remaining_runtime_seconds: float = inf
@@ -165,6 +189,7 @@ def gate_actions(
                     "num_paths": min(10, spread.paths_analyzed),
                     "detour_threshold": 2.0,
                     "max_cells": 3,
+                    "max_move_distance": 30,
                 },
                 reason="target-clock paths have measurable physical spread",
             )

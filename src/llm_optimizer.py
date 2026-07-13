@@ -17,7 +17,7 @@ from openai import OpenAI
 from src.analysis import DesignSignature, require_target_clock_wns
 from src.base import DCPOptimizerBase
 from src.parsers import parse_spread_analysis, parse_timing_summary_static, spread_recommends_pblock
-from src.policy import BudgetState, EligibleAction, gate_actions
+from src.policy import BudgetState, EligibleAction, gate_actions, rank_fanout_candidates
 from src.prompting import DEFAULT_SYSTEM_PROMPT_PATH, build_planner_system_prompt, prompt_sha256
 from src.scoring import ContestScoreInput, ValidationStatus, calculate_contest_score
 from src.search import GenerationSearchConfig, SearchCandidate
@@ -754,10 +754,17 @@ class DCPOptimizer(DCPOptimizerBase):
                 max_cells = 3
             max_cells = max(1, min(5, max_cells))
 
+            try:
+                max_move_distance = int(args.get("max_move_distance", 30))
+            except (TypeError, ValueError):
+                max_move_distance = 30
+            max_move_distance = max(5, min(80, max_move_distance))
+
             return strategy, {
                 "num_paths": num_paths,
                 "detour_threshold": detour_threshold,
                 "max_cells": max_cells,
+                "max_move_distance": max_move_distance,
             }
 
         if strategy == "PHYS_OPT":
@@ -1146,21 +1153,49 @@ class DCPOptimizer(DCPOptimizerBase):
 
         nets_report = ""
         self.high_fanout_nets = []
-        analysis_attempts = [
+        nets_report = await self.v(
+            "get_critical_high_fanout_nets",
             {"num_paths": 50, "min_fanout": 100, "exclude_clocks": True},
-            # Fall back to the broader scan if strict filtering leaves us with
-            # nothing; this keeps FANOUT usable on designs dominated by control
-            # or clock-like naming conventions.
-            {"num_paths": 50, "min_fanout": 100, "exclude_clocks": False},
-        ]
-        for analysis_args in analysis_attempts:
-            nets_report = await self.v("get_critical_high_fanout_nets", analysis_args)
-            self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
-            if self._fanout_candidates_available():
-                break
+        )
+        self.high_fanout_nets = self.parse_high_fanout_nets(nets_report)
+
+        geography_by_name = {}
+        if self.high_fanout_nets:
+            geography_report = await self.rw(
+                "analyze_fanout_geography",
+                {"net_names": [net_name for net_name, _, _ in self.high_fanout_nets]},
+            )
+            try:
+                geography_payload = json.loads(geography_report)
+                geography_by_name = {
+                    item["net_name"]: item
+                    for item in geography_payload.get("nets", [])
+                    if "net_name" in item
+                }
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("Could not parse fanout geography; using timing evidence only")
+
+        ranked_evidence = rank_fanout_candidates(
+            [
+                {
+                    "net_name": net_name,
+                    "fanout": fanout,
+                    "critical_path_count": path_count,
+                    "is_clock": geography_by_name.get(net_name, {}).get("is_clock", False),
+                    "sink_span": geography_by_name.get(net_name, {}).get("sink_span", 0),
+                }
+                for net_name, fanout, path_count in self.high_fanout_nets
+            ],
+            blacklist=self.fanout_blacklist,
+        )
         nets_to_optimize = [
-            net_info for net_info in self.high_fanout_nets if net_info[0] not in self.fanout_blacklist
-        ][:top_n_nets]
+            (
+                item["net_name"],
+                int(item["fanout"]),
+                int(item["critical_path_count"]),
+            )
+            for item in ranked_evidence[:top_n_nets]
+        ]
         if not nets_to_optimize:
             raise ValueError("No critical high-fanout nets are available in the current design state.")
 
@@ -1214,8 +1249,16 @@ class DCPOptimizer(DCPOptimizerBase):
         num_paths: int = 10,
         detour_threshold: float = 2.0,
         max_cells: int = 3,
+        max_move_distance: int = 30,
     ) -> str:
         """Relocate detour-heavy cells identified on critical paths."""
+        baseline_checkpoint = Path(self.temp_dir) / f"cell_relocate_before_{self.iteration}.dcp"
+        await self.v(
+            "write_checkpoint",
+            {"dcp_path": str(baseline_checkpoint.resolve()), "force": True},
+        )
+        baseline_report = await self.v("report_timing_summary")
+        baseline_metrics = await self._measure_current_metrics(baseline_report)
         pins_file = Path(self.temp_dir) / f"critical_path_pins_iter_{self.iteration}.json"
 
         await self.v(
@@ -1240,7 +1283,7 @@ class DCPOptimizer(DCPOptimizerBase):
         candidates = detour_data.get("candidates", [])
         if not candidates:
             print("No detour-heavy critical cells found; measuring without relocation.")
-            return await self.v("report_timing_summary")
+            return baseline_report
 
         prioritized_candidates = sorted(
             candidates,
@@ -1263,7 +1306,7 @@ class DCPOptimizer(DCPOptimizerBase):
 
         if not prioritized_cells:
             print("Detour analysis returned candidates, but no valid cells were selected.")
-            return await self.v("report_timing_summary")
+            return baseline_report
 
         print("Relocating detour-heavy cells: " + ", ".join(prioritized_cells))
         relocation_report = await self.rw(
@@ -1271,6 +1314,7 @@ class DCPOptimizer(DCPOptimizerBase):
             {
                 "cell_names": prioritized_cells,
                 "max_candidates": max_cells,
+                "max_move_distance": max_move_distance,
             },
         )
         relocation_data = json.loads(relocation_report)
@@ -1288,7 +1332,12 @@ class DCPOptimizer(DCPOptimizerBase):
 
         await self.v("open_checkpoint", {"dcp_path": str(temp_dcp.resolve())})
         report, _ = await self._reroute_and_measure()
-        return report
+        current_metrics = await self._measure_current_metrics(report)
+        if self._is_metrics_improvement(current_metrics, baseline_metrics):
+            return report
+
+        await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
+        return baseline_report
 
     async def run_phys_opt_flow(self, directive: str = "RuntimeOptimized") -> str:
         """Execute one independently measured phys-opt portfolio attempt."""
@@ -1499,6 +1548,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 "num_paths": "int (3-20)",
                 "detour_threshold": "float (1.2-4.0)",
                 "max_cells": "int (1-5)",
+                "max_move_distance": "int (5-80 tiles)",
             },
             "PHYS_OPT": {"directive": ["RuntimeOptimized"]},
             "HARD_BLOCK": {"hard_block_types": ["DSP", "BRAM", "URAM"]},
