@@ -13,6 +13,8 @@ from typing import Optional
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from src.mcp import build_rapidwright_mcp_env
+
 logger = logging.getLogger(__name__)
 
 
@@ -84,11 +86,11 @@ class DCPOptimizerBase:
                 "--mcp-log", str(rapidwright_mcp_log),
             ])
 
-        env = {**os.environ}
-        rapidwright_submodule = repo_root / "RapidWright"
-        if rapidwright_submodule.is_dir() and "RAPIDWRIGHT_PATH" not in env:
-            env["RAPIDWRIGHT_PATH"] = str(rapidwright_submodule)
-            env["CLASSPATH"] = f"{rapidwright_submodule}/bin:{rapidwright_submodule}/jars/*"
+        env = build_rapidwright_mcp_env(
+            repo_root,
+            os.environ,
+            vivado_exec=os.environ.get("VIVADO_EXEC"),
+        )
 
         rapidwright_config = {
             "command": sys.executable,

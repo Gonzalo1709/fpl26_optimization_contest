@@ -30,6 +30,8 @@ from typing import Optional, Tuple
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from src.mcp import build_rapidwright_mcp_env
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -88,7 +90,12 @@ class DCPValidator:
         rapidwright_config = {
             "command": sys.executable,
             "args": rapidwright_args,
-            "env": {**os.environ}
+            "cwd": str(self.temp_dir),
+            "env": build_rapidwright_mcp_env(
+                script_dir,
+                os.environ,
+                vivado_exec=os.environ.get("VIVADO_EXEC"),
+            ),
         }
         
         logger.info("Starting RapidWright MCP server...")

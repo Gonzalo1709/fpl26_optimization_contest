@@ -70,7 +70,7 @@ help:
 	@echo "  build-rapidwright  - Build RapidWright from source (git submodule)"
 	@echo "  run_optimizer      - Run optimizer on a DCP file (LLM-guided, requires API key)"
 	@echo "  run_test           - Run optimizer in test mode (no LLM, hardcoded optimization)"
-	@echo "  validate           - Validate functional equivalence between two DCPs"
+	@echo "  validate           - Validate equivalence (configures Java/RapidWright automatically)"
 	@echo "  validate_demo      - Run validation demo (self-check)"
 	@echo "  clean              - Remove generated files (run directories, logs, Vivado outputs)"
 	@echo "  veryclean          - Remove all generated files including example DCPs"
@@ -88,7 +88,7 @@ help:
 	@echo ""
 	@echo "Environment variables:"
 	@echo "  VIVADO_EXEC     - Path to Vivado executable (default: vivado)"
-	@echo "  JAVA_HOME       - Java installation directory (auto-detected from PATH if not set)"
+	@echo "  JAVA_HOME       - Java installation directory (auto-detected from PATH or Vivado)"
 	@echo "  RUN_CWD         - Working directory for optimizer/test execution (default: repo root)"
 	@echo "  DCP             - Input DCP file for run_optimizer / run_test targets"
 	@echo "  MAX_NETS        - Max high fanout nets to optimize in test mode (default: 5)"
@@ -315,6 +315,7 @@ validate:
 	@printf "$(COLOR_GREEN)Golden DCP:$(COLOR_RESET)  $(GOLDEN)\n"
 	@printf "$(COLOR_GREEN)Revised DCP:$(COLOR_RESET) $(REVISED)\n"
 	@printf "$(COLOR_GREEN)Test Vectors:$(COLOR_RESET) $(or $(VECTORS),10000)\n"
+	@printf "$(COLOR_GREEN)Java source:$(COLOR_RESET) JAVA_HOME, PATH, or the VIVADO_EXEC bundled JRE\n"
 	@echo ""
 	@if [ -n "$(VECTORS)" ]; then \
 		$(PYTHON) validate_dcps.py "$(GOLDEN)" "$(REVISED)" --vectors $(VECTORS); \
