@@ -13,8 +13,9 @@ from typing import Optional
 
 from openai import OpenAI
 
+from src.analysis import DesignSignature, require_target_clock_wns
 from src.base import DCPOptimizerBase
-from src.parsers import parse_timing_summary_static
+from src.parsers import parse_spread_analysis, parse_timing_summary_static, spread_recommends_pblock
 from src.prompting import DEFAULT_SYSTEM_PROMPT_PATH, build_planner_system_prompt, prompt_sha256
 from src.scoring import ContestScoreInput, ValidationStatus, calculate_contest_score
 from src.search import GenerationSearchConfig, SearchCandidate
@@ -88,6 +89,7 @@ class DCPOptimizer(DCPOptimizerBase):
         self.history: list[dict] = []
         self.fanout_blacklist: dict[str, str] = {}
         self.validation_status = ValidationStatus()
+        self.design_signature: Optional[DesignSignature] = None
 
     def _extract_llm_text(self, response) -> str:
         """Best-effort extraction of text content from a chat completion response."""
@@ -444,6 +446,7 @@ class DCPOptimizer(DCPOptimizerBase):
 
     async def perform_initial_analysis(self, input_dcp: Path) -> str:
         """Perform deterministic startup analysis before the optimization loop begins."""
+        analysis_started = time.time()
         logger.info("Performing initial design analysis...")
         print("\n=== Initial Design Analysis ===\n")
 
@@ -467,7 +470,7 @@ class DCPOptimizer(DCPOptimizerBase):
 
         self.clock_period = await super().get_clock_period(self._call_vivado_tool)
         target_wns = await super().get_wns_for_target_clock(self._call_vivado_tool)
-        self.initial_wns = target_wns if target_wns is not None else timing_info["wns"]
+        self.initial_wns = require_target_clock_wns(target_wns)
         self.best_wns = self.initial_wns if self.initial_wns is not None else float("-inf")
 
         clock_info = f" (clock: {self.target_clock})" if self.target_clock else ""
@@ -497,6 +500,8 @@ class DCPOptimizer(DCPOptimizerBase):
         print(f"✓ Found {len(self.high_fanout_nets)} high fanout nets (>100 fanout)\n")
 
         critical_path_spread_info = None
+        spread_result = None
+        critical_paths_report = None
 
         print("Loading design in RapidWright for spread analysis...")
         result = await self.call_tool("rapidwright_read_checkpoint", {"dcp_path": str(input_dcp.resolve())})
@@ -510,25 +515,51 @@ class DCPOptimizer(DCPOptimizerBase):
                 "vivado_extract_critical_path_cells",
                 {"num_paths": 50, "output_file": str(temp_path)},
             )
+            try:
+                critical_paths_report = temp_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                logger.warning("Could not read critical-path analysis file: %s", exc)
             spread_result = await self.call_tool(
                 "rapidwright_analyze_critical_path_spread",
                 {"input_file": str(temp_path)},
             )
 
             try:
-                spread_data = json.loads(spread_result)
-                critical_path_spread_info = {
-                    "max_distance": spread_data.get("max_distance_found", 0),
-                    "avg_distance": spread_data.get("avg_max_distance", 0),
-                    "paths_analyzed": spread_data.get("paths_analyzed", 0),
-                }
+                critical_path_spread_info = parse_spread_analysis(spread_result)
+                if critical_path_spread_info is None:
+                    raise ValueError("spread report was unavailable or malformed")
                 print("✓ Critical path spread analyzed:")
                 print(f"  - Max distance: {critical_path_spread_info['max_distance']} tiles")
                 print(f"  - Avg distance: {critical_path_spread_info['avg_distance']:.1f} tiles")
                 print(f"  - Paths analyzed: {critical_path_spread_info['paths_analyzed']}")
                 print()
-            except (json.JSONDecodeError, KeyError) as exc:
+            except (KeyError, ValueError) as exc:
                 print(f"⚠ Warning: Could not parse spread results: {exc}")
+
+        congestion_report = None
+        try:
+            congestion_report = await self.call_tool(
+                "vivado_run_tcl",
+                {
+                    "command": "report_design_analysis -congestion -return_string",
+                    "timeout": 60,
+                },
+            )
+        except Exception as exc:
+            logger.warning("Optional congestion analysis unavailable: %s", exc)
+
+        self.design_signature = DesignSignature.from_reports(
+            target_clock=self.target_clock or "clk_fpl26contest",
+            clock_period_ns=self.clock_period,
+            wns_ns=self.initial_wns,
+            tns_ns=self.initial_tns,
+            failing_endpoints=self.initial_failing_endpoints,
+            high_fanout_report=nets_report,
+            spread_report=spread_result,
+            analysis_duration_seconds=time.time() - analysis_started,
+            critical_paths_report=critical_paths_report,
+            congestion_report=congestion_report,
+        )
 
         summary = ["=== Initial Design Analysis ===\n", "TIMING STATUS:"]
         if self.clock_period is not None:
@@ -553,7 +584,7 @@ class DCPOptimizer(DCPOptimizerBase):
             summary.append(f"  Max cell distance: {critical_path_spread_info['max_distance']} tiles")
             summary.append(f"  Avg cell distance: {critical_path_spread_info['avg_distance']:.1f} tiles")
             summary.append(f"  Paths analyzed: {critical_path_spread_info['paths_analyzed']}")
-            if critical_path_spread_info["avg_distance"] > 70 and critical_path_spread_info["paths_analyzed"] >= 5:
+            if spread_recommends_pblock(critical_path_spread_info):
                 summary.append("  ⚠ RECOMMENDATION: Use PBLOCK strategy (high spread detected)")
             summary.append("")
 
@@ -569,6 +600,9 @@ class DCPOptimizer(DCPOptimizerBase):
 
         summary.append("")
         summary.append(f"Total nets available for optimization: {len(self.high_fanout_nets)}")
+        summary.append("")
+        summary.append("DESIGN SIGNATURE:")
+        summary.append(json.dumps(self.design_signature.to_dict(), sort_keys=True))
 
         summary_text = "\n".join(summary)
         print(summary_text)
@@ -2217,6 +2251,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 "path": str(self.system_prompt_path),
                 "sha256_16": self.system_prompt_hash,
             },
+            "design_signature": self.design_signature.to_dict() if self.design_signature else None,
             "generation_search": {
                 "config": asdict(self.generation_config),
                 "best_candidate_id": self.best_candidate.candidate_id if self.best_candidate else None,
