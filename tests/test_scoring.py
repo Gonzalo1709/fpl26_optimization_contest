@@ -23,6 +23,19 @@ class ContestScoringTests(unittest.TestCase):
         )
 
         self.assertEqual(result.projected_score, 0.0)
+        self.assertEqual(result.score_status, "no_fmax_gain")
+
+    def test_negative_fmax_delta_reports_clamped_gain(self):
+        result = calculate_contest_score(
+            ContestScoreInput(
+                delta_fmax_mhz=-5.0,
+                llm_cost_usd=0.0,
+                runtime_seconds=0.0,
+            )
+        )
+
+        self.assertEqual(result.projected_score, 0.0)
+        self.assertEqual(result.score_status, "negative_gain_clamped")
 
     def test_official_example_includes_cost_and_runtime_penalties(self):
         result = calculate_contest_score(
@@ -66,6 +79,7 @@ class ContestScoringTests(unittest.TestCase):
 
         self.assertFalse(result.validation.complete)
         self.assertIsNone(result.validated_score)
+        self.assertEqual(result.score_status, "validation_pending")
 
     def test_failed_validation_forces_validated_score_to_zero(self):
         result = calculate_contest_score(
@@ -87,6 +101,27 @@ class ContestScoringTests(unittest.TestCase):
         self.assertTrue(result.validation.complete)
         self.assertFalse(result.validation.passed)
         self.assertEqual(result.validated_score, 0.0)
+        self.assertEqual(result.score_status, "validation_failed")
+
+    def test_positive_validated_score_reports_positive(self):
+        result = calculate_contest_score(
+            ContestScoreInput(
+                delta_fmax_mhz=5.0,
+                llm_cost_usd=0.0,
+                runtime_seconds=0.0,
+                validation=ValidationStatus(
+                    par_routed=True,
+                    par_drc_clean=True,
+                    hold_passed=True,
+                    pulse_width_passed=True,
+                    structural_passed=True,
+                    simulation_passed=True,
+                ),
+            )
+        )
+
+        self.assertEqual(result.validated_score, 5.0)
+        self.assertEqual(result.score_status, "positive")
 
     def test_token_report_contains_projected_score_and_validation_fields(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -113,6 +148,7 @@ class ContestScoringTests(unittest.TestCase):
                 (444.44444444444446 - 400.0) * 0.9416666666666667,
             )
             self.assertIsNone(summary["validated_contest_score"])
+            self.assertEqual(summary["score_status"], "validation_pending")
             self.assertEqual(
                 summary["validation"],
                 {

@@ -16,6 +16,17 @@ It is clamped at zero. Fmax must be computed only from `clk_fpl26contest` as
 routing, DRC, hold, pulse-width, structural, and required simulation checks have
 all passed.
 
+`token_usage.json` also records `score_status` so a numeric zero or pending
+validation cannot be misread:
+
+| Status | Meaning |
+| --- | --- |
+| `positive` | The Fmax gain is positive and every required validation gate passed. |
+| `no_fmax_gain` | The retained checkpoint has exactly zero target-clock Fmax gain, normally after rollback to the root. |
+| `negative_gain_clamped` | The candidate target-clock Fmax regressed and the contest formula clamped the projected score to zero. |
+| `validation_pending` | The projected gain is positive, but one or more required validation gates remain unknown. |
+| `validation_failed` | Validation completed with at least one failed gate, forcing validated score to zero. |
+
 ## Promotion rule
 
 Promote a recipe, policy, search setting, or prompt only when a fixed benchmark

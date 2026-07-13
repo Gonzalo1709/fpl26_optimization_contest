@@ -63,6 +63,7 @@ class ContestScore:
     projected_score: float
     validation: ValidationStatus
     validated_score: float | None
+    score_status: str
 
 
 def target_clock_fmax_mhz(period_ns: float, wns_ns: float) -> float | None:
@@ -71,6 +72,23 @@ def target_clock_fmax_mhz(period_ns: float, wns_ns: float) -> float | None:
     if period_ns <= 0 or achievable_period_ns <= 0:
         return None
     return 1000.0 / achievable_period_ns
+
+
+def classify_score_status(
+    delta_fmax_mhz: float,
+    projected_score: float,
+    validation: ValidationStatus,
+) -> str:
+    """Explain whether a score is positive, clamped, pending, or invalid."""
+    if validation.complete and not validation.passed:
+        return "validation_failed"
+    if delta_fmax_mhz < 0:
+        return "negative_gain_clamped"
+    if delta_fmax_mhz == 0:
+        return "no_fmax_gain"
+    if not validation.complete:
+        return "validation_pending"
+    return "positive"
 
 
 def calculate_contest_score(score_input: ContestScoreInput) -> ContestScore:
@@ -90,6 +108,11 @@ def calculate_contest_score(score_input: ContestScoreInput) -> ContestScore:
         validated_score = projected_score if score_input.validation.passed else 0.0
     else:
         validated_score = None
+    score_status = classify_score_status(
+        score_input.delta_fmax_mhz,
+        projected_score,
+        score_input.validation,
+    )
 
     return ContestScore(
         delta_fmax_mhz=score_input.delta_fmax_mhz,
@@ -99,4 +122,5 @@ def calculate_contest_score(score_input: ContestScoreInput) -> ContestScore:
         projected_score=projected_score,
         validation=score_input.validation,
         validated_score=validated_score,
+        score_status=score_status,
     )

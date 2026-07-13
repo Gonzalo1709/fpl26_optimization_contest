@@ -2565,6 +2565,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 "score_penalty_multiplier": contest_score.penalty_multiplier if contest_score else None,
                 "projected_contest_score": contest_score.projected_score if contest_score else None,
                 "validated_contest_score": contest_score.validated_score if contest_score else None,
+                "score_status": contest_score.score_status if contest_score else None,
                 "validation": validation_summary,
                 "total_tool_calls": len(self.tool_call_details),
                 "total_tool_time_seconds": total_tool_time,
