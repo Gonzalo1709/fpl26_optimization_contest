@@ -32,7 +32,7 @@ def make_signature(
 
 
 class RecipePolicyTests(unittest.TestCase):
-    def test_pblock_requires_extreme_spread_or_congestion_corroboration(self):
+    def test_pblock_requires_extreme_multi_path_spread(self):
         logicnets_like = make_signature(
             spread={
                 "max_distance_found": 198,
@@ -62,7 +62,7 @@ class RecipePolicyTests(unittest.TestCase):
         self.assertIn(
             "PBLOCK", {action.strategy for action in gate_actions(rosetta_like)}
         )
-        self.assertIn(
+        self.assertNotIn(
             "PBLOCK", {action.strategy for action in gate_actions(congested)}
         )
 
@@ -123,6 +123,21 @@ class RecipePolicyTests(unittest.TestCase):
 
         self.assertNotIn("HARD_BLOCK", no_hard_block)
         self.assertIn("HARD_BLOCK", with_bram)
+
+    def test_rejects_hard_block_for_low_spread_congestion_only_signature(self):
+        vex_like = make_signature(
+            critical_paths=[["cache/RAMB36E2", "top/out_reg"]],
+            spread={
+                "max_distance_found": 93,
+                "avg_max_distance": 53.5,
+                "paths_analyzed": 50,
+            },
+            congestion_report="Global Horizontal Congestion: 5",
+        )
+
+        strategies = {action.strategy for action in gate_actions(vex_like)}
+
+        self.assertNotIn("HARD_BLOCK", strategies)
 
     def test_phys_opt_remains_eligible_on_ambiguous_inputs(self):
         strategies = {

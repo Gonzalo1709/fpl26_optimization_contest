@@ -23,12 +23,13 @@ Recipe guidance:
 - FANOUT is for non-clock nets shared by several target-clock critical paths.
   Path incidence is more important than raw fanout.
 - PBLOCK is a specialist action. Prefer it only for extreme multi-path spread
-  (roughly average at least 120 tiles and maximum at least 150) or for strong
-  spread corroborated by severe congestion. Do not infer PBLOCK merely from a
-  large maximum distance on one path.
+  (average at least 120 tiles and maximum at least 150 across at least five
+  sampled paths). Congestion alone does not admit PBLOCK. Do not infer it from
+  a large maximum distance on one path.
 - HARD_BLOCK is a specialist action for DSP, BRAM, or URAM types that actually
-  occur on sampled target-clock paths and have locality evidence. Let the
-  controller reject it when RapidWright finds no legal local move.
+  occur on sampled target-clock paths and have average path spread of at least
+  80 tiles. Congestion alone is not locality evidence. Let the controller
+  reject it when RapidWright finds no legal local move.
 - NO_OP retains the legal incumbent when the reserve is reached or no action has
   credible upside.
 

@@ -13,6 +13,7 @@ final validation step for a candidate prompt.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -47,13 +48,25 @@ class EvalExample:
 class PromptEvalResult:
     prompt_path: Optional[Path]
     prompt_hash: str
+    examples_hash: str
+    model: str
     mean_score: float
     examples: list[dict[str, Any]]
 
 
+def examples_sha256(path: Path) -> str:
+    """Return a stable short hash for the exact offline evaluation corpus."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def write_utf8_text(path: Path, text: str) -> None:
+    """Write portable prompt/evaluation artifacts with an explicit encoding."""
+    path.write_text(text, encoding="utf-8")
+
+
 def load_eval_examples(path: Path) -> list[EvalExample]:
     examples: list[EvalExample] = []
-    with path.open() as handle:
+    with path.open(encoding="utf-8") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
             line = raw_line.strip()
             if not line or line.startswith("#"):
@@ -118,7 +131,14 @@ def sanitize_action(action: dict[str, Any]) -> tuple[str, dict[str, Any], list[s
 
     if strategy == "PHYS_OPT":
         directive = args.get("directive", "Default")
-        if directive not in ["Explore", "AggressiveExplore", "Default"]:
+        if directive not in [
+            "RuntimeOptimized",
+            "CriticalPin",
+            "PlacementRouting",
+            "Explore",
+            "AggressiveExplore",
+            "Default",
+        ]:
             issues.append("PHYS_OPT directive is not supported")
             directive = "Default"
         return "PHYS_OPT", {"directive": directive}, issues
@@ -127,6 +147,68 @@ def sanitize_action(action: dict[str, Any]) -> tuple[str, dict[str, Any], list[s
         if args:
             issues.append("PBLOCK args should be empty")
         return "PBLOCK", {}, issues
+
+    if strategy in {"CRITICAL_PIN", "NO_OP"}:
+        if args:
+            issues.append(f"{strategy} args should be empty")
+        return strategy, {}, issues
+
+    if strategy == "ROUTE_PRESERVE":
+        try:
+            max_nets = int(args.get("max_nets", 4))
+        except (TypeError, ValueError):
+            max_nets = 4
+            issues.append("ROUTE_PRESERVE max_nets was not an integer")
+        try:
+            min_delay = float(args.get("min_net_delay_ns", 0.2))
+        except (TypeError, ValueError):
+            min_delay = 0.2
+            issues.append("ROUTE_PRESERVE min_net_delay_ns was not numeric")
+        if not 1 <= max_nets <= 8:
+            issues.append("ROUTE_PRESERVE max_nets must be in 1..8")
+        if not 0.05 <= min_delay <= 2.0:
+            issues.append("ROUTE_PRESERVE min_net_delay_ns must be in 0.05..2.0")
+        return "ROUTE_PRESERVE", {
+            "max_nets": max(1, min(8, max_nets)),
+            "min_net_delay_ns": max(0.05, min(2.0, min_delay)),
+        }, issues
+
+    if strategy == "CELL_RELOCATE":
+        def bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+            try:
+                value = int(args.get(name, default))
+            except (TypeError, ValueError):
+                value = default
+                issues.append(f"CELL_RELOCATE {name} was not an integer")
+            if not minimum <= value <= maximum:
+                issues.append(f"CELL_RELOCATE {name} must be in {minimum}..{maximum}")
+            return max(minimum, min(maximum, value))
+
+        try:
+            detour_threshold = float(args.get("detour_threshold", 2.0))
+        except (TypeError, ValueError):
+            detour_threshold = 2.0
+            issues.append("CELL_RELOCATE detour_threshold was not numeric")
+        if not 1.0 <= detour_threshold <= 10.0:
+            issues.append("CELL_RELOCATE detour_threshold must be in 1.0..10.0")
+        detour_threshold = max(1.0, min(10.0, detour_threshold))
+
+        return "CELL_RELOCATE", {
+            "num_paths": bounded_int("num_paths", 10, 3, 20),
+            "detour_threshold": detour_threshold,
+            "max_cells": bounded_int("max_cells", 3, 1, 5),
+            "max_move_distance": bounded_int("max_move_distance", 30, 5, 80),
+        }, issues
+
+    if strategy == "HARD_BLOCK":
+        types = args.get("hard_block_types") or ["DSP", "BRAM", "URAM"]
+        if isinstance(types, str):
+            types = [types]
+        allowed = {"DSP", "BRAM", "URAM"}
+        sanitized = [str(item) for item in types if str(item) in allowed]
+        if not sanitized:
+            issues.append("HARD_BLOCK requires at least one supported hard-block type")
+        return "HARD_BLOCK", {"hard_block_types": sanitized or sorted(allowed)}, issues
 
     issues.append(f"unknown strategy: {strategy}")
     return "INVALID", {}, issues
@@ -163,15 +245,29 @@ def score_action(action: Optional[dict[str, Any]], parse_error: str, example: Ev
             feedback.append(f"FANOUT top_n_nets should be in {min_top}..{max_top}.")
     elif strategy == "PHYS_OPT":
         directive = args.get("directive")
-        allowed = example.allowed_directives or ["Explore", "AggressiveExplore", "Default"]
+        allowed = example.allowed_directives or [
+            "RuntimeOptimized",
+            "CriticalPin",
+            "PlacementRouting",
+            "Explore",
+            "AggressiveExplore",
+            "Default",
+        ]
         if directive in allowed:
             score += 0.2
             feedback.append(f"PHYS_OPT directive {directive} was allowed.")
         else:
             feedback.append(f"PHYS_OPT directive should be one of {allowed}.")
-    elif strategy == "PBLOCK":
+    elif strategy in {
+        "PBLOCK",
+        "CRITICAL_PIN",
+        "ROUTE_PRESERVE",
+        "CELL_RELOCATE",
+        "HARD_BLOCK",
+        "NO_OP",
+    }:
         score += 0.2
-        feedback.append("PBLOCK requires no args.")
+        feedback.append(f"{strategy} output matched its bounded schema.")
 
     if example.feedback_hint:
         feedback.append(example.feedback_hint)
@@ -193,6 +289,7 @@ def call_planner(
             {"role": "user", "content": json.dumps(decision_input)},
         ],
         max_tokens=max_tokens,
+        temperature=0,
         extra_body={"usage": {"include": True}},
     )
     choices = getattr(response, "choices", None) or []
@@ -209,6 +306,7 @@ def evaluate_prompt_text(
     base_prompt: str,
     examples: list[EvalExample],
     prompt_path: Optional[Path] = None,
+    examples_hash: str = "",
 ) -> PromptEvalResult:
     planner_prompt = build_planner_system_prompt(base_prompt=base_prompt)
     per_example: list[dict[str, Any]] = []
@@ -231,6 +329,8 @@ def evaluate_prompt_text(
     return PromptEvalResult(
         prompt_path=prompt_path,
         prompt_hash=prompt_sha256(planner_prompt),
+        examples_hash=examples_hash,
+        model=model,
         mean_score=statistics.mean(item["score"] for item in per_example),
         examples=per_example,
     )
@@ -240,13 +340,15 @@ def write_eval_result(result: PromptEvalResult, output_path: Optional[Path]) -> 
     payload = {
         "prompt_path": str(result.prompt_path) if result.prompt_path else None,
         "prompt_hash": result.prompt_hash,
+        "examples_hash": result.examples_hash,
+        "model": result.model,
         "mean_score": result.mean_score,
         "examples": result.examples,
     }
     text = json.dumps(payload, indent=2)
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text + "\n")
+        write_utf8_text(output_path, text + "\n")
     else:
         print(text)
 
@@ -310,11 +412,19 @@ Return only the rewritten base prompt.
 
 def run_evaluate(args: argparse.Namespace) -> int:
     examples = load_eval_examples(args.examples)
+    corpus_hash = examples_sha256(args.examples)
     client = OpenAI(api_key=args.api_key, base_url=args.base_url)
     results: list[PromptEvalResult] = []
 
     for path in collect_candidate_paths(args.candidate, args.candidates_dir):
-        result = evaluate_prompt_text(client, args.model, load_system_prompt(path), examples, prompt_path=path)
+        result = evaluate_prompt_text(
+            client,
+            args.model,
+            load_system_prompt(path),
+            examples,
+            prompt_path=path,
+            examples_hash=corpus_hash,
+        )
         results.append(result)
         print(f"{path}: mean_score={result.mean_score:.3f}, hash={result.prompt_hash}")
 
@@ -327,33 +437,50 @@ def run_evaluate(args: argparse.Namespace) -> int:
                 {
                     "prompt_path": str(result.prompt_path) if result.prompt_path else None,
                     "prompt_hash": result.prompt_hash,
+                    "examples_hash": result.examples_hash,
+                    "model": result.model,
                     "mean_score": result.mean_score,
                     "examples": result.examples,
                 }
                 for result in sorted(results, key=lambda item: item.mean_score, reverse=True)
             ]
             args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(json.dumps(payload, indent=2) + "\n")
+            write_utf8_text(args.output, json.dumps(payload, indent=2) + "\n")
     return 0
 
 
 def run_gepa_lite(args: argparse.Namespace) -> int:
     examples = load_eval_examples(args.examples)
+    corpus_hash = examples_sha256(args.examples)
     client = OpenAI(api_key=args.api_key, base_url=args.base_url)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     current_prompt = load_system_prompt(args.seed_prompt)
     best_prompt = current_prompt
-    best_result = evaluate_prompt_text(client, args.model, best_prompt, examples, prompt_path=args.seed_prompt)
+    best_result = evaluate_prompt_text(
+        client,
+        args.model,
+        best_prompt,
+        examples,
+        prompt_path=args.seed_prompt,
+        examples_hash=corpus_hash,
+    )
     print(f"seed: mean_score={best_result.mean_score:.3f}, hash={best_result.prompt_hash}")
 
     for iteration in range(1, args.iterations + 1):
         feedback = summarize_feedback(best_result)
         candidate_prompt = propose_gepa_lite_variant(client, args.reflection_model or args.model, best_prompt, feedback)
         candidate_path = args.output_dir / f"candidate_{iteration:03d}.txt"
-        candidate_path.write_text(candidate_prompt.rstrip() + "\n")
+        write_utf8_text(candidate_path, candidate_prompt.rstrip() + "\n")
 
-        result = evaluate_prompt_text(client, args.model, candidate_prompt, examples, prompt_path=candidate_path)
+        result = evaluate_prompt_text(
+            client,
+            args.model,
+            candidate_prompt,
+            examples,
+            prompt_path=candidate_path,
+            examples_hash=corpus_hash,
+        )
         print(f"{candidate_path}: mean_score={result.mean_score:.3f}, hash={result.prompt_hash}")
         write_eval_result(result, args.output_dir / f"candidate_{iteration:03d}.json")
 
@@ -362,7 +489,7 @@ def run_gepa_lite(args: argparse.Namespace) -> int:
             best_result = result
 
     best_path = args.output_dir / "best_SYSTEM_PROMPT.TXT"
-    best_path.write_text(best_prompt.rstrip() + "\n")
+    write_utf8_text(best_path, best_prompt.rstrip() + "\n")
     write_eval_result(best_result, args.output_dir / "best_eval.json")
     print(f"best: mean_score={best_result.mean_score:.3f}, prompt={best_path}")
     return 0
@@ -442,7 +569,7 @@ def run_dspy_gepa(args: argparse.Namespace) -> int:
         optimized_prompt = optimized_prompt.split(marker, 1)[0].rstrip()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(optimized_prompt.rstrip() + "\n")
+    write_utf8_text(args.output, optimized_prompt.rstrip() + "\n")
     print(f"Wrote DSPy GEPA optimized prompt to {args.output}")
     return 0
 

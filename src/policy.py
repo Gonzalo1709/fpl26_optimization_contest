@@ -271,9 +271,8 @@ def gate_actions(
             )
         )
 
-    hard_block_locality_evidence = (
-        (spread is not None and spread.avg_distance >= 80)
-        or bool(signature.congestion and signature.congestion.get("severe"))
+    hard_block_locality_evidence = bool(
+        spread is not None and spread.avg_distance >= 80
     )
     if (
         signature.critical_hard_block_types
@@ -296,23 +295,16 @@ def gate_actions(
         and spread.avg_distance >= 120
         and spread.max_distance >= 150
     )
-    congestion_corroborated_spread = bool(
-        spread
-        and spread.avg_distance >= 70
-        and spread.max_distance >= 120
-        and signature.congestion
-        and signature.congestion.get("severe")
-    )
     if (
         spread
         and spread.paths_analyzed >= 5
-        and (extreme_spread or congestion_corroborated_spread)
+        and extreme_spread
         and budget.remaining_runtime_seconds >= budget.validation_reserve_seconds + 180
     ):
         actions.append(
             EligibleAction(
                 strategy="PBLOCK",
-                reason="multiple target-clock paths have strong physical spread",
+                reason="multiple target-clock paths have extreme physical spread",
             )
         )
 
