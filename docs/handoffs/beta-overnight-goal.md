@@ -51,7 +51,7 @@ Prompt optimization is not a priority: the current production prompt beat both G
 | Promoted policy/search changes | Score-status reporting added without changing score calculation or candidate promotion |
 | Rejected experiments and evidence | pending |
 | Unit test result | 53/53 passed with `.venv/Scripts/python.exe`; score-status targeted tests also pass after TDD implementation |
-| Beta archive path / SHA256 / size | pending |
+| Beta archive path / SHA256 / size | Final archive pending. `upload270426.zip` is explicitly rejected: wrong root layout and contains `.git`, DCPs, and an SSH private key |
 | Clean `make setup` result | pending |
 | Clean default non-test optimizer result | pending |
 | Remaining blocker | Authorized SSH access must be recovered, or the running disposable VM must be explicitly approved for termination/relaunch; the duplicate-start HTTP 409 body overwrote the local ephemeral contest key |
@@ -64,3 +64,4 @@ Prompt optimization is not a priority: the current production prompt beat both G
 - Load OpenRouter credentials only from ignored `.env`; never print or commit them.
 - `make validate` should discover Vivado's bundled JRE. If Java/RapidWright fails and bundled Java is unavailable, use the documented disposable-instance fallback `sudo apt install default-jre` and record that it was required.
 - A regressed candidate must be rolled back. A regressed code experiment must be reverted or left unpromoted rather than stacked with more speculation.
+- Never upload `upload270426.zip`; the read-only preflight in `docs/experiments/2026-07-13-beta-submission-rehearsal.md` proves it contains forbidden artifacts.
