@@ -761,9 +761,16 @@ class DCPOptimizer(DCPOptimizerBase):
             }
 
         if strategy == "PHYS_OPT":
-            directive = args.get("directive", "Default")
-            if directive not in ["Explore", "AggressiveExplore", "Default"]:
-                directive = "Default"
+            directive = args.get("directive", "RuntimeOptimized")
+            if directive not in [
+                "RuntimeOptimized",
+                "CriticalPin",
+                "PlacementRouting",
+                "Default",
+                "Explore",
+                "AggressiveExplore",
+            ]:
+                directive = "RuntimeOptimized"
             return strategy, {"directive": directive}
 
         if strategy == "HARD_BLOCK":
@@ -778,7 +785,7 @@ class DCPOptimizer(DCPOptimizerBase):
         if strategy == "NO_OP":
             return strategy, {}
 
-        return "PHYS_OPT", {"directive": "Default"}
+        return "PHYS_OPT", {"directive": "RuntimeOptimized"}
 
     def _current_budget_state(self) -> BudgetState:
         """Translate configured run limits into the recipe policy budget model."""
@@ -808,7 +815,8 @@ class DCPOptimizer(DCPOptimizerBase):
             return (
                 EligibleAction(
                     strategy="PHYS_OPT",
-                    default_args={"directive": "Default"},
+                    default_args={"directive": "RuntimeOptimized"},
+                    allowed_args={"directive": ["RuntimeOptimized"]},
                     reason="design signature is unavailable; use the conservative fallback",
                 ),
             )
@@ -816,6 +824,7 @@ class DCPOptimizer(DCPOptimizerBase):
             self.design_signature,
             budget=self._current_budget_state(),
             history=self.history,
+            validation=self.validation_status,
         )
         if self.fanout_blacklist:
             available_fanout_names = {
@@ -847,6 +856,10 @@ class DCPOptimizer(DCPOptimizerBase):
             allowed_types = set(eligible[strategy].default_args.get("hard_block_types", []))
             requested_types = [item for item in args["hard_block_types"] if item in allowed_types]
             args["hard_block_types"] = requested_types or sorted(allowed_types)
+        elif strategy == "PHYS_OPT":
+            allowed_directives = eligible[strategy].allowed_args.get("directive", [])
+            if args["directive"] not in allowed_directives:
+                args = dict(eligible[strategy].default_args)
         return strategy, args
 
     def _canonicalize_action_args(self, strategy: str, args: dict) -> dict:
@@ -871,10 +884,8 @@ class DCPOptimizer(DCPOptimizerBase):
                 candidates.extend([("FANOUT", {"top_n_nets": 3}), ("FANOUT", {"top_n_nets": 5})])
             elif eligible.strategy == "PHYS_OPT":
                 candidates.extend(
-                    [
-                        ("PHYS_OPT", {"directive": "Explore"}),
-                        ("PHYS_OPT", {"directive": "AggressiveExplore"}),
-                    ]
+                    ("PHYS_OPT", {"directive": directive})
+                    for directive in eligible.allowed_args.get("directive", [])
                 )
 
         seen: set[str] = set()
@@ -1021,8 +1032,6 @@ class DCPOptimizer(DCPOptimizerBase):
             args = eligible[strategy].default_args
             if strategy == "FANOUT":
                 args = {"top_n_nets": 3}
-            elif strategy == "PHYS_OPT":
-                args = {"directive": "Explore"}
             forced_strategies.append((strategy, args))
         if not forced_strategies:
             return None
@@ -1281,48 +1290,31 @@ class DCPOptimizer(DCPOptimizerBase):
         report, _ = await self._reroute_and_measure()
         return report
 
-    async def run_phys_opt_flow(self, directive: str = "Default") -> str:
-        """Execute a multi-pass Vivado phys_opt recipe."""
+    async def run_phys_opt_flow(self, directive: str = "RuntimeOptimized") -> str:
+        """Execute one independently measured phys-opt portfolio attempt."""
         baseline_checkpoint = Path(self.temp_dir) / "phys_opt_baseline.dcp"
         await self.v("write_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "force": True})
         baseline_report = await self.v("report_timing_summary")
         baseline_metrics = await self._measure_current_metrics(baseline_report)
 
-        directive_sequence = [directive]
-        if self.generation_config.strategy_effort == "fast":
-            directive_sequence = [directive]
-        elif directive == "Default":
-            directive_sequence.extend(["Explore", "AggressiveExplore"])
-        elif directive == "Explore":
-            directive_sequence.append("AggressiveExplore")
+        tool_args_by_mode = {
+            "RuntimeOptimized": {"directive": "RuntimeOptimized"},
+            "CriticalPin": {"critical_pin_opt": True},
+            "PlacementRouting": {"placement_opt": True, "routing_opt": True},
+            "Default": {"directive": "Default"},
+            "Explore": {"directive": "Explore"},
+            "AggressiveExplore": {"directive": "AggressiveExplore"},
+        }
+        tool_args = tool_args_by_mode.get(directive, tool_args_by_mode["RuntimeOptimized"])
+        await self.v("phys_opt_design", tool_args)
+        report = await self.v("report_timing_summary")
+        current_metrics = await self._measure_current_metrics(report)
 
-        if self.generation_config.strategy_effort == "thorough":
-            for extra_directive in ["Default", "Explore", "AggressiveExplore"]:
-                if extra_directive not in directive_sequence:
-                    directive_sequence.append(extra_directive)
+        if self._is_metrics_improvement(current_metrics, baseline_metrics):
+            return report
 
-        best_report: Optional[str] = baseline_report
-        best_metrics = baseline_metrics
-        best_checkpoint = baseline_checkpoint
-
-        for pass_index, current_directive in enumerate(directive_sequence, start=1):
-            checkpoint_path = Path(self.temp_dir) / f"phys_opt_before_{pass_index:02d}.dcp"
-            await self.v("write_checkpoint", {"dcp_path": str(checkpoint_path.resolve()), "force": True})
-            await self.v("phys_opt_design", {"directive": current_directive})
-            report = await self.v("report_timing_summary")
-            current_metrics = await self._measure_current_metrics(report)
-
-            if self._is_metrics_improvement(current_metrics, best_metrics):
-                best_metrics = current_metrics
-                best_report = report
-                best_checkpoint = Path(self.temp_dir) / f"phys_opt_best_{pass_index:02d}.dcp"
-                await self.v("write_checkpoint", {"dcp_path": str(best_checkpoint.resolve()), "force": True})
-                continue
-
-            await self.v("open_checkpoint", {"dcp_path": str(checkpoint_path.resolve())})
-
-        await self.v("open_checkpoint", {"dcp_path": str(best_checkpoint.resolve())})
-        return best_report
+        await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
+        return baseline_report
 
     async def run_hard_block_flow(
         self,
@@ -1508,7 +1500,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 "detour_threshold": "float (1.2-4.0)",
                 "max_cells": "int (1-5)",
             },
-            "PHYS_OPT": {"directive": ["Explore", "AggressiveExplore", "Default"]},
+            "PHYS_OPT": {"directive": ["RuntimeOptimized"]},
             "HARD_BLOCK": {"hard_block_types": ["DSP", "BRAM", "URAM"]},
             "NO_OP": {},
         }
@@ -1517,6 +1509,8 @@ class DCPOptimizer(DCPOptimizerBase):
             schema = dict(schemas[action.strategy])
             if action.strategy == "HARD_BLOCK":
                 schema["hard_block_types"] = action.default_args["hard_block_types"]
+            elif action.strategy == "PHYS_OPT":
+                schema["directive"] = action.allowed_args["directive"]
             available_strategies[action.strategy] = schema
         return {
             "analysis": self._compact_analysis_summary(analysis_summary),
@@ -2228,15 +2222,15 @@ class DCPOptimizer(DCPOptimizerBase):
                 step_elapsed_time = time.time() - step_start_time
             except Exception as exc:
                 logger.exception("Error during branch %s step %s", branch_id, step)
-                branch_history.append(
-                    {
-                        "step": step,
-                        "strategy": strategy,
-                        "args": args,
-                        "wns": None,
-                        "error": str(exc),
-                    }
-                )
+                failed_step = {
+                    "step": step,
+                    "strategy": strategy,
+                    "args": args,
+                    "wns": None,
+                    "error": str(exc),
+                }
+                branch_history.append(failed_step)
+                self.history.append(failed_step)
                 used_action_signatures.add(self._action_signature(strategy, args))
                 steps_since_peak += 1
                 continue
@@ -2249,37 +2243,37 @@ class DCPOptimizer(DCPOptimizerBase):
             )
             roi_accepted = self._is_step_roi_acceptable(delta_vs_peak, step_elapsed_time)
             used_action_signatures.add(self._action_signature(strategy, args))
-            branch_history.append(
-                {
-                    "step": step,
-                    "strategy": strategy,
-                    "args": args,
-                    "wns": current_wns,
-                    "tns": current_metrics.get("tns"),
-                    "failing_endpoints": current_metrics.get("failing_endpoints"),
-                    "delta_wns": (
-                        current_wns - previous_wns if current_wns is not None and previous_wns is not None else None
-                    ),
-                    "delta_vs_peak": delta_vs_peak,
-                    "elapsed_seconds": step_elapsed_time,
-                    "roi_accepted": roi_accepted,
-                    "previous_wns": previous_wns,
-                    "delta_tns": (
-                        current_metrics.get("tns") - previous_metrics["tns"]
-                        if current_metrics.get("tns") is not None and previous_metrics["tns"] is not None
-                        else None
-                    ),
-                    "delta_failing_endpoints": (
-                        current_metrics.get("failing_endpoints") - previous_metrics["failing_endpoints"]
-                        if current_metrics.get("failing_endpoints") is not None
-                        and previous_metrics["failing_endpoints"] is not None
-                        else None
-                    ),
-                    "delta_vs_parent": (
-                        current_wns - parent.wns if current_wns is not None and parent.wns is not None else None
-                    ),
-                }
-            )
+            completed_step = {
+                "step": step,
+                "strategy": strategy,
+                "args": args,
+                "wns": current_wns,
+                "tns": current_metrics.get("tns"),
+                "failing_endpoints": current_metrics.get("failing_endpoints"),
+                "delta_wns": (
+                    current_wns - previous_wns if current_wns is not None and previous_wns is not None else None
+                ),
+                "delta_vs_peak": delta_vs_peak,
+                "elapsed_seconds": step_elapsed_time,
+                "roi_accepted": roi_accepted,
+                "previous_wns": previous_wns,
+                "delta_tns": (
+                    current_metrics.get("tns") - previous_metrics["tns"]
+                    if current_metrics.get("tns") is not None and previous_metrics["tns"] is not None
+                    else None
+                ),
+                "delta_failing_endpoints": (
+                    current_metrics.get("failing_endpoints") - previous_metrics["failing_endpoints"]
+                    if current_metrics.get("failing_endpoints") is not None
+                    and previous_metrics["failing_endpoints"] is not None
+                    else None
+                ),
+                "delta_vs_parent": (
+                    current_wns - parent.wns if current_wns is not None and parent.wns is not None else None
+                ),
+            }
+            branch_history.append(completed_step)
+            self.history.append(completed_step)
 
             checkpoint_path = search_dir / f"{branch_id}_step{step:02d}.dcp"
             saved = await self._save_vivado_checkpoint(checkpoint_path)

@@ -30,7 +30,7 @@ Rules for the controller interface:
 - Prefer PHYS_OPT when placement spread is low, after PBLOCK/FANOUT changed the design, or when recent steps stagnate.
 - If stagnation >= 2, switch strategy if possible.
 - FANOUT args: {"top_n_nets": int from 1 to 10}
-- PHYS_OPT args: {"directive": "Explore" | "AggressiveExplore" | "Default"}
+- PHYS_OPT args: {"directive": one value provided by the PHYS_OPT schema}
 - PBLOCK args: {}
 - CELL_RELOCATE args: {"num_paths": int from 3 to 20, "detour_threshold": float from 1.2 to 4.0, "max_cells": int from 1 to 5}
 - HARD_BLOCK args: {"hard_block_types": subset of the provided eligible resource types}

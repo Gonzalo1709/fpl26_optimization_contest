@@ -121,11 +121,11 @@
 
 **Produces:** a guarded sequence: `RuntimeOptimized`, targeted critical-pin/routing/placement options, `Explore`, and `AggressiveExplore` only when budget and prior results justify it.
 
-- [ ] Write tests for directive ordering, skip conditions, and rollback after negative target-clock delta.
-- [ ] Implement portfolio attempts as separate saved candidates so existing generation branching can compare them instead of mutating one state.
-- [ ] Gate escalation on remaining runtime, previous gain, and hold/pulse status.
-- [ ] Run a fixed-budget public-suite A/B against the current single-directive behavior and fill experiment records.
-- [ ] Commit: `feat: add score-aware phys-opt portfolio`.
+- [x] Write tests for directive ordering, skip conditions, and rollback after negative target-clock delta.
+- [x] Implement portfolio attempts as separate saved candidates so existing generation branching can compare them instead of mutating one state.
+- [x] Gate escalation on remaining runtime, previous gain, and hold/pulse status.
+- [x] Run a fixed-budget public-suite A/B against the current single-directive behavior and fill experiment records.
+- [x] Commit: `feat: add score-aware phys-opt portfolio`.
 
 ### Task 7: Improve existing fanout and cell-relocation flows
 

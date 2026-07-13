@@ -124,7 +124,7 @@ class RecipePolicyTests(unittest.TestCase):
             {"PHYS_OPT", "CELL_RELOCATE"},
         )
         self.assertEqual(strategy, "PHYS_OPT")
-        self.assertEqual(args, {"directive": "Default"})
+        self.assertEqual(args, {"directive": "RuntimeOptimized"})
 
     def test_forced_branch_diversity_cannot_bypass_policy(self):
         signature = make_signature(
