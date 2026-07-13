@@ -44,7 +44,7 @@ Prompt optimization is not a priority: the current production prompt beat both G
 | Field | Result |
 | --- | --- |
 | Final branch / commit | `feat/score-aware-optimizer-portfolio` / `f7101eb` (`feat: explain optimizer score status`) |
-| Instance status / remaining budget | Running instance `i-0058deec95f879b31` at `100.31.235.29`; 20.86 h remained at the latest API check |
+| Instance status / remaining budget | Running instance `i-0058deec95f879b31` at `100.31.235.29`; 20.74 h remained after 11.06 session hours at the latest API check |
 | Public benchmarks completed | 3/12 characterized before this sprint |
 | Newly validated positive benchmarks | pending |
 | Best validated aggregate public score | 111.216 before this sprint |

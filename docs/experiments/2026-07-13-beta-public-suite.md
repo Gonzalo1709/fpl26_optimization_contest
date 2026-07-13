@@ -43,8 +43,9 @@ Validated positive subtotal before this screening is **111.216**.
 
 ## Execution State
 
-The official account reported 20.86 instance-hours remaining and instance
-`i-0058deec95f879b31` running at `100.31.235.29`. Screening has not started:
+The latest API check reported 20.74 instance-hours remaining and instance
+`i-0058deec95f879b31` still running at `100.31.235.29` after 11.06 session
+hours. Screening has not started:
 the locally available contest SSH key was overwritten by the HTTP 409 response
 from a rejected duplicate start request, and the separate personal SSH key is
 not authorized on this instance. No restart or termination has been performed
