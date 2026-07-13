@@ -40,6 +40,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+XELAB_TIMEOUT_SECONDS = 900
+
 
 def is_clock_port_name(name: str) -> bool:
     """Return whether an input port name uses a conventional clock token."""
@@ -686,7 +688,7 @@ endmodule
                 cwd=xsim_dir,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=XELAB_TIMEOUT_SECONDS
             )
             
             if result.returncode != 0:
