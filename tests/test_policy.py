@@ -181,6 +181,29 @@ class RecipePolicyTests(unittest.TestCase):
         self.assertEqual(no_fanout_phys.allowed_args["directive"], ["RuntimeOptimized", "CriticalPin"])
         self.assertEqual(fanout_phys.allowed_args["directive"], ["RuntimeOptimized"])
 
+    def test_neutral_fallback_does_not_duplicate_positive_portfolio_critical_pin(self):
+        history = [
+            {"strategy": "CELL_RELOCATE", "delta_vs_peak": 0.2},
+            {
+                "strategy": "PHYS_OPT",
+                "args": {"directive": "RuntimeOptimized"},
+                "wns": -1.0,
+                "delta_wns": 0.0,
+            },
+        ]
+
+        actions = gate_actions(
+            make_signature(),
+            budget=BudgetState(remaining_runtime_seconds=900.0, remaining_cost_usd=0.01),
+            history=history,
+        )
+
+        phys_opt = next(action for action in actions if action.strategy == "PHYS_OPT")
+        self.assertEqual(
+            phys_opt.allowed_args["directive"],
+            ["RuntimeOptimized", "CriticalPin", "PlacementRouting"],
+        )
+
     def test_neutral_phys_opt_history_does_not_change_pblock_or_hard_block_gates(self):
         neutral_history = [
             {

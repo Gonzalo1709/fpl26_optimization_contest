@@ -2461,13 +2461,18 @@ class DCPOptimizer(DCPOptimizerBase):
                         branch_id,
                         step,
                     )
+                    fallback_restore_confirmed = True
                     try:
                         baseline_checkpoint = Path(self.temp_dir) / "phys_opt_baseline.dcp"
-                        await self.v(
+                        restore_result = await self.v(
                             "open_checkpoint",
                             {"dcp_path": str(baseline_checkpoint.resolve())},
                         )
+                        self._raise_if_tool_reported_error(
+                            "vivado_open_checkpoint", restore_result
+                        )
                     except Exception:
+                        fallback_restore_confirmed = False
                         logger.exception(
                             "Could not restore neutral PHYS_OPT fallback baseline"
                         )
@@ -2486,6 +2491,12 @@ class DCPOptimizer(DCPOptimizerBase):
                     )
                     current_wns = fallback_previous_wns
                     current_metrics = fallback_previous_metrics
+                    if not fallback_restore_confirmed:
+                        print(
+                            f"[SEARCH] Branch {branch_id} step {step}: neutral PHYS_OPT "
+                            "baseline restore was not confirmed; stopping branch."
+                        )
+                        return None
                 else:
                     fallback_delta_vs_peak = (
                         current_wns - peak_metrics["wns"]

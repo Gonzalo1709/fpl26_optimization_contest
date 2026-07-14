@@ -133,10 +133,11 @@ def plan_neutral_phys_opt_fallback(
 
     completed = history[-1]
     delta_wns = completed.get("delta_wns")
-    try:
-        is_explicitly_neutral = delta_wns is not None and float(delta_wns) == 0.0
-    except (TypeError, ValueError):
-        is_explicitly_neutral = False
+    is_explicitly_neutral = (
+        isinstance(delta_wns, (int, float))
+        and not isinstance(delta_wns, bool)
+        and delta_wns == 0.0
+    )
     if (
         completed.get("strategy") != "PHYS_OPT"
         or (completed.get("args") or {}).get("directive") != "RuntimeOptimized"
@@ -259,11 +260,17 @@ def gate_actions(
         history=history,
         validation=validation,
     )
-    phys_opt_attempts += plan_neutral_phys_opt_fallback(
+    neutral_phys_opt_attempts = plan_neutral_phys_opt_fallback(
         signature,
         budget,
         history=history,
         validation=validation,
+    )
+    existing_phys_opt_names = {attempt.name for attempt in phys_opt_attempts}
+    phys_opt_attempts += tuple(
+        attempt
+        for attempt in neutral_phys_opt_attempts
+        if attempt.name not in existing_phys_opt_names
     )
     actions = [
         EligibleAction(

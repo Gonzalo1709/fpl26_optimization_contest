@@ -88,6 +88,8 @@ class PhysOptPortfolioPolicyTests(unittest.TestCase):
             ),
             (signature, eligible_budget, [{**neutral, "delta_wns": None}], ValidationStatus()),
             (signature, eligible_budget, [{**neutral, "delta_wns": "missing"}], ValidationStatus()),
+            (signature, eligible_budget, [{**neutral, "delta_wns": "0.0"}], ValidationStatus()),
+            (signature, eligible_budget, [{**neutral, "delta_wns": False}], ValidationStatus()),
             (signature, eligible_budget, [{**neutral, "wns": None}], ValidationStatus()),
             (signature, eligible_budget, [{**neutral, "error": "failed"}], ValidationStatus()),
             (
@@ -204,6 +206,53 @@ class PhysOptPortfolioPolicyTests(unittest.TestCase):
 
 
 class PhysOptPortfolioExecutionTests(unittest.IsolatedAsyncioTestCase):
+    def _make_neutral_branch(self, temporary_directory):
+        signature = DesignSignature.from_reports(
+            target_clock="clk_fpl26contest",
+            clock_period_ns=1.57,
+            wns_ns=-1.0,
+            tns_ns=-10.0,
+            failing_endpoints=10,
+            high_fanout_report="",
+            spread_report=None,
+            analysis_duration_seconds=1.0,
+        )
+        parent = SearchCandidate(
+            candidate_id="root",
+            dcp_path=Path("root.dcp"),
+            wns=-1.0,
+            tns=-10.0,
+            failing_endpoints=10,
+            peak_wns=-1.0,
+            generation=0,
+            parent_id=None,
+            branch_index=0,
+            steps_taken=0,
+            steps_since_peak=0,
+            summary="root",
+        )
+        optimizer = DCPOptimizer(
+            api_key="test-key",
+            run_dir=Path(temporary_directory),
+            system_prompt="test planner prompt",
+            generation_config=GenerationSearchConfig(
+                budget_profile="fast",
+                max_steps_per_branch=1,
+                max_steps_without_improvement=1,
+                wall_clock_limit_seconds=3600.0,
+            ),
+            force_strategy="PHYS_OPT",
+        )
+        optimizer.design_signature = signature
+        optimizer.best_candidate = parent
+        optimizer.initial_wns = -1.0
+        optimizer._restore_candidate_state = AsyncMock()
+        optimizer._save_vivado_checkpoint = AsyncMock(return_value=True)
+        optimizer._measure_current_metrics = AsyncMock(
+            return_value={"wns": -1.0, "tns": -10.0, "failing_endpoints": 10}
+        )
+        return optimizer, parent
+
     async def test_fast_neutral_runtime_executes_one_critical_pin_before_patience_stop(self):
         signature = DesignSignature.from_reports(
             target_clock="clk_fpl26contest",
@@ -317,6 +366,56 @@ class PhysOptPortfolioExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(phys_calls), 1)
         self.assertEqual(phys_calls[0].args[1], {"directive": "RuntimeOptimized"})
         self.assertEqual(optimizer.v.await_args_list[-1].args[0], "open_checkpoint")
+
+    async def test_critical_pin_exception_with_confirmed_restore_keeps_neutral_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            optimizer, parent = self._make_neutral_branch(temporary_directory)
+            optimizer._execute_strategy = AsyncMock(
+                side_effect=[("runtime report", -1.0), RuntimeError("critical pin failed")]
+            )
+            optimizer.v = AsyncMock(return_value="opened checkpoint successfully")
+
+            candidate = await optimizer._run_generation_branch(
+                "analysis", Path(temporary_directory), parent, 1, 1, ""
+            )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.wns, -1.0)
+        self.assertEqual(len(optimizer.search_candidates), 1)
+        optimizer._save_vivado_checkpoint.assert_awaited_once()
+        self.assertEqual(optimizer.history[-1]["error"], "critical pin failed")
+
+    async def test_critical_pin_exception_with_restore_exception_aborts_branch(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            optimizer, parent = self._make_neutral_branch(temporary_directory)
+            optimizer._execute_strategy = AsyncMock(
+                side_effect=[("runtime report", -1.0), RuntimeError("critical pin failed")]
+            )
+            optimizer.v = AsyncMock(side_effect=RuntimeError("restore failed"))
+
+            candidate = await optimizer._run_generation_branch(
+                "analysis", Path(temporary_directory), parent, 1, 1, ""
+            )
+
+        self.assertIsNone(candidate)
+        optimizer._save_vivado_checkpoint.assert_not_awaited()
+        self.assertEqual(optimizer.search_candidates, [])
+
+    async def test_critical_pin_exception_with_encoded_restore_error_aborts_branch(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            optimizer, parent = self._make_neutral_branch(temporary_directory)
+            optimizer._execute_strategy = AsyncMock(
+                side_effect=[("runtime report", -1.0), RuntimeError("critical pin failed")]
+            )
+            optimizer.v = AsyncMock(return_value='{"error": "checkpoint restore failed"}')
+
+            candidate = await optimizer._run_generation_branch(
+                "analysis", Path(temporary_directory), parent, 1, 1, ""
+            )
+
+        self.assertIsNone(candidate)
+        optimizer._save_vivado_checkpoint.assert_not_awaited()
+        self.assertEqual(optimizer.search_candidates, [])
 
 
 if __name__ == "__main__":
