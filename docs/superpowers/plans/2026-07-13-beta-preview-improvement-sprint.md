@@ -10,7 +10,10 @@
 
 ## Global Constraints
 
-- Deadline: `2026-07-14T11:59:59Z`; stop new experiments at `2026-07-14T08:30:00Z`.
+- Deadline: `2026-07-14T11:59:59Z`; by user authorization on
+  `2026-07-14`, candidate work may resume, no new candidate may start after
+  `2026-07-14T09:45:00Z`, and the hard experimental freeze is
+  `2026-07-14T10:30:00Z`.
 - Never leave an unproven candidate as the latest beta submission at the freeze time.
 - Never submit while another preview is provisioning or running.
 - Promote only a score strictly greater than the incumbent with no global failure and all placement, DRC, hold, pulse-width, and simulation gates passing.
@@ -33,6 +36,11 @@
 | LogicNets | +10.699 MHz, score 10.616, all gates passed |
 | Vex v2 | 0 MHz, score 0, all gates passed; `no_improvement` |
 | Restore action | Resubmit the archive above and confirm its MD5 |
+
+Candidate A remains protected throughout the authorized extension. After every
+candidate, automatically restore this archive if the result is worse, equal,
+failed, or still unproven when the restoration window is reached; confirm the
+restored server MD5 before continuing or freezing.
 
 Attempt #3 artifacts are in `C:/tmp/beta-preview-attempt3/`. The validation
 instance was stopped after setup preflight with 14.87 hours remaining. The
@@ -74,10 +82,9 @@ Alternatives, in order: (1) early-stop only for the lowest-risk cost/runtime imp
 
 ## Task 3: Candidate B — Bounded Neutral PHYS_OPT Fallback
 
-Run only if time remains and Candidate A did not produce a sufficient improvement.
-
-**Skipped:** Candidate A strictly improved the incumbent, so this task's
-condition was false. None of the implementation bullets below were performed.
+**Active by user authorization on `2026-07-14`.** The earlier `Skipped` state
+is superseded. Candidate A's strict improvement remains protected while this
+bounded candidate is evaluated through the same automatic restoration gate.
 
 **Files:** modify `src/policy.py`, `src/llm_optimizer.py`; test `tests/test_phys_opt_portfolio.py` and `tests/test_policy.py`.
 
@@ -85,6 +92,25 @@ condition was false. None of the implementation bullets below were performed.
 - [ ] Prove the fallback is disabled after positive gain, with critical fanout evidence, inside the validation reserve, or after one alternate attempt.
 - [ ] Implement the bounded fallback without widening PBLOCK/HARD_BLOCK eligibility.
 - [ ] Run targeted and full tests; commit `feat: try bounded neutral phys opt fallback`.
+- [ ] Package and preview through the same promotion/restoration gate.
+
+## Task 3A: Candidate C — Evidence-Based Single-Variable Improvement
+
+Run only after Candidate B is exhausted. Use attempt #3 logs to identify one
+benchmark-independent fast-search/early-stop or recipe-ordering improvement;
+change one policy variable only.
+
+- [ ] Record the attempt #3 evidence and the single policy variable selected.
+- [ ] Implement and verify the bounded change without weakening existing gates.
+- [ ] Package and preview through the same promotion/restoration gate.
+
+## Task 3B: Candidate D — Deterministic Signature Planner Bypass
+
+Attempt a deterministic design-signature planner bypass only if Candidate B and
+Candidate C are exhausted, evidence is strong, and at least three hours remain.
+
+- [ ] Record the strong benchmark-independent signature evidence and remaining budget.
+- [ ] Implement and verify the narrow deterministic bypass.
 - [ ] Package and preview through the same promotion/restoration gate.
 
 ## Task 4: Runtime-Only Packaging Gate
@@ -114,10 +140,12 @@ completed preview attempt #3 with score 10.616, no newer attempt, no running
 instance, and 14h52m of instance budget. The protected ZIP hashes still match.
 The organizer `--all` command refreshed all three artifacts under
 `C:/tmp/fpl26-beta-freeze-final/results/beta/preview/attempt-3/`, and the local
-suite passed 63/63 plus `compileall`. The app automation backend was unavailable,
-so this checkpoint does not replace the required observation at 08:30Z.
+suite passed 63/63 plus `compileall`. The existing PID `38892` watcher scheduled
+for 08:30Z is read-only pre-freeze evidence; it is not the new hard freeze and
+does not prevent the user-authorized candidate sequence from continuing.
 
-- [ ] At `2026-07-14T08:30:00Z`, stop new candidates.
+- [ ] Do not start a new candidate after `2026-07-14T09:45:00Z`.
+- [ ] At `2026-07-14T10:30:00Z`, enforce the hard experimental freeze.
 - [ ] Restore the last proven incumbent if the latest candidate is unproven.
 - [ ] Verify the latest beta MD5, `confirmed` status, positive preview, and no newer pending attempt.
 - [ ] Download final `--all` artifacts, stop unused instances after SCP retrieval, update the rehearsal/public-suite/handoff documents, and push the final conventional documentation commit.

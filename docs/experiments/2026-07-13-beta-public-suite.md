@@ -92,8 +92,18 @@ OpenRouter key and credentials were not transferred. Artifacts are retained at
 `C:/tmp/beta-preview-attempt3/{scorecard.json,logs.zip,dcp_results.zip}`.
 
 Candidate A improves the former beta incumbent by 3.077 points and is the
-current protected incumbent. Candidate B was skipped because its condition was
-false after this strict improvement. The former incumbent archive remains
+current protected incumbent. By user authorization on `2026-07-14`, Candidate
+B is active and its earlier `skipped` state is superseded. If B is exhausted,
+Candidate C uses attempt #3 logs to identify one benchmark-independent
+fast-search/early-stop or recipe-ordering improvement and changes one policy
+variable only. Candidate D may attempt a deterministic design-signature planner
+bypass only if B and C are exhausted, evidence is strong, and at least three
+hours remain.
+
+Candidate A's archive, attempt #3 result, MD5, and hashes remain protected.
+Every worse, equal, failed, or unproven candidate triggers automatic restoration
+of `C:/tmp/fpl26_beta_candidate_a.zip` and confirmation of server MD5
+`94daa68fdd1794430b5edbb2b194f57c`. The former incumbent archive remains
 immutable at `C:/tmp/fpl26_beta_submission_runtime_v2.zip` for historical
 rollback only; final freeze verification remains outstanding.
 
@@ -105,5 +115,6 @@ latest completed preview at **10.616**. There was no running instance or newer
 preview attempt, and 14h52m of instance budget remained. A fresh organizer
 `--all` download under `C:/tmp/fpl26-beta-freeze-final/` reproduced the existing
 scorecard, logs, and DCP-result SHA256 hashes. The local suite passed 63/63 plus
-`compileall`. No additional candidate is authorized by the sprint gates; only
-the scheduled 08:30Z freeze observation remains.
+`compileall`. The existing PID `38892` watcher at 08:30Z is read-only pre-freeze
+evidence, not the new hard freeze. Under the `2026-07-14` authorization, no new
+candidate may start after 09:45Z and the hard experimental freeze is 10:30Z.

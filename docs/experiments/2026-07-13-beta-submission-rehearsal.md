@@ -96,8 +96,9 @@ confirmed positive LogicNets result.
 The earlier decision was superseded by the bounded Candidate A change at
 `75cf2498f0bb9a0d0b34c9e405d4f9086e900ba3`
 (`feat: stop low-value fast search expansion`). Candidate A strictly improved
-the 7.539 incumbent, so Candidate B's conditional gate was false and Candidate
-B was skipped.
+the 7.539 incumbent and remains the protected incumbent. The earlier Candidate
+B `skipped` state was superseded by the user's `2026-07-14` authorization to
+resume the bounded candidate sequence.
 
 ### Final Candidate A archive preflight
 
@@ -137,7 +138,25 @@ source files. The validation instance was stopped after setup preflight with
 Candidate A improves the former 7.539 incumbent by 3.077 points and is now the
 protected incumbent. The previous archive remains immutable at
 `C:/tmp/fpl26_beta_submission_runtime_v2.zip` for historical rollback only.
-The deadline freeze verification remains outstanding.
+Every subsequent candidate remains subject to automatic restoration of
+`C:/tmp/fpl26_beta_candidate_a.zip`, with MD5
+`94daa68fdd1794430b5edbb2b194f57c` reconfirmed, if it is worse, equal, failed,
+or unproven when the restoration window is reached. The deadline freeze
+verification remains outstanding.
+
+## Authorized Extended Candidate Window
+
+On `2026-07-14`, the user authorized candidate work to resume. Candidate B is
+active; its old `skipped` state is superseded. If B is exhausted, Candidate C
+uses attempt #3 logs to identify one benchmark-independent fast-search/
+early-stop or recipe-ordering improvement and changes one policy variable only.
+Candidate D may attempt a deterministic design-signature planner bypass only if
+B and C are exhausted, evidence is strong, and at least three hours remain.
+
+No new candidate may start after `2026-07-14T09:45:00Z`. The hard experimental
+freeze is extended from 08:30Z to `2026-07-14T10:30:00Z`. The existing PID
+`38892` watcher at 08:30Z is read-only pre-freeze evidence, not the new hard
+freeze.
 
 ## Pre-Freeze Readiness Checkpoint
 
@@ -158,6 +177,6 @@ The final artifact set was refreshed with the organizer's `--all` command into
 | `dcp_results.zip` | 15,129,275 | `080bdb0b067302418cc98ce5408fa96a7cad794169dd978d445dbbe57dcd8676` |
 
 The full local suite passed 63/63 and `compileall` passed at 02:51Z. This is a
-readiness checkpoint only: the scheduled 08:30Z freeze observation and final
-documentation commit remain pending because the app automation backend was
-unavailable.
+readiness checkpoint only. The PID `38892` watcher at 08:30Z provides read-only
+pre-freeze evidence; the user-authorized candidate window and the 10:30Z hard
+freeze remain pending.

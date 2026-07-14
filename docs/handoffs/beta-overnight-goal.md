@@ -56,10 +56,10 @@ Prompt optimization is not a priority: the current production prompt beat both G
 | Package correction | First Windows repack rejected before submission after stripping `RapidWright/gradlew` executable metadata; final package preserved incumbent ZIP metadata and replaced only `src/search.py` and `src/llm_optimizer.py` |
 | Non-test execution | Manual SSH run unavailable without an injected OpenRouter key; credentials were not transferred; official preview performed the full metered run |
 | Artifacts | `C:/tmp/beta-preview-attempt3/{scorecard.json,logs.zip,dcp_results.zip}` |
-| Decision | Promoted: +3.077 over 7.539. Candidate B skipped because its conditional gate was false |
+| Decision | Promoted: +3.077 over 7.539. On `2026-07-14`, the user authorized Candidate B to become active, superseding its earlier `skipped` state |
 | Instance / remaining budget | Validation instance stopped after setup preflight; 14.87 hours remained |
 | Rollback history | `C:/tmp/fpl26_beta_submission_runtime_v2.zip` remains immutable for historical rollback only |
-| Remaining action | Perform final freeze verification; Candidate A is the current protected incumbent |
+| Remaining action | Evaluate the authorized candidate sequence without starting a candidate after 09:45Z, then perform the 10:30Z hard-freeze verification; Candidate A remains protected |
 
 ### Pre-freeze checkpoint at 02:49Z
 
@@ -71,9 +71,25 @@ Prompt optimization is not a priority: the current production prompt beat both G
   `C:/tmp/fpl26-beta-freeze-final/results/beta/preview/attempt-3/`; scorecard,
   logs, and DCP results matched their recorded SHA256 hashes.
 - The full local suite passed 63/63 and `compileall` passed.
-- The app automation backend was unavailable. Re-run the read-only status,
-  submission-status, and preview-history checks at or after 08:30Z before
-  checking off Task 6; do not start another candidate.
+- The app automation backend was unavailable. The existing PID `38892` watcher
+  at 08:30Z performs read-only status, submission-status, and preview-history
+  checks. It is pre-freeze evidence, not the new hard freeze.
+
+### Authorized extended candidate window
+
+On `2026-07-14`, the user authorized candidate work to resume. Candidate B is
+active and its old `skipped` state is superseded. If B is exhausted, Candidate C
+uses attempt #3 logs to identify one benchmark-independent fast-search/
+early-stop or recipe-ordering improvement and changes one policy variable only.
+Candidate D may attempt a deterministic design-signature planner bypass only if
+B and C are exhausted, evidence is strong, and at least three hours remain.
+
+Do not start a new candidate after 09:45Z. Enforce the hard experimental freeze
+at 10:30Z, extended from 08:30Z. Candidate A remains protected at score 10.616,
+attempt #3, archive `C:/tmp/fpl26_beta_candidate_a.zip`, SHA256
+`337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`,
+and MD5 `94daa68fdd1794430b5edbb2b194f57c`. Automatically restore that archive and
+confirm its server MD5 after any worse, equal, failed, or unproven candidate.
 
 The table below is the earlier attempt #2 handoff retained for history.
 
