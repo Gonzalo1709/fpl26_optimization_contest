@@ -91,14 +91,11 @@ non-test run was not possible because the instance environment had no injected
 OpenRouter key and credentials were not transferred. Artifacts are retained at
 `C:/tmp/beta-preview-attempt3/{scorecard.json,logs.zip,dcp_results.zip}`.
 
-Candidate A improves the former beta incumbent by 3.077 points and is the
-current protected incumbent. By user authorization on `2026-07-14`, Candidate
-B is active and its earlier `skipped` state is superseded. If B is exhausted,
-Candidate C uses attempt #3 logs to identify one benchmark-independent
-fast-search/early-stop or recipe-ordering improvement and changes one policy
-variable only. Candidate D may attempt a deterministic design-signature planner
-bypass only if B and C are exhausted, evidence is strong, and at least three
-hours remain.
+Candidate A improved the former beta incumbent by 3.077 points in attempt #3
+and remained protected through the extended candidate window. Candidate B was
+authorized and evaluated, then rejected after tying rather than exceeding A.
+Candidate C had no justified single-variable change, and Candidate D was
+skipped by its three-hour reserve gate.
 
 Candidate A's archive, attempt #3 result, MD5, and hashes remain protected.
 Every worse, equal, failed, or unproven candidate triggers automatic restoration
@@ -132,11 +129,17 @@ B was therefore rejected. All attempt #4 artifacts were downloaded with
 `C:/tmp/beta-preview-attempt4/results/beta/preview/attempt-4/`.
 
 Candidate A was resubmitted at `2026-07-14T07:57:27Z`; its protected MD5 was
-confirmed and preview attempt #5 is running. Candidate C had no justified
-single-variable change. Candidate D became ineligible at 07:30Z because fewer
-than three hours remained before freeze while B was nonterminal. The validation
-instance was stopped after SCP/setup work with 13h52m remaining. The final local
-suite passed 72/72 plus `compileall` and `git diff --check` in `.venv`.
+confirmed. Preview attempt #5 (`v_a6e8e4d1915a`) completed at
+`2026-07-14T08:19:13Z` with score **10.788**: LogicNets reached 414.422 MHz
+(+10.871 MHz) in 207.683 seconds at $0.0183, while Vex remained legal and
+neutral in 99.892 seconds. Every official gate passed. Complete artifacts are
+under `C:/tmp/beta-preview-attempt5/results/beta/preview/attempt-5/`.
+
+Candidate C had no justified single-variable change. Candidate D became
+ineligible at 07:30Z because fewer than three hours remained before freeze while
+B was nonterminal. The validation instance was stopped after SCP/setup work
+with 13h52m remaining. The final local suite passed 72/72 plus `compileall` and
+`git diff --check` in `.venv`.
 
 ## Pre-Freeze Readiness
 

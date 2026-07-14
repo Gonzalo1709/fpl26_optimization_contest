@@ -197,7 +197,26 @@ Attempt #4 artifacts are under
 
 Because equality is not promotion, Candidate B was rejected. Candidate A was
 resubmitted at `2026-07-14T07:57:27Z`; the service confirmed protected MD5
-`94daa68fdd1794430b5edbb2b194f57c`. Restoration preview attempt #5 is running.
+`94daa68fdd1794430b5edbb2b194f57c`. Restoration preview attempt #5
+(`v_a6e8e4d1915a`) completed at `2026-07-14T08:19:13Z` with score **10.788**,
+no global failure, and no newer pending preview.
+
+### Restored Candidate A attempt #5
+
+| Benchmark | Input Fmax | Output Fmax | Delta Fmax | Runtime | Cost | Score | Validation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `logicnets_jscl` | 403.551251 MHz | 414.422 MHz | +10.871 MHz | 207.683 s | $0.0183 | 10.788 | Routed, DRC, hold, pulse-width, and simulation gates passed |
+| `vexriscv_re-place_v2` | 397.456280 MHz | 397.456 MHz | 0 MHz | 99.892 s | $0.0098 | 0 | All gates passed; `no_improvement` |
+
+Attempt #5 used the same protected archive and MD5 as attempt #3; measured
+FANOUT variation raised the score from 10.616 to **10.788**. Complete artifacts
+are under `C:/tmp/beta-preview-attempt5/results/beta/preview/attempt-5/`:
+
+| Artifact | Bytes | SHA256 |
+| --- | ---: | --- |
+| `scorecard.json` | 2,079 | `dcda55b6f2486045e5693dabf6f3ca27a2745a8c8ce5ca060370d2d10bda26f4` |
+| `logs.zip` | 114,245 | `8417456d2bd24cbe590e18ac92882cd19da2b945e58bcc178f2478bb183363ef` |
+| `dcp_results.zip` | 15,126,058 | `77fb1320f5eeeceea3c14ec712833a9ab8d6f786078b6e2f313f3c49358a5112` |
 
 Candidate C was skipped because attempt #3 provided no evidence-supported
 single variable. Its strongest hypothesis was allowing another fast generation,

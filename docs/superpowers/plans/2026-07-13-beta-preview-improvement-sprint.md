@@ -27,13 +27,13 @@
 
 | Field | Value |
 | --- | --- |
-| Preview | Attempt #3 / `v_520de46a2c58` |
-| Score | **10.616** |
+| Preview | Attempt #5 / `v_a6e8e4d1915a` |
+| Score | **10.788** |
 | Submission MD5 | `94daa68fdd1794430b5edbb2b194f57c` |
 | Archive | `C:/tmp/fpl26_beta_candidate_a.zip` |
 | SHA256 | `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141` |
 | Packaged source | `75cf2498f0bb9a0d0b34c9e405d4f9086e900ba3` (`feat: stop low-value fast search expansion`) |
-| LogicNets | +10.699 MHz, score 10.616, all gates passed |
+| LogicNets | +10.871 MHz, score 10.788, all gates passed |
 | Vex v2 | 0 MHz, score 0, all gates passed; `no_improvement` |
 | Restore action | Resubmit the archive above and confirm its MD5 |
 
@@ -104,8 +104,11 @@ needed. Transfer used the organizer's `scp` command. Preview attempt #4
 (`v_da0b3a97b453`) completed at `2026-07-14T07:25:16Z` with all gates passing
 but score **10.616**, equal to Candidate A. The Vex row remained neutral while
 runtime rose to 148.383 seconds. Candidate B was rejected and Candidate A was
-resubmitted at `2026-07-14T07:57:27Z` with the protected MD5; restoration
-preview attempt #5 is running.
+resubmitted at `2026-07-14T07:57:27Z` with the protected MD5. Restoration
+preview attempt #5 (`v_a6e8e4d1915a`) completed at
+`2026-07-14T08:19:13Z` with score **10.788**, all gates passing, and no newer
+pending attempt. The identical archive's measured FANOUT result improved to
++10.871 MHz, so attempt #5 is the highest proven preview.
 
 ## Task 3A: Candidate C — Evidence-Based Single-Variable Improvement
 
@@ -147,8 +150,10 @@ Candidate B attempt #4 artifacts are under
 `C:/tmp/beta-preview-attempt4/results/beta/preview/attempt-4/`. The equal score
 triggered the mandatory rollback. The service confirmed Candidate A's MD5
 `94daa68fdd1794430b5edbb2b194f57c` as the latest upload at
-`2026-07-14T07:57:27Z`; attempt #5 must become terminal and latest before the
-freeze is complete.
+`2026-07-14T07:57:27Z`. Attempt #5 became terminal/latest at
+`2026-07-14T08:19:13Z` with score **10.788** and all gates passing. Its complete
+artifacts are under
+`C:/tmp/beta-preview-attempt5/results/beta/preview/attempt-5/`.
 
 ## Task 6: Deadline Freeze
 
@@ -157,10 +162,12 @@ remains to be done at the scheduled cutoff.
 
 At `2026-07-14T07:57:27Z`, Candidate A was restored after Candidate B tied the
 incumbent. The server confirmed the protected MD5 and started preview attempt
-#5. The validation instance was terminated after all SCP/setup work, leaving
-13h52m. The correct local `.venv` suite then passed 72/72 plus `compileall` and
-`git diff --check`; an earlier invocation with dependency-free `C:/Python313`
-was discarded as an interpreter-selection error.
+#5. It completed at `2026-07-14T08:19:13Z` as the latest non-stale preview with
+score **10.788**, validation `v_a6e8e4d1915a`, and all gates passing. The
+validation instance was terminated after all SCP/setup work, leaving 13h52m.
+The correct local `.venv` suite then passed 72/72 plus `compileall` and `git
+diff --check`; an earlier invocation with dependency-free `C:/Python313` was
+discarded as an interpreter-selection error.
 
 Pre-freeze readiness was rechecked at `2026-07-14T02:49:29Z`. The contest
 service still reported submission MD5 `94daa68fdd1794430b5edbb2b194f57c`,

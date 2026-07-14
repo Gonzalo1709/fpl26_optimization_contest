@@ -46,20 +46,20 @@ Prompt optimization is not a priority: the current production prompt beat both G
 | Field | Result |
 | --- | --- |
 | Branch / promoted commit | `feat/score-aware-optimizer-portfolio` / `75cf2498f0bb9a0d0b34c9e405d4f9086e900ba3` (`feat: stop low-value fast search expansion`) |
-| Protected beta preview | Attempt #3 / `v_520de46a2c58`; score **10.616**; completed `2026-07-14T01:47:24Z`; no global failure |
-| Submission | Confirmed `2026-07-14T01:25:04Z`; MD5 `94daa68fdd1794430b5edbb2b194f57c` |
-| LogicNets | 403.551251 -> 414.250 MHz; +10.699 MHz; score 10.616; 210.633 s; $0.0195; all gates passed |
-| Vex v2 | 397.456280 -> 397.456 MHz; 0 MHz; score 0; 100.498 s; $0.0098; all gates passed; `no_improvement` |
+| Protected beta preview | Attempt #5 / `v_a6e8e4d1915a`; score **10.788**; completed `2026-07-14T08:19:13Z`; no global failure or newer pending attempt |
+| Submission | Restored and confirmed `2026-07-14T07:57:27Z`; MD5 `94daa68fdd1794430b5edbb2b194f57c` |
+| LogicNets | 403.551251 -> 414.422 MHz; +10.871 MHz; score 10.788; 207.683 s; $0.0183; all gates passed |
+| Vex v2 | 397.456280 -> 397.456 MHz; 0 MHz; score 0; 99.892 s; $0.0098; all gates passed; `no_improvement` |
 | Candidate A archive | `C:/tmp/fpl26_beta_candidate_a.zip`; 1,525,735 bytes; 468 entries |
 | Archive hashes | SHA256 `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`; MD5 `94daa68fdd1794430b5edbb2b194f57c` |
 | Setup preflight | Exact extracted `make setup` passed on `i-010aa4c4964acf607` using the Vivado 2025.1 bundled JRE; no `default-jre` install |
 | Package correction | First Windows repack rejected before submission after stripping `RapidWright/gradlew` executable metadata; final package preserved incumbent ZIP metadata and replaced only `src/search.py` and `src/llm_optimizer.py` |
 | Non-test execution | Manual SSH run unavailable without an injected OpenRouter key; credentials were not transferred; official preview performed the full metered run |
-| Artifacts | `C:/tmp/beta-preview-attempt3/{scorecard.json,logs.zip,dcp_results.zip}` |
+| Artifacts | `C:/tmp/beta-preview-attempt5/results/beta/preview/attempt-5/{scorecard.json,logs.zip,dcp_results.zip}` |
 | Decision | Promoted: +3.077 over 7.539. On `2026-07-14`, the user authorized Candidate B to become active, superseding its earlier `skipped` state |
 | Instance / remaining budget | Validation instance stopped after setup preflight; 14.87 hours remained |
 | Rollback history | `C:/tmp/fpl26_beta_submission_runtime_v2.zip` remains immutable for historical rollback only |
-| Remaining action | Wait for restored Candidate A preview attempt #5 to become terminal/latest, download final `--all` artifacts, then perform the 10:30Z hard-freeze verification |
+| Remaining action | Perform the scheduled 10:30Z hard-freeze recheck, final documentation review, commit, and push |
 
 ### Pre-freeze checkpoint at 02:49Z
 
@@ -85,8 +85,8 @@ Candidate D may attempt a deterministic design-signature planner bypass only if
 B and C are exhausted, evidence is strong, and at least three hours remain.
 
 Do not start a new candidate after 09:45Z. Enforce the hard experimental freeze
-at 10:30Z, extended from 08:30Z. Candidate A remains protected at score 10.616,
-attempt #3, archive `C:/tmp/fpl26_beta_candidate_a.zip`, SHA256
+at 10:30Z, extended from 08:30Z. Candidate A remains protected at score 10.788,
+attempt #5, archive `C:/tmp/fpl26_beta_candidate_a.zip`, SHA256
 `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`,
 and MD5 `94daa68fdd1794430b5edbb2b194f57c`. Automatically restore that archive and
 confirm its server MD5 after any worse, equal, failed, or unproven candidate.
@@ -104,7 +104,8 @@ confirm its server MD5 after any worse, equal, failed, or unproven candidate.
 | Vex v2 | 0 MHz; 148.383 s; $0.0098; score 0; bounded CriticalPin fallback neutral; `no_improvement` |
 | Artifacts | `C:/tmp/beta-preview-attempt4/results/beta/preview/attempt-4/`; all scorecard/log/DCP ZIP hashes recorded in the rehearsal |
 | Decision | Rejected because equality does not pass the strict promotion rule; Candidate A resubmitted at `2026-07-14T07:57:27Z` |
-| Current beta | Protected MD5 `94daa68fdd1794430b5edbb2b194f57c` is the latest server upload; restoration preview attempt #5 is running |
+| Current beta | Protected MD5 `94daa68fdd1794430b5edbb2b194f57c`; attempt #5 / `v_a6e8e4d1915a`; score **10.788**; completed/latest with all gates passing and no pending attempt |
+| Final artifacts | Attempt #5 scorecard/logs/DCP results downloaded with `--all`; SHA256 `dcda55b6...26f4`, `8417456d...63ef`, and `77fb1320...5112` respectively (full hashes in rehearsal) |
 | Remaining candidates | C skipped for lack of fixed evidence; D skipped at 07:30Z by the mandatory three-hour reserve; no further candidate will start |
 | Instance/budget | Unused instance terminated after SCP/setup retrieval; 13h52m remained |
 | Final local verification | Correct `.venv`: 72/72 tests, `compileall`, and `git diff --check` passed; a dependency-free `C:/Python313` invocation was discarded as an interpreter-selection error |
