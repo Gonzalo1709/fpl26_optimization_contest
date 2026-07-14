@@ -49,3 +49,18 @@ class SearchCandidate:
     projected_score: float = 0.0
     validation: ValidationStatus = field(default_factory=ValidationStatus)
     validated_score: Optional[float] = None
+
+
+def should_stop_fast_search(
+    config: GenerationSearchConfig,
+    root: SearchCandidate,
+    best: SearchCandidate,
+) -> bool:
+    """Return whether a scored fast search has earned early termination."""
+    return (
+        config.budget_profile == "fast"
+        and best.projected_score > 0
+        and root.wns is not None
+        and best.wns is not None
+        and best.wns >= root.wns + config.min_wns_delta
+    )

@@ -26,7 +26,7 @@ from src.policy import (
 )
 from src.prompting import DEFAULT_SYSTEM_PROMPT_PATH, build_planner_system_prompt, prompt_sha256
 from src.scoring import ContestScoreInput, ValidationStatus, calculate_contest_score
-from src.search import GenerationSearchConfig, SearchCandidate
+from src.search import GenerationSearchConfig, SearchCandidate, should_stop_fast_search
 
 logger = logging.getLogger(__name__)
 
@@ -2155,6 +2155,7 @@ class DCPOptimizer(DCPOptimizerBase):
         self.best_candidate = root
         active_candidates = [root]
         hit_wall_clock_limit = False
+        fast_search_stopped = False
 
         for generation in range(1, cfg.max_generations + 1):
             if self._should_stop_for_budget("[SEARCH]"):
@@ -2215,14 +2216,33 @@ class DCPOptimizer(DCPOptimizerBase):
                             self.best_candidate = candidate
                             print(f"[SEARCH] New global best: {candidate.candidate_id} ({self._format_wns(candidate.wns)})")
 
+                        should_stop_fast = bool(
+                            self.best_candidate
+                            and should_stop_fast_search(cfg, root, self.best_candidate)
+                        )
+
                         if cfg.stop_when_timing_met and candidate.wns is not None and candidate.wns >= 0:
                             print("[SEARCH] Timing met; stopping search because stop_when_timing_met is enabled.")
                             active_candidates = [candidate]
                             branch_results = [candidate]
                             break
 
+                        if should_stop_fast and self.best_candidate:
+                            print(
+                                f"[SEARCH] Candidate {self.best_candidate.candidate_id} has projected score "
+                                f"{self.best_candidate.projected_score:.6f}; later fast-profile expansion is skipped."
+                            )
+                            fast_search_stopped = True
+                            break
+
+                    if fast_search_stopped:
+                        break
+
                     if cfg.stop_when_timing_met and self.best_candidate and self.best_candidate.wns is not None and self.best_candidate.wns >= 0:
                         break
+
+                if fast_search_stopped:
+                    break
 
                 if not branch_results:
                     print("[SEARCH] No viable branches produced this generation; stopping.")
