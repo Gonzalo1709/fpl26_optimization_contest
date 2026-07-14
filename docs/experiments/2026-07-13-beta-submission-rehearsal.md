@@ -158,6 +158,62 @@ freeze is extended from 08:30Z to `2026-07-14T10:30:00Z`. The existing PID
 `38892` watcher at 08:30Z is read-only pre-freeze evidence, not the new hard
 freeze.
 
+## Candidate B Result and Mandatory Restoration
+
+Candidate B used commits `ef62cd5` (`feat: try bounded neutral phys opt
+fallback`) and `416e4aa` (`fix: make neutral phys opt rollback fail safe`). It
+preserved the existing fast early stop, recipes, search controller, rollback,
+ranking, specialist gates, and DSPy/GEPA integration. Targeted tests passed
+26/26, and the complete suite passed 72/72 plus `compileall` and `git diff
+--check` after the rollback review fix.
+
+| Gate | Result |
+| --- | --- |
+| Archive | `C:/tmp/fpl26_beta_candidate_b.zip` |
+| Size / entries | 1,526,812 bytes / 468 |
+| SHA256 | `53d75b9d1205a83edd0db15c8d8c320f5bb2ac5433327f40f2247e44ee7a9684` |
+| MD5 / server MD5 | `29a9c8e2161bd8daa85c0319f8302991` |
+| Runtime delta from Candidate A | Replaced only `src/policy.py` and `src/llm_optimizer.py`; ZIP metadata and `RapidWright/gradlew` executable mode preserved |
+| Transfer | Organizer `./fpl26contest scp` to `i-010122f97d9e8d2fd` |
+| Exact extracted setup | Passed after sourcing `/tools/Xilinx/2025.1/Vivado/settings64.sh`; Vivado 2025.1 bundled Java 11 worked; `default-jre` was not installed |
+| Full non-test evidence | Official preview attempt #4 |
+
+Preview attempt #4 (`v_da0b3a97b453`) completed at
+`2026-07-14T07:25:16Z` with total score **10.616** and no global failure:
+
+| Benchmark | Input Fmax | Output Fmax | Delta Fmax | Runtime | Cost | Score | Validation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `logicnets_jscl` | 403.551251 MHz | 414.250 MHz | +10.699 MHz | 210.602 s | $0.0192 | 10.616 | Routed, DRC, hold, pulse-width, and simulation gates passed |
+| `vexriscv_re-place_v2` | 397.456280 MHz | 397.456 MHz | 0 MHz | 148.383 s | $0.0098 | 0 | All gates passed; alternate CriticalPin remained neutral; `no_improvement` |
+
+Attempt #4 artifacts are under
+`C:/tmp/beta-preview-attempt4/results/beta/preview/attempt-4/`:
+
+| Artifact | Bytes | SHA256 |
+| --- | ---: | --- |
+| `scorecard.json` | 2,079 | `15aefeaa3d1de0631db20fd86e903ee71f0356e5f4cce25c35332b3f148616ce` |
+| `logs.zip` | 114,341 | `17e87374f6700ae69dafe1c15399e464292b26cd2319d335480de142c8d97ab1` |
+| `dcp_results.zip` | 15,129,955 | `0ce7d6293b1351cd7fa98eaf4275b4b78ab273960812a8dccea3bb00873c0906` |
+
+Because equality is not promotion, Candidate B was rejected. Candidate A was
+resubmitted at `2026-07-14T07:57:27Z`; the service confirmed protected MD5
+`94daa68fdd1794430b5edbb2b194f57c`. Restoration preview attempt #5 is running.
+
+Candidate C was skipped because attempt #3 provided no evidence-supported
+single variable. Its strongest hypothesis was allowing another fast generation,
+but the only fixed second-generation gain was +0.018 ns, below the preserved
+0.020 ns acceptance gate; its extra runtime predicted about -0.049 score. The
+apparent FANOUT `top_n` alternatives were not real breadth comparisons because
+the fast executor caps them to one net.
+
+Candidate D's narrow hypothesis was to bypass the planner only for the two
+repeatedly measured signature classes, saving at most about 0.0209 score on the
+positive row from its $0.0195 planner call plus small API latency. It was skipped
+because Candidate B was still nonterminal at `2026-07-14T07:30:05Z`, when fewer
+than the mandatory three hours remained before the 10:30Z freeze. No source or
+package was produced for C or D. The now-unused validation instance was
+terminated with 13h52m budget remaining.
+
 ## Pre-Freeze Readiness Checkpoint
 
 At `2026-07-14T02:49:29Z`, the organizer service again reported Candidate A as

@@ -88,11 +88,24 @@ bounded candidate is evaluated through the same automatic restoration gate.
 
 **Files:** modify `src/policy.py`, `src/llm_optimizer.py`; test `tests/test_phys_opt_portfolio.py` and `tests/test_policy.py`.
 
-- [ ] Add failing tests for exactly one alternate PHYS_OPT directive after `RuntimeOptimized` yields zero gain on a no-critical-fanout signature with clean budget/signoff state.
-- [ ] Prove the fallback is disabled after positive gain, with critical fanout evidence, inside the validation reserve, or after one alternate attempt.
-- [ ] Implement the bounded fallback without widening PBLOCK/HARD_BLOCK eligibility.
-- [ ] Run targeted and full tests; commit `feat: try bounded neutral phys opt fallback`.
-- [ ] Package and preview through the same promotion/restoration gate.
+- [x] Add failing tests for exactly one alternate PHYS_OPT directive after `RuntimeOptimized` yields zero gain on a no-critical-fanout signature with clean budget/signoff state.
+- [x] Prove the fallback is disabled after positive gain, with critical fanout evidence, inside the validation reserve, or after one alternate attempt.
+- [x] Implement the bounded fallback without widening PBLOCK/HARD_BLOCK eligibility.
+- [x] Run targeted and full tests; commits `ef62cd5` (`feat: try bounded neutral phys opt fallback`) and `416e4aa` (`fix: make neutral phys opt rollback fail safe`).
+- [x] Package and preview through the same promotion/restoration gate.
+
+Candidate B archive `C:/tmp/fpl26_beta_candidate_b.zip` was 1,526,812 bytes
+with 468 entries, SHA256
+`53d75b9d1205a83edd0db15c8d8c320f5bb2ac5433327f40f2247e44ee7a9684`,
+and MD5 `29a9c8e2161bd8daa85c0319f8302991`. Exact extracted `make
+setup` passed after sourcing Vivado 2025.1 on instance
+`i-010122f97d9e8d2fd`; its bundled Java 11 worked and `default-jre` was not
+needed. Transfer used the organizer's `scp` command. Preview attempt #4
+(`v_da0b3a97b453`) completed at `2026-07-14T07:25:16Z` with all gates passing
+but score **10.616**, equal to Candidate A. The Vex row remained neutral while
+runtime rose to 148.383 seconds. Candidate B was rejected and Candidate A was
+resubmitted at `2026-07-14T07:57:27Z` with the protected MD5; restoration
+preview attempt #5 is running.
 
 ## Task 3A: Candidate C — Evidence-Based Single-Variable Improvement
 
@@ -100,18 +113,18 @@ Run only after Candidate B is exhausted. Use attempt #3 logs to identify one
 benchmark-independent fast-search/early-stop or recipe-ordering improvement;
 change one policy variable only.
 
-- [ ] Record the attempt #3 evidence and the single policy variable selected.
-- [ ] Implement and verify the bounded change without weakening existing gates.
-- [ ] Package and preview through the same promotion/restoration gate.
+- [x] Record attempt #3 evidence in the rehearsal document; no single policy variable met the fixed-evidence gate.
+- [x] Skip implementation rather than weaken existing gates or stack a speculative change.
+- [x] Skip packaging and preview because no Candidate C was justified.
 
 ## Task 3B: Candidate D — Deterministic Signature Planner Bypass
 
 Attempt a deterministic design-signature planner bypass only if Candidate B and
 Candidate C are exhausted, evidence is strong, and at least three hours remain.
 
-- [ ] Record the strong benchmark-independent signature evidence and remaining budget.
-- [ ] Implement and verify the narrow deterministic bypass.
-- [ ] Package and preview through the same promotion/restoration gate.
+- [x] Record the narrow hypothesis and time decision in the rehearsal document.
+- [x] Skip implementation: Candidate B remained nonterminal at `2026-07-14T07:30:05Z`, leaving fewer than the mandatory three hours before freeze.
+- [x] Skip packaging and preview; no Candidate D work was started.
 
 ## Task 4: Runtime-Only Packaging Gate
 
@@ -119,6 +132,7 @@ Candidate C are exhausted, evidence is strong, and at least three hours remain.
 - [x] Keep RapidWright's Java package named `tests`; v3 proved production classes import it.
 - [x] Reject any ZIP containing Git metadata, credentials, keys, DCPs, logs, documentation, generated runs, or standalone test suites.
 - [x] Extract into a fresh directory and run exact `make setup` before every submission. Candidate A passed on `i-010aa4c4964acf607` with the Vivado 2025.1 bundled JRE and no `default-jre` install.
+- [x] Candidate B passed the same extracted setup contract on `i-010122f97d9e8d2fd` after SCP transfer and sourcing Vivado 2025.1; bundled Java 11 worked and no package install was required.
 
 ## Task 5: Serialized Preview and Restoration Loop
 
@@ -126,13 +140,27 @@ Candidate C are exhausted, evidence is strong, and at least three hours remain.
 - [x] Wait for the terminal preview state; do not supersede it.
 - [x] Download scorecard, logs, and DCP results with the `--preview --attempt N --all` equivalent.
 - [x] Record score, per-row Fmax, cost, runtime, gates, archive hashes, commit, and decision.
-- [x] Apply the worse/equal/failed restoration rule; restoration was not needed because Candidate A improved.
+- [x] Apply the worse/equal/failed restoration rule; Candidate A needed no restoration after it improved, while Candidate B's equal score triggered immediate restoration.
 - [x] Promote Candidate A and keep `C:/tmp/fpl26_beta_candidate_a.zip` immutable as the current protected incumbent.
+
+Candidate B attempt #4 artifacts are under
+`C:/tmp/beta-preview-attempt4/results/beta/preview/attempt-4/`. The equal score
+triggered the mandatory rollback. The service confirmed Candidate A's MD5
+`94daa68fdd1794430b5edbb2b194f57c` as the latest upload at
+`2026-07-14T07:57:27Z`; attempt #5 must become terminal and latest before the
+freeze is complete.
 
 ## Task 6: Deadline Freeze
 
 Candidate A is the current protected incumbent. Final freeze verification
 remains to be done at the scheduled cutoff.
+
+At `2026-07-14T07:57:27Z`, Candidate A was restored after Candidate B tied the
+incumbent. The server confirmed the protected MD5 and started preview attempt
+#5. The validation instance was terminated after all SCP/setup work, leaving
+13h52m. The correct local `.venv` suite then passed 72/72 plus `compileall` and
+`git diff --check`; an earlier invocation with dependency-free `C:/Python313`
+was discarded as an interpreter-selection error.
 
 Pre-freeze readiness was rechecked at `2026-07-14T02:49:29Z`. The contest
 service still reported submission MD5 `94daa68fdd1794430b5edbb2b194f57c`,

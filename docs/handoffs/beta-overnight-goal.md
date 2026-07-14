@@ -59,7 +59,7 @@ Prompt optimization is not a priority: the current production prompt beat both G
 | Decision | Promoted: +3.077 over 7.539. On `2026-07-14`, the user authorized Candidate B to become active, superseding its earlier `skipped` state |
 | Instance / remaining budget | Validation instance stopped after setup preflight; 14.87 hours remained |
 | Rollback history | `C:/tmp/fpl26_beta_submission_runtime_v2.zip` remains immutable for historical rollback only |
-| Remaining action | Evaluate the authorized candidate sequence without starting a candidate after 09:45Z, then perform the 10:30Z hard-freeze verification; Candidate A remains protected |
+| Remaining action | Wait for restored Candidate A preview attempt #5 to become terminal/latest, download final `--all` artifacts, then perform the 10:30Z hard-freeze verification |
 
 ### Pre-freeze checkpoint at 02:49Z
 
@@ -90,6 +90,24 @@ attempt #3, archive `C:/tmp/fpl26_beta_candidate_a.zip`, SHA256
 `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`,
 and MD5 `94daa68fdd1794430b5edbb2b194f57c`. Automatically restore that archive and
 confirm its server MD5 after any worse, equal, failed, or unproven candidate.
+
+### Candidate B rejection and restoration
+
+| Field | Result |
+| --- | --- |
+| Implementation | `ef62cd5` plus fail-safe rollback fix `416e4aa`; targeted 26/26 and full 72/72 tests passed |
+| Candidate archive | `C:/tmp/fpl26_beta_candidate_b.zip`; 1,526,812 bytes; 468 entries |
+| Archive hashes | SHA256 `53d75b9d1205a83edd0db15c8d8c320f5bb2ac5433327f40f2247e44ee7a9684`; MD5 `29a9c8e2161bd8daa85c0319f8302991` |
+| Deployment/setup | Organizer SCP to `i-010122f97d9e8d2fd`; exact extracted `make setup` passed with Vivado 2025.1 bundled Java 11; no `default-jre` install |
+| Preview | Attempt #4 / `v_da0b3a97b453`; completed `2026-07-14T07:25:16Z`; score **10.616**; no global failure; every gate passed |
+| LogicNets | +10.699 MHz; 210.602 s; $0.0192; score 10.616 |
+| Vex v2 | 0 MHz; 148.383 s; $0.0098; score 0; bounded CriticalPin fallback neutral; `no_improvement` |
+| Artifacts | `C:/tmp/beta-preview-attempt4/results/beta/preview/attempt-4/`; all scorecard/log/DCP ZIP hashes recorded in the rehearsal |
+| Decision | Rejected because equality does not pass the strict promotion rule; Candidate A resubmitted at `2026-07-14T07:57:27Z` |
+| Current beta | Protected MD5 `94daa68fdd1794430b5edbb2b194f57c` is the latest server upload; restoration preview attempt #5 is running |
+| Remaining candidates | C skipped for lack of fixed evidence; D skipped at 07:30Z by the mandatory three-hour reserve; no further candidate will start |
+| Instance/budget | Unused instance terminated after SCP/setup retrieval; 13h52m remained |
+| Final local verification | Correct `.venv`: 72/72 tests, `compileall`, and `git diff --check` passed; a dependency-free `C:/Python313` invocation was discarded as an interpreter-selection error |
 
 The table below is the earlier attempt #2 handoff retained for history.
 

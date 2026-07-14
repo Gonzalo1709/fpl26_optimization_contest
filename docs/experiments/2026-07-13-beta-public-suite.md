@@ -107,6 +107,37 @@ of `C:/tmp/fpl26_beta_candidate_a.zip` and confirmation of server MD5
 immutable at `C:/tmp/fpl26_beta_submission_runtime_v2.zip` for historical
 rollback only; final freeze verification remains outstanding.
 
+## Beta Preview Candidate B Result
+
+Candidate B at commits `ef62cd5` and `416e4aa` added one fail-safe CriticalPin
+attempt only after a neutral RuntimeOptimized result on an eligible
+fanout-absent signature. Archive `C:/tmp/fpl26_beta_candidate_b.zip` was
+1,526,812 bytes with 468 entries, SHA256
+`53d75b9d1205a83edd0db15c8d8c320f5bb2ac5433327f40f2247e44ee7a9684`,
+and MD5/server MD5 `29a9c8e2161bd8daa85c0319f8302991`. Organizer SCP
+transferred it to `i-010122f97d9e8d2fd`; exact extracted `make setup` passed
+with Vivado 2025.1 and its bundled Java 11, without installing `default-jre`.
+
+Attempt #4 (`v_da0b3a97b453`) completed at `2026-07-14T07:25:16Z`:
+
+| Benchmark | Input Fmax | Output Fmax | Delta Fmax | Runtime | Cost | Score | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `logicnets_jscl` | 403.551251 MHz | 414.250 MHz | +10.699 MHz | 210.602 s | $0.0192 | 10.616 | All official gates passed |
+| `vexriscv_re-place_v2` | 397.456280 MHz | 397.456 MHz | 0 MHz | 148.383 s | $0.0098 | 0 | All gates passed; bounded fallback neutral; `no_improvement` |
+
+The total **10.616** tied Candidate A rather than strictly improving it. The
+fallback added about 47.9 seconds to the neutral Vex row and no Fmax. Candidate
+B was therefore rejected. All attempt #4 artifacts were downloaded with
+`--all` under
+`C:/tmp/beta-preview-attempt4/results/beta/preview/attempt-4/`.
+
+Candidate A was resubmitted at `2026-07-14T07:57:27Z`; its protected MD5 was
+confirmed and preview attempt #5 is running. Candidate C had no justified
+single-variable change. Candidate D became ineligible at 07:30Z because fewer
+than three hours remained before freeze while B was nonterminal. The validation
+instance was stopped after SCP/setup work with 13h52m remaining. The final local
+suite passed 72/72 plus `compileall` and `git diff --check` in `.venv`.
+
 ## Pre-Freeze Readiness
 
 At `2026-07-14T02:49:29Z`, the live service still showed Candidate A MD5
