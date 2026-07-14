@@ -5,8 +5,13 @@ from unittest.mock import AsyncMock
 
 from src.analysis import DesignSignature
 from src.llm_optimizer import DCPOptimizer
-from src.policy import BudgetState, plan_phys_opt_portfolio
+from src.policy import (
+    BudgetState,
+    plan_neutral_phys_opt_fallback,
+    plan_phys_opt_portfolio,
+)
 from src.scoring import ValidationStatus
+from src.search import GenerationSearchConfig, SearchCandidate
 
 
 def complete_validation(value: bool) -> ValidationStatus:
@@ -21,6 +26,99 @@ def complete_validation(value: bool) -> ValidationStatus:
 
 
 class PhysOptPortfolioPolicyTests(unittest.TestCase):
+    def test_neutral_runtime_fallback_requires_every_safety_gate(self):
+        signature = DesignSignature.from_reports(
+            target_clock="clk_fpl26contest",
+            clock_period_ns=1.57,
+            wns_ns=-1.0,
+            tns_ns=-10.0,
+            failing_endpoints=10,
+            high_fanout_report="",
+            spread_report=None,
+            analysis_duration_seconds=1.0,
+        )
+        neutral = {
+            "strategy": "PHYS_OPT",
+            "args": {"directive": "RuntimeOptimized"},
+            "wns": -1.0,
+            "delta_wns": 0.0,
+        }
+        eligible_budget = BudgetState(
+            remaining_runtime_seconds=900.0,
+            remaining_cost_usd=0.01,
+            validation_reserve_seconds=600.0,
+        )
+
+        attempts = plan_neutral_phys_opt_fallback(
+            signature, eligible_budget, [neutral], ValidationStatus()
+        )
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].name, "CriticalPin")
+        self.assertEqual(attempts[0].tool_args, {"critical_pin_opt": True})
+
+        fanout_signature = DesignSignature.from_reports(
+            target_clock="clk_fpl26contest",
+            clock_period_ns=1.57,
+            wns_ns=-1.0,
+            tns_ns=-10.0,
+            failing_endpoints=10,
+            high_fanout_report=(
+                "Paths Fanout Parent Net Name\n"
+                "1 100 top/critical_net\n"
+                "===\n"
+            ),
+            spread_report=None,
+            analysis_duration_seconds=1.0,
+        )
+        disabled_cases = [
+            (signature, eligible_budget, [{**neutral, "delta_wns": 0.1}], ValidationStatus()),
+            (fanout_signature, eligible_budget, [neutral], ValidationStatus()),
+            (
+                signature,
+                BudgetState(remaining_runtime_seconds=899.9, remaining_cost_usd=0.01),
+                [neutral],
+                ValidationStatus(),
+            ),
+            (
+                signature,
+                BudgetState(remaining_runtime_seconds=900.0, remaining_cost_usd=0.0),
+                [neutral],
+                ValidationStatus(),
+            ),
+            (signature, eligible_budget, [{**neutral, "delta_wns": None}], ValidationStatus()),
+            (signature, eligible_budget, [{**neutral, "delta_wns": "missing"}], ValidationStatus()),
+            (signature, eligible_budget, [{**neutral, "wns": None}], ValidationStatus()),
+            (signature, eligible_budget, [{**neutral, "error": "failed"}], ValidationStatus()),
+            (
+                signature,
+                eligible_budget,
+                [neutral],
+                ValidationStatus(hold_passed=False),
+            ),
+            (
+                signature,
+                eligible_budget,
+                [neutral],
+                ValidationStatus(pulse_width_passed=False),
+            ),
+            (
+                signature,
+                eligible_budget,
+                [neutral, {"strategy": "PHYS_OPT", "args": {"directive": "CriticalPin"}}],
+                ValidationStatus(),
+            ),
+            (
+                signature,
+                eligible_budget,
+                [neutral, {"strategy": "PHYS_OPT", "args": {"directive": "PlacementRouting"}}],
+                ValidationStatus(),
+            ),
+        ]
+        for case in disabled_cases:
+            with self.subTest(case=case):
+                self.assertEqual(plan_neutral_phys_opt_fallback(*case), ())
+
     def test_orders_attempts_from_low_to_high_risk_after_measured_gain(self):
         attempts = plan_phys_opt_portfolio(
             BudgetState(remaining_runtime_seconds=1800.0),
@@ -106,6 +204,85 @@ class PhysOptPortfolioPolicyTests(unittest.TestCase):
 
 
 class PhysOptPortfolioExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fast_neutral_runtime_executes_one_critical_pin_before_patience_stop(self):
+        signature = DesignSignature.from_reports(
+            target_clock="clk_fpl26contest",
+            clock_period_ns=1.57,
+            wns_ns=-1.0,
+            tns_ns=-10.0,
+            failing_endpoints=10,
+            high_fanout_report="",
+            spread_report=None,
+            analysis_duration_seconds=1.0,
+        )
+        parent = SearchCandidate(
+            candidate_id="root",
+            dcp_path=Path("root.dcp"),
+            wns=-1.0,
+            tns=-10.0,
+            failing_endpoints=10,
+            peak_wns=-1.0,
+            generation=0,
+            parent_id=None,
+            branch_index=0,
+            steps_taken=0,
+            steps_since_peak=0,
+            summary="root",
+        )
+        config = GenerationSearchConfig(
+            budget_profile="fast",
+            max_steps_per_branch=1,
+            max_steps_without_improvement=1,
+            wall_clock_limit_seconds=3600.0,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            optimizer = DCPOptimizer(
+                api_key="test-key",
+                run_dir=Path(temporary_directory),
+                system_prompt="test planner prompt",
+                generation_config=config,
+                force_strategy="PHYS_OPT",
+            )
+            optimizer.design_signature = signature
+            optimizer.best_candidate = parent
+            optimizer.initial_wns = -1.0
+            optimizer._restore_candidate_state = AsyncMock()
+            optimizer._save_vivado_checkpoint = AsyncMock(return_value=True)
+            optimizer._execute_strategy = AsyncMock(
+                side_effect=[("runtime report", -1.0), ("critical report", -0.9)]
+            )
+            optimizer._measure_current_metrics = AsyncMock(
+                side_effect=[
+                    {"wns": -1.0, "tns": -10.0, "failing_endpoints": 10},
+                    {"wns": -0.9, "tns": -9.0, "failing_endpoints": 9},
+                ]
+            )
+
+            candidate = await optimizer._run_generation_branch(
+                "analysis",
+                Path(temporary_directory),
+                parent,
+                generation=1,
+                branch_index=1,
+                tried_summaries="",
+            )
+
+        self.assertEqual(
+            [call.args for call in optimizer._execute_strategy.await_args_list],
+            [
+                ("PHYS_OPT", {"directive": "RuntimeOptimized"}),
+                ("PHYS_OPT", {"directive": "CriticalPin"}),
+            ],
+        )
+        self.assertEqual(len(optimizer.history), 2)
+        self.assertEqual(
+            [entry["args"]["directive"] for entry in optimizer.history],
+            ["RuntimeOptimized", "CriticalPin"],
+        )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.wns, -0.9)
+        self.assertIs(optimizer.best_candidate, candidate)
+
     async def test_negative_target_clock_delta_restores_baseline(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             optimizer = DCPOptimizer(

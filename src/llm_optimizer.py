@@ -21,6 +21,7 @@ from src.policy import (
     BudgetState,
     EligibleAction,
     gate_actions,
+    plan_neutral_phys_opt_fallback,
     rank_fanout_candidates,
     select_route_preserve_nets,
 )
@@ -2431,6 +2432,113 @@ class DCPOptimizer(DCPOptimizerBase):
             }
             branch_history.append(completed_step)
             self.history.append(completed_step)
+
+            neutral_fallback = (
+                plan_neutral_phys_opt_fallback(
+                    self.design_signature,
+                    self._current_budget_state(),
+                    history=self.history,
+                    validation=self.validation_status,
+                )
+                if self.design_signature is not None
+                else ()
+            )
+            if neutral_fallback:
+                fallback_args = {"directive": neutral_fallback[0].name}
+                fallback_previous_wns = current_wns
+                fallback_previous_metrics = current_metrics
+                fallback_start_time = time.time()
+                try:
+                    result_report, current_wns = await self._execute_strategy(
+                        "PHYS_OPT", fallback_args
+                    )
+                    fallback_elapsed_time = time.time() - fallback_start_time
+                    current_metrics = await self._measure_current_metrics(result_report)
+                except Exception as exc:
+                    fallback_elapsed_time = time.time() - fallback_start_time
+                    logger.exception(
+                        "Error during bounded neutral PHYS_OPT fallback in branch %s step %s",
+                        branch_id,
+                        step,
+                    )
+                    try:
+                        baseline_checkpoint = Path(self.temp_dir) / "phys_opt_baseline.dcp"
+                        await self.v(
+                            "open_checkpoint",
+                            {"dcp_path": str(baseline_checkpoint.resolve())},
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not restore neutral PHYS_OPT fallback baseline"
+                        )
+                    fallback_failed_step = {
+                        "step": step,
+                        "strategy": "PHYS_OPT",
+                        "args": fallback_args,
+                        "wns": None,
+                        "error": str(exc),
+                        "elapsed_seconds": fallback_elapsed_time,
+                    }
+                    branch_history.append(fallback_failed_step)
+                    self.history.append(fallback_failed_step)
+                    used_action_signatures.add(
+                        self._action_signature("PHYS_OPT", fallback_args)
+                    )
+                    current_wns = fallback_previous_wns
+                    current_metrics = fallback_previous_metrics
+                else:
+                    fallback_delta_vs_peak = (
+                        current_wns - peak_metrics["wns"]
+                        if current_wns is not None and peak_metrics.get("wns") is not None
+                        else None
+                    )
+                    fallback_step = {
+                        "step": step,
+                        "strategy": "PHYS_OPT",
+                        "args": fallback_args,
+                        "wns": current_wns,
+                        "tns": current_metrics.get("tns"),
+                        "failing_endpoints": current_metrics.get("failing_endpoints"),
+                        "delta_wns": (
+                            current_wns - fallback_previous_wns
+                            if current_wns is not None and fallback_previous_wns is not None
+                            else None
+                        ),
+                        "delta_vs_peak": fallback_delta_vs_peak,
+                        "elapsed_seconds": fallback_elapsed_time,
+                        "roi_accepted": self._is_step_roi_acceptable(
+                            fallback_delta_vs_peak, fallback_elapsed_time
+                        ),
+                        "previous_wns": fallback_previous_wns,
+                        "delta_tns": (
+                            current_metrics.get("tns") - fallback_previous_metrics["tns"]
+                            if current_metrics.get("tns") is not None
+                            and fallback_previous_metrics.get("tns") is not None
+                            else None
+                        ),
+                        "delta_failing_endpoints": (
+                            current_metrics.get("failing_endpoints")
+                            - fallback_previous_metrics["failing_endpoints"]
+                            if current_metrics.get("failing_endpoints") is not None
+                            and fallback_previous_metrics.get("failing_endpoints") is not None
+                            else None
+                        ),
+                        "delta_vs_parent": (
+                            current_wns - parent.wns
+                            if current_wns is not None and parent.wns is not None
+                            else None
+                        ),
+                    }
+                    branch_history.append(fallback_step)
+                    self.history.append(fallback_step)
+                    used_action_signatures.add(
+                        self._action_signature("PHYS_OPT", fallback_args)
+                    )
+                    strategy = "PHYS_OPT"
+                    args = fallback_args
+                    delta_vs_peak = fallback_delta_vs_peak
+                    step_elapsed_time += fallback_elapsed_time
+                    roi_accepted = fallback_step["roi_accepted"]
 
             checkpoint_path = search_dir / f"{branch_id}_step{step:02d}.dcp"
             saved = await self._save_vivado_checkpoint(checkpoint_path)

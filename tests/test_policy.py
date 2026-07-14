@@ -153,6 +153,76 @@ class RecipePolicyTests(unittest.TestCase):
 
         self.assertIn("PHYS_OPT", strategies)
 
+    def test_neutral_phys_opt_fallback_is_exposed_only_without_fanout(self):
+        neutral_history = [
+            {
+                "strategy": "PHYS_OPT",
+                "args": {"directive": "RuntimeOptimized"},
+                "wns": -1.0,
+                "delta_wns": 0.0,
+            }
+        ]
+        budget = BudgetState(remaining_runtime_seconds=900.0, remaining_cost_usd=0.01)
+        no_fanout = gate_actions(make_signature(), budget=budget, history=neutral_history)
+        with_fanout = gate_actions(
+            make_signature(
+                high_fanout_report=(
+                    "Paths Fanout Parent Net Name\n"
+                    "1 100 top/critical_net\n"
+                    "===\n"
+                )
+            ),
+            budget=budget,
+            history=neutral_history,
+        )
+
+        no_fanout_phys = next(action for action in no_fanout if action.strategy == "PHYS_OPT")
+        fanout_phys = next(action for action in with_fanout if action.strategy == "PHYS_OPT")
+        self.assertEqual(no_fanout_phys.allowed_args["directive"], ["RuntimeOptimized", "CriticalPin"])
+        self.assertEqual(fanout_phys.allowed_args["directive"], ["RuntimeOptimized"])
+
+    def test_neutral_phys_opt_history_does_not_change_pblock_or_hard_block_gates(self):
+        neutral_history = [
+            {
+                "strategy": "PHYS_OPT",
+                "args": {"directive": "RuntimeOptimized"},
+                "wns": -1.0,
+                "delta_wns": 0.0,
+            }
+        ]
+        signatures = [
+            make_signature(),
+            make_signature(
+                spread={"max_distance_found": 200, "avg_max_distance": 130, "paths_analyzed": 10},
+                critical_paths=[["cache/RAMB36E2", "top/out_reg"]],
+            ),
+        ]
+        budget = BudgetState(remaining_runtime_seconds=900.0, remaining_cost_usd=0.01)
+
+        for signature in signatures:
+            before = {action.strategy for action in gate_actions(signature, budget=budget)}
+            after = {
+                action.strategy
+                for action in gate_actions(signature, budget=budget, history=neutral_history)
+            }
+            self.assertEqual(before & {"PBLOCK", "HARD_BLOCK"}, after & {"PBLOCK", "HARD_BLOCK"})
+
+    def test_sanitizer_rejects_critical_pin_when_neutral_gate_is_false(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            optimizer = DCPOptimizer(
+                api_key="test-key",
+                run_dir=Path(temporary_directory),
+                system_prompt="test planner prompt",
+            )
+            optimizer.design_signature = make_signature()
+
+            strategy, args = optimizer.sanitize_action(
+                {"strategy": "PHYS_OPT", "args": {"directive": "CriticalPin"}}
+            )
+
+        self.assertEqual(strategy, "PHYS_OPT")
+        self.assertEqual(args, {"directive": "RuntimeOptimized"})
+
     def test_validation_reserve_allows_only_no_op(self):
         actions = gate_actions(
             make_signature(),

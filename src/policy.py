@@ -104,6 +104,56 @@ class PhysOptAttempt:
     tool_args: dict
 
 
+def plan_neutral_phys_opt_fallback(
+    signature: DesignSignature,
+    budget: BudgetState,
+    history: Iterable[dict] = (),
+    validation: ValidationStatus | None = None,
+) -> tuple[PhysOptAttempt, ...]:
+    """Return the one bounded alternate after an explicitly neutral runtime pass."""
+    history = tuple(history)
+    validation = validation or ValidationStatus()
+    if not history or signature.high_fanout_candidates:
+        return ()
+    if (
+        budget.remaining_runtime_seconds
+        < budget.validation_reserve_seconds + 300
+        or budget.remaining_cost_usd <= 0
+        or validation.hold_passed is False
+        or validation.pulse_width_passed is False
+    ):
+        return ()
+
+    for item in history:
+        if item.get("strategy") != "PHYS_OPT":
+            continue
+        directive = (item.get("args") or {}).get("directive")
+        if directive != "RuntimeOptimized":
+            return ()
+
+    completed = history[-1]
+    delta_wns = completed.get("delta_wns")
+    try:
+        is_explicitly_neutral = delta_wns is not None and float(delta_wns) == 0.0
+    except (TypeError, ValueError):
+        is_explicitly_neutral = False
+    if (
+        completed.get("strategy") != "PHYS_OPT"
+        or (completed.get("args") or {}).get("directive") != "RuntimeOptimized"
+        or completed.get("error") is not None
+        or completed.get("wns") is None
+        or not is_explicitly_neutral
+    ):
+        return ()
+
+    return (
+        PhysOptAttempt(
+            name="CriticalPin",
+            tool_args={"critical_pin_opt": True},
+        ),
+    )
+
+
 def plan_phys_opt_portfolio(
     budget: BudgetState,
     history: Iterable[dict] = (),
@@ -205,6 +255,12 @@ def gate_actions(
         )
 
     phys_opt_attempts = plan_phys_opt_portfolio(
+        budget,
+        history=history,
+        validation=validation,
+    )
+    phys_opt_attempts += plan_neutral_phys_opt_fallback(
+        signature,
         budget,
         history=history,
         validation=validation,
