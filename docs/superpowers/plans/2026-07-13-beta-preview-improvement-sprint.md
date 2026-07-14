@@ -184,7 +184,7 @@ does not prevent the user-authorized candidate sequence from continuing.
 - [x] Restore the last proven incumbent if the latest candidate is unproven; no freeze-time restoration was needed because Candidate A attempt #5 was already terminal/latest.
 - [x] Verify the latest beta MD5, `confirmed` status, positive preview, and no newer pending attempt.
 - [x] Download final `--all` artifacts, confirm no instance is running, and update the rehearsal/public-suite/handoff documents.
-- [ ] Independently review the final diff, commit it conventionally, and push it to origin.
+- [x] Independently review the final diff, commit it conventionally as `7fcd642` (`docs: finalize beta freeze`), and push it to origin.
 
 ### Hard freeze evidence at 10:30Z
 
