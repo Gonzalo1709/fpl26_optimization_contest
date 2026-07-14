@@ -90,3 +90,51 @@ outputs. No attempt #3 was submitted because the zero Vex row already selected
 the intended low-risk PHYS_OPT directive and there is no fixed evidence that a
 policy change would improve the distinct `v2` checkpoint without risking the
 confirmed positive LogicNets result.
+
+## Candidate A Promotion
+
+The earlier decision was superseded by the bounded Candidate A change at
+`75cf2498f0bb9a0d0b34c9e405d4f9086e900ba3`
+(`feat: stop low-value fast search expansion`). Candidate A strictly improved
+the 7.539 incumbent, so Candidate B's conditional gate was false and Candidate
+B was skipped.
+
+### Final Candidate A archive preflight
+
+| Gate | Result |
+| --- | --- |
+| Archive | `C:/tmp/fpl26_beta_candidate_a.zip` |
+| SHA256 | `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141` |
+| MD5 / server MD5 | `94daa68fdd1794430b5edbb2b194f57c` |
+| Byte size | 1,525,735 bytes |
+| Entries | 468 |
+| Packaging method | Preserved all incumbent ZIP metadata; replaced only `src/search.py` and `src/llm_optimizer.py` |
+| Extracted `make setup` | Passed on disposable instance `i-010aa4c4964acf607` using the Vivado 2025.1 bundled JRE; no `default-jre` install was needed |
+| Manual non-test SSH run | Not possible: the SSH environment lacked an injected OpenRouter key, and credentials were not transferred |
+| Official non-test evidence | Preview attempt #3 performed the full run with metering |
+
+The first Windows repack was rejected before submission because it stripped
+the executable metadata from `RapidWright/gradlew`. The submitted package
+preserved all incumbent ZIP metadata and changed only the two Candidate A
+source files. The validation instance was stopped after setup preflight with
+14.87 hours remaining.
+
+### Preview attempt #3 scorecard
+
+- Submission confirmed: `2026-07-14T01:25:04Z`
+- Validation: `v_520de46a2c58`
+- Completed: `2026-07-14T01:47:24Z`
+- Total score: **10.616**
+- Global status: completed; global failure: null
+- Artifacts:
+  `C:/tmp/beta-preview-attempt3/{scorecard.json,logs.zip,dcp_results.zip}`
+
+| Benchmark | Input Fmax | Output Fmax | Delta Fmax | Runtime | Cost | Score | Validation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `logicnets_jscl` | 403.551251 MHz | 414.250 MHz | +10.699 MHz | 210.633 s | $0.0195 | 10.616 | Routed, DRC, hold, pulse-width, and simulation gates all passed |
+| `vexriscv_re-place_v2` | 397.456280 MHz | 397.456 MHz | 0 MHz | 100.498 s | $0.0098 | 0 | All gates passed; failure reason `no_improvement` |
+
+Candidate A improves the former 7.539 incumbent by 3.077 points and is now the
+protected incumbent. The previous archive remains immutable at
+`C:/tmp/fpl26_beta_submission_runtime_v2.zip` for historical rollback only.
+The deadline freeze verification remains outstanding.

@@ -24,17 +24,20 @@
 
 | Field | Value |
 | --- | --- |
-| Preview | Attempt #2 / `v_cafee7d2e8e6` |
-| Score | **7.539** |
-| Submission MD5 | `9b55acba24a3788449a2b0b175d77ec3` |
-| Archive | `C:/tmp/fpl26_beta_submission_runtime_v2.zip` |
-| SHA256 | `bf12a10ab56986a275f3275e4e8589a185a582361fbd8388da82dec4a545f5a0` |
-| Packaged source | `8d9c176` |
-| LogicNets | +7.633 MHz, score 7.539, all gates passed |
-| Vex v2 | 0 MHz, all gates passed |
+| Preview | Attempt #3 / `v_520de46a2c58` |
+| Score | **10.616** |
+| Submission MD5 | `94daa68fdd1794430b5edbb2b194f57c` |
+| Archive | `C:/tmp/fpl26_beta_candidate_a.zip` |
+| SHA256 | `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141` |
+| Packaged source | `75cf2498f0bb9a0d0b34c9e405d4f9086e900ba3` (`feat: stop low-value fast search expansion`) |
+| LogicNets | +10.699 MHz, score 10.616, all gates passed |
+| Vex v2 | 0 MHz, score 0, all gates passed; `no_improvement` |
 | Restore action | Resubmit the archive above and confirm its MD5 |
 
-Attempt #2 artifacts are in `C:/tmp/beta-preview-attempt2/`. The disposable VM was stopped with 15.19 hours remaining.
+Attempt #3 artifacts are in `C:/tmp/beta-preview-attempt3/`. The validation
+instance was stopped after setup preflight with 14.87 hours remaining. The
+former 7.539 incumbent remains immutable at
+`C:/tmp/fpl26_beta_submission_runtime_v2.zip` for historical rollback only.
 
 ## Evidence and Approach
 
@@ -53,25 +56,28 @@ Alternatives, in order: (1) early-stop only for the lowest-risk cost/runtime imp
 
 ## Task 1: Freeze and Verify the Incumbent
 
-- [ ] Confirm `beta_status=confirmed`, MD5 `9b55acba24a3788449a2b0b175d77ec3`, and attempt #2 score 7.539.
-- [ ] Recompute the incumbent ZIP SHA256 and MD5.
-- [ ] Run the full local suite: `.venv/Scripts/python.exe -m unittest discover -s tests -v`; expect 57 passing tests before new tests.
-- [ ] Record the current UTC time and remaining experiment window in the rehearsal document.
+- [x] Confirm `beta_status=confirmed`, MD5 `9b55acba24a3788449a2b0b175d77ec3`, and attempt #2 score 7.539.
+- [x] Recompute the incumbent ZIP SHA256 and MD5.
+- [x] Run the full local suite: `.venv/Scripts/python.exe -m unittest discover -s tests -v`; 57 tests passed before Candidate A.
+- [x] Record the current UTC time and remaining experiment window in the rehearsal document.
 
 ## Task 2: Candidate A — Score-Aware Fast Early Stop
 
 **Files:** modify `src/search.py`, `src/llm_optimizer.py`; test `tests/test_search_ranking.py`.
 
-- [ ] Add a failing test proving that only the `fast` profile stops expansion after a candidate has positive projected score and an accepted WNS/Fmax gain; zero-gain roots and other profiles remain expandable.
-- [ ] Run the targeted test and observe the expected failure.
-- [ ] Implement the smallest pure helper in `src/search.py` and call it after updating `best_candidate` in `_optimize_generational`.
-- [ ] Run targeted and full tests; commit `feat: stop low-value fast search expansion`.
-- [ ] Package, audit, run extracted `make setup`, submit, and wait for the preview.
-- [ ] Promote only if score exceeds 7.539 with all gates passing; otherwise restore the incumbent immediately.
+- [x] Add a failing test proving that only the `fast` profile stops expansion after a candidate has positive projected score and an accepted WNS/Fmax gain; zero-gain roots and other profiles remain expandable.
+- [x] Run the targeted test and observe the expected failure.
+- [x] Implement the smallest pure helper in `src/search.py` and call it after updating `best_candidate` in `_optimize_generational`.
+- [x] Run targeted and full tests; commit `feat: stop low-value fast search expansion` (`75cf2498f0bb9a0d0b34c9e405d4f9086e900ba3`).
+- [x] Package, audit, run extracted `make setup`, submit, and wait for the preview.
+- [x] Promote after attempt #3 scored 10.616, exceeding 7.539 with no global failure and all gates passing.
 
 ## Task 3: Candidate B — Bounded Neutral PHYS_OPT Fallback
 
 Run only if time remains and Candidate A did not produce a sufficient improvement.
+
+**Skipped:** Candidate A strictly improved the incumbent, so this task's
+condition was false. None of the implementation bullets below were performed.
 
 **Files:** modify `src/policy.py`, `src/llm_optimizer.py`; test `tests/test_phys_opt_portfolio.py` and `tests/test_policy.py`.
 
@@ -83,21 +89,24 @@ Run only if time remains and Candidate A did not produce a sufficient improvemen
 
 ## Task 4: Runtime-Only Packaging Gate
 
-- [ ] Include only `Makefile`, `requirements.txt`, `dcp_optimizer.py`, `SYSTEM_PROMPT.TXT`, `src/`, `RapidWrightMCP/`, `VivadoMCP/`, and build-required RapidWright sources.
-- [ ] Keep RapidWright's Java package named `tests`; v3 proved production classes import it.
-- [ ] Reject any ZIP containing Git metadata, credentials, keys, DCPs, logs, documentation, generated runs, or standalone test suites.
-- [ ] Extract into a fresh directory and run exact `make setup` before every submission.
+- [x] Include only `Makefile`, `requirements.txt`, `dcp_optimizer.py`, `SYSTEM_PROMPT.TXT`, `src/`, `RapidWrightMCP/`, `VivadoMCP/`, and build-required RapidWright sources.
+- [x] Keep RapidWright's Java package named `tests`; v3 proved production classes import it.
+- [x] Reject any ZIP containing Git metadata, credentials, keys, DCPs, logs, documentation, generated runs, or standalone test suites.
+- [x] Extract into a fresh directory and run exact `make setup` before every submission. Candidate A passed on `i-010aa4c4964acf607` with the Vivado 2025.1 bundled JRE and no `default-jre` install.
 
 ## Task 5: Serialized Preview and Restoration Loop
 
-- [ ] Confirm no preview is running, submit one candidate, and confirm its MD5.
-- [ ] Wait for the terminal preview state; do not supersede it.
-- [ ] Download scorecard, logs, and DCP results with the `--preview --attempt N --all` equivalent.
-- [ ] Record score, per-row Fmax, cost, runtime, gates, archive hashes, commit, and decision.
-- [ ] If worse/equal/failed, resubmit the protected incumbent and confirm restoration.
-- [ ] If better and fully valid, update the protected-incumbent table and keep the winning archive immutable.
+- [x] Confirm no preview is running, submit one candidate, and confirm its MD5.
+- [x] Wait for the terminal preview state; do not supersede it.
+- [x] Download scorecard, logs, and DCP results with the `--preview --attempt N --all` equivalent.
+- [x] Record score, per-row Fmax, cost, runtime, gates, archive hashes, commit, and decision.
+- [x] Apply the worse/equal/failed restoration rule; restoration was not needed because Candidate A improved.
+- [x] Promote Candidate A and keep `C:/tmp/fpl26_beta_candidate_a.zip` immutable as the current protected incumbent.
 
 ## Task 6: Deadline Freeze
+
+Candidate A is the current protected incumbent. Final freeze verification
+remains to be done at the scheduled cutoff.
 
 - [ ] At `2026-07-14T08:30:00Z`, stop new candidates.
 - [ ] Restore the last proven incumbent if the latest candidate is unproven.

@@ -68,3 +68,31 @@ Four of nine new control rows are complete. No policy change is justified from
 this incomplete matrix, although PBLOCK now has one validated positive on an
 extreme multi-path-spread signature and two neutral results on others; it
 remains correctly gated and cannot yet be promoted more broadly.
+
+## Beta Preview Candidate A Result
+
+Candidate A at `75cf2498f0bb9a0d0b34c9e405d4f9086e900ba3`
+(`feat: stop low-value fast search expansion`) was submitted as archive
+`C:/tmp/fpl26_beta_candidate_a.zip`. The 1,525,735-byte archive has 468 entries,
+SHA256 `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`,
+and MD5/server MD5 `94daa68fdd1794430b5edbb2b194f57c`.
+
+Attempt #3 (`v_520de46a2c58`) was confirmed at `2026-07-14T01:25:04Z` and
+completed at `2026-07-14T01:47:24Z` with score **10.616**, completed global
+status, and no global failure.
+
+| Benchmark | Input Fmax | Output Fmax | Delta Fmax | Runtime | Cost | Score | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `logicnets_jscl` | 403.551251 MHz | 414.250 MHz | +10.699 MHz | 210.633 s | $0.0195 | 10.616 | Routed, DRC, hold, pulse-width, and simulation gates all passed |
+| `vexriscv_re-place_v2` | 397.456280 MHz | 397.456 MHz | 0 MHz | 100.498 s | $0.0098 | 0 | All gates passed; `no_improvement` |
+
+The official preview supplied the full non-test run with metering. A manual SSH
+non-test run was not possible because the instance environment had no injected
+OpenRouter key and credentials were not transferred. Artifacts are retained at
+`C:/tmp/beta-preview-attempt3/{scorecard.json,logs.zip,dcp_results.zip}`.
+
+Candidate A improves the former beta incumbent by 3.077 points and is the
+current protected incumbent. Candidate B was skipped because its condition was
+false after this strict improvement. The former incumbent archive remains
+immutable at `C:/tmp/fpl26_beta_submission_runtime_v2.zip` for historical
+rollback only; final freeze verification remains outstanding.

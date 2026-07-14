@@ -41,6 +41,28 @@ Prompt optimization is not a priority: the current production prompt beat both G
 
 ## Morning Handoff
 
+### Candidate A promotion update
+
+| Field | Result |
+| --- | --- |
+| Branch / promoted commit | `feat/score-aware-optimizer-portfolio` / `75cf2498f0bb9a0d0b34c9e405d4f9086e900ba3` (`feat: stop low-value fast search expansion`) |
+| Protected beta preview | Attempt #3 / `v_520de46a2c58`; score **10.616**; completed `2026-07-14T01:47:24Z`; no global failure |
+| Submission | Confirmed `2026-07-14T01:25:04Z`; MD5 `94daa68fdd1794430b5edbb2b194f57c` |
+| LogicNets | 403.551251 -> 414.250 MHz; +10.699 MHz; score 10.616; 210.633 s; $0.0195; all gates passed |
+| Vex v2 | 397.456280 -> 397.456 MHz; 0 MHz; score 0; 100.498 s; $0.0098; all gates passed; `no_improvement` |
+| Candidate A archive | `C:/tmp/fpl26_beta_candidate_a.zip`; 1,525,735 bytes; 468 entries |
+| Archive hashes | SHA256 `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`; MD5 `94daa68fdd1794430b5edbb2b194f57c` |
+| Setup preflight | Exact extracted `make setup` passed on `i-010aa4c4964acf607` using the Vivado 2025.1 bundled JRE; no `default-jre` install |
+| Package correction | First Windows repack rejected before submission after stripping `RapidWright/gradlew` executable metadata; final package preserved incumbent ZIP metadata and replaced only `src/search.py` and `src/llm_optimizer.py` |
+| Non-test execution | Manual SSH run unavailable without an injected OpenRouter key; credentials were not transferred; official preview performed the full metered run |
+| Artifacts | `C:/tmp/beta-preview-attempt3/{scorecard.json,logs.zip,dcp_results.zip}` |
+| Decision | Promoted: +3.077 over 7.539. Candidate B skipped because its conditional gate was false |
+| Instance / remaining budget | Validation instance stopped after setup preflight; 14.87 hours remained |
+| Rollback history | `C:/tmp/fpl26_beta_submission_runtime_v2.zip` remains immutable for historical rollback only |
+| Remaining action | Perform final freeze verification; Candidate A is the current protected incumbent |
+
+The table below is the earlier attempt #2 handoff retained for history.
+
 | Field | Result |
 | --- | --- |
 | Final branch / commit | `feat/score-aware-optimizer-portfolio` / `8d9c176` (`docs: record finn screening`) |
