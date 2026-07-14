@@ -179,11 +179,36 @@ suite passed 63/63 plus `compileall`. The existing PID `38892` watcher scheduled
 for 08:30Z is read-only pre-freeze evidence; it is not the new hard freeze and
 does not prevent the user-authorized candidate sequence from continuing.
 
-- [ ] Do not start a new candidate after `2026-07-14T09:45:00Z`.
-- [ ] At `2026-07-14T10:30:00Z`, enforce the hard experimental freeze.
-- [ ] Restore the last proven incumbent if the latest candidate is unproven.
-- [ ] Verify the latest beta MD5, `confirmed` status, positive preview, and no newer pending attempt.
-- [ ] Download final `--all` artifacts, stop unused instances after SCP retrieval, update the rehearsal/public-suite/handoff documents, and push the final conventional documentation commit.
+- [x] Do not start a new candidate after `2026-07-14T09:45:00Z`; the cutoff passed with Candidate A attempt #5 completed/latest and no newer upload.
+- [x] At `2026-07-14T10:30:00Z`, enforce the hard experimental freeze.
+- [x] Restore the last proven incumbent if the latest candidate is unproven; no freeze-time restoration was needed because Candidate A attempt #5 was already terminal/latest.
+- [x] Verify the latest beta MD5, `confirmed` status, positive preview, and no newer pending attempt.
+- [x] Download final `--all` artifacts, confirm no instance is running, and update the rehearsal/public-suite/handoff documents.
+- [ ] Independently review the final diff, commit it conventionally, and push it to origin.
+
+### Hard freeze evidence at 10:30Z
+
+The scheduled watcher woke at `2026-07-14T10:30:07Z` and independently
+reconfirmed the protected archive SHA256 and MD5, but its contest log was empty
+and it exited before artifact/test collection. That partial run was not accepted
+as completion evidence. The complete freeze protocol was rerun interactively
+from `2026-07-14T10:31:08Z` using the known-good client environment.
+
+- Server beta MD5: `94daa68fdd1794430b5edbb2b194f57c`.
+- Latest preview: attempt #5 / `v_a6e8e4d1915a`, completed, score **10.788**,
+  no global failure and no newer pending attempt.
+- Instance: none running; budget remaining: 13h52m.
+- Archive: SHA256
+  `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`,
+  MD5 `94daa68fdd1794430b5edbb2b194f57c`.
+- Fresh `--all` root:
+  `C:/tmp/fpl26-beta-freeze-final-1030-interactive/results/beta/preview/attempt-5/`.
+- Fresh scorecard/logs/DCP hashes exactly matched the attempt #5 hashes already
+  recorded in the rehearsal.
+- Scorecard audit: both rows scored; every routing, DRC, hold, pulse-width, and
+  simulation gate passed.
+- Final local verification: 72/72 tests passed in `.venv`; `compileall` and
+  `git diff --check` passed.
 
 ## Definition of Done
 

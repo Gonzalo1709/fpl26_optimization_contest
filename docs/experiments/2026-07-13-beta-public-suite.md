@@ -152,3 +152,18 @@ scorecard, logs, and DCP-result SHA256 hashes. The local suite passed 63/63 plus
 `compileall`. The existing PID `38892` watcher at 08:30Z is read-only pre-freeze
 evidence, not the new hard freeze. Under the `2026-07-14` authorization, no new
 candidate may start after 09:45Z and the hard experimental freeze is 10:30Z.
+
+## Final Beta Freeze Result
+
+The 09:45Z candidate cutoff and 10:30Z hard freeze passed without any newer
+candidate or upload. An interactive freeze audit at 10:31Z confirmed Candidate
+A MD5 `94daa68fdd1794430b5edbb2b194f57c` as the latest beta submission and
+attempt #5 / `v_a6e8e4d1915a` as completed/non-stale at **10.788**, with no
+newer pending attempt. No validation instance was running and 13h52m remained.
+
+The final `--all` download under
+`C:/tmp/fpl26-beta-freeze-final-1030-interactive/` exactly reproduced the
+recorded scorecard, log, and DCP-result hashes. Both benchmark rows were scored
+and all official legality, routing, DRC, hold, pulse-width, and simulation gates
+were true. The final `.venv` suite passed 72/72 plus `compileall` and `git diff
+--check`.

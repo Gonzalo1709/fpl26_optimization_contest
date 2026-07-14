@@ -255,3 +255,32 @@ The full local suite passed 63/63 and `compileall` passed at 02:51Z. This is a
 readiness checkpoint only. The PID `38892` watcher at 08:30Z provides read-only
 pre-freeze evidence; the user-authorized candidate window and the 10:30Z hard
 freeze remain pending.
+
+## Final Hard Freeze
+
+At `2026-07-14T10:30:00Z`, experimentation remained stopped and Candidate A
+attempt #5 remained the latest beta submission. The scheduled watcher woke at
+10:30:07Z and correctly rehashed the archive, but its contest log was empty and
+it stopped before artifact/test collection. Its partial output was rejected;
+the complete procedure was rerun interactively beginning at 10:31:08Z.
+
+| Freeze gate | Final result |
+| --- | --- |
+| Server beta MD5 | `94daa68fdd1794430b5edbb2b194f57c` |
+| Latest preview | Attempt #5 / `v_a6e8e4d1915a`; completed; score **10.788**; no failure or newer pending attempt |
+| Archive | `C:/tmp/fpl26_beta_candidate_a.zip`; 1,525,735 bytes; 468 entries |
+| Archive hashes | SHA256 `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`; MD5 `94daa68fdd1794430b5edbb2b194f57c` |
+| Instance / budget | No instance running; 13h52m remaining |
+| Final tests | `.venv` full suite 72/72; `compileall`; `git diff --check` all passed |
+| Final artifact root | `C:/tmp/fpl26-beta-freeze-final-1030-interactive/results/beta/preview/attempt-5/` |
+
+The fresh `--all` download reproduced the authoritative attempt #5 files:
+
+| Artifact | Bytes | SHA256 |
+| --- | ---: | --- |
+| `scorecard.json` | 2,079 | `dcda55b6f2486045e5693dabf6f3ca27a2745a8c8ce5ca060370d2d10bda26f4` |
+| `logs.zip` | 114,245 | `8417456d2bd24cbe590e18ac92882cd19da2b945e58bcc178f2478bb183363ef` |
+| `dcp_results.zip` | 15,126,058 | `77fb1320f5eeeceea3c14ec712833a9ab8d6f786078b6e2f313f3c49358a5112` |
+
+The parsed scorecard reported `status=completed`, `total_score=10.788`, null
+global failure, both rows scored, and every official validation gate true.

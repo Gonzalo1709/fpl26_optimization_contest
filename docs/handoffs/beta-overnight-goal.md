@@ -110,6 +110,26 @@ confirm its server MD5 after any worse, equal, failed, or unproven candidate.
 | Instance/budget | Unused instance terminated after SCP/setup retrieval; 13h52m remained |
 | Final local verification | Correct `.venv`: 72/72 tests, `compileall`, and `git diff --check` passed; a dependency-free `C:/Python313` invocation was discarded as an interpreter-selection error |
 
+### Final 10:30Z freeze handoff
+
+- The 09:45Z new-candidate cutoff passed with no new upload. Candidate A remained
+  locked through the 10:30Z hard freeze.
+- Interactive live verification at 10:31Z confirmed beta MD5
+  `94daa68fdd1794430b5edbb2b194f57c`, latest completed attempt #5 /
+  `v_a6e8e4d1915a`, score **10.788**, no failure, and no newer pending attempt.
+- No contest instance was running; 13h52m remained.
+- Final `--all` artifacts are under
+  `C:/tmp/fpl26-beta-freeze-final-1030-interactive/results/beta/preview/attempt-5/`
+  and exactly match the full SHA256 hashes in the rehearsal.
+- The protected archive still matches SHA256
+  `337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`
+  and MD5 `94daa68fdd1794430b5edbb2b194f57c`.
+- Final verification passed 72/72 tests in `.venv`, `compileall`, and `git diff
+  --check`.
+- The scheduled 10:30 watcher produced only the correct archive hashes and an
+  empty contest log, so its partial result was discarded and replaced by the
+  complete interactive evidence above.
+
 The table below is the earlier attempt #2 handoff retained for history.
 
 | Field | Result |
