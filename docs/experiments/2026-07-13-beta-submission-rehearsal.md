@@ -138,3 +138,26 @@ Candidate A improves the former 7.539 incumbent by 3.077 points and is now the
 protected incumbent. The previous archive remains immutable at
 `C:/tmp/fpl26_beta_submission_runtime_v2.zip` for historical rollback only.
 The deadline freeze verification remains outstanding.
+
+## Pre-Freeze Readiness Checkpoint
+
+At `2026-07-14T02:49:29Z`, the organizer service again reported Candidate A as
+the confirmed beta submission, attempt #3 as completed with score **10.616**, no
+newer attempt, no running validation instance, and 14h52m remaining. The archive
+still matched SHA256
+`337d9c4381c21cd99dce340b104d15faaa4e4e7027a92eeb6d61f80b5ae9b141`
+and MD5 `94daa68fdd1794430b5edbb2b194f57c`.
+
+The final artifact set was refreshed with the organizer's `--all` command into
+`C:/tmp/fpl26-beta-freeze-final/results/beta/preview/attempt-3/`:
+
+| Artifact | Bytes | SHA256 |
+| --- | ---: | --- |
+| `scorecard.json` | 2,079 | `1d7dd95e0ebc272a2513e8ab4ab34268ed58704836d4f72cbe1ca169ee8b9b7c` |
+| `logs.zip` | 118,549 | `c4cd02b238a754e767fc8f53bb909501772035f92db45cb491d12d22e825a92e` |
+| `dcp_results.zip` | 15,129,275 | `080bdb0b067302418cc98ce5408fa96a7cad794169dd978d445dbbe57dcd8676` |
+
+The full local suite passed 63/63 and `compileall` passed at 02:51Z. This is a
+readiness checkpoint only: the scheduled 08:30Z freeze observation and final
+documentation commit remain pending because the app automation backend was
+unavailable.

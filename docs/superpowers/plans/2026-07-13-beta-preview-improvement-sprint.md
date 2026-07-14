@@ -108,6 +108,15 @@ condition was false. None of the implementation bullets below were performed.
 Candidate A is the current protected incumbent. Final freeze verification
 remains to be done at the scheduled cutoff.
 
+Pre-freeze readiness was rechecked at `2026-07-14T02:49:29Z`. The contest
+service still reported submission MD5 `94daa68fdd1794430b5edbb2b194f57c`,
+completed preview attempt #3 with score 10.616, no newer attempt, no running
+instance, and 14h52m of instance budget. The protected ZIP hashes still match.
+The organizer `--all` command refreshed all three artifacts under
+`C:/tmp/fpl26-beta-freeze-final/results/beta/preview/attempt-3/`, and the local
+suite passed 63/63 plus `compileall`. The app automation backend was unavailable,
+so this checkpoint does not replace the required observation at 08:30Z.
+
 - [ ] At `2026-07-14T08:30:00Z`, stop new candidates.
 - [ ] Restore the last proven incumbent if the latest candidate is unproven.
 - [ ] Verify the latest beta MD5, `confirmed` status, positive preview, and no newer pending attempt.

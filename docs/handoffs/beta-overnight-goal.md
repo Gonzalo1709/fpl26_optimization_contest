@@ -61,6 +61,20 @@ Prompt optimization is not a priority: the current production prompt beat both G
 | Rollback history | `C:/tmp/fpl26_beta_submission_runtime_v2.zip` remains immutable for historical rollback only |
 | Remaining action | Perform final freeze verification; Candidate A is the current protected incumbent |
 
+### Pre-freeze checkpoint at 02:49Z
+
+- Live beta MD5 remained `94daa68fdd1794430b5edbb2b194f57c`; attempt #3 was
+  still the latest completed preview at **10.616**, with no pending attempt.
+- No instance was running and 14h52m of validation budget remained.
+- Candidate A's SHA256 and MD5 matched the protected values.
+- The organizer `--all` command refreshed attempt #3 into
+  `C:/tmp/fpl26-beta-freeze-final/results/beta/preview/attempt-3/`; scorecard,
+  logs, and DCP results matched their recorded SHA256 hashes.
+- The full local suite passed 63/63 and `compileall` passed.
+- The app automation backend was unavailable. Re-run the read-only status,
+  submission-status, and preview-history checks at or after 08:30Z before
+  checking off Task 6; do not start another candidate.
+
 The table below is the earlier attempt #2 handoff retained for history.
 
 | Field | Result |

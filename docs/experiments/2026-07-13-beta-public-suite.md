@@ -96,3 +96,14 @@ current protected incumbent. Candidate B was skipped because its condition was
 false after this strict improvement. The former incumbent archive remains
 immutable at `C:/tmp/fpl26_beta_submission_runtime_v2.zip` for historical
 rollback only; final freeze verification remains outstanding.
+
+## Pre-Freeze Readiness
+
+At `2026-07-14T02:49:29Z`, the live service still showed Candidate A MD5
+`94daa68fdd1794430b5edbb2b194f57c` as the beta submission and attempt #3 as the
+latest completed preview at **10.616**. There was no running instance or newer
+preview attempt, and 14h52m of instance budget remained. A fresh organizer
+`--all` download under `C:/tmp/fpl26-beta-freeze-final/` reproduced the existing
+scorecard, logs, and DCP-result SHA256 hashes. The local suite passed 63/63 plus
+`compileall`. No additional candidate is authorized by the sprint gates; only
+the scheduled 08:30Z freeze observation remains.
