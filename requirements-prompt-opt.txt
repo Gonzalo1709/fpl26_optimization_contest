@@ -2,4 +2,4 @@
 # The core optimizer does not require these.
 
 -r requirements.txt
-dspy>=3.0.0
+dspy>=3.0.0,<4.0.0

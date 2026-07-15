@@ -275,6 +275,21 @@ Examples:
         action="store_true",
         help="Force the PHYS_OPT recipe every iteration",
     )
+    force_group.add_argument(
+        "--force-critical-pin",
+        action="store_true",
+        help="Force the bounded CRITICAL_PIN recipe every iteration",
+    )
+    force_group.add_argument(
+        "--force-route-preserve",
+        action="store_true",
+        help="Force the bounded ROUTE_PRESERVE recipe every iteration",
+    )
+    force_group.add_argument(
+        "--force-hard-block",
+        action="store_true",
+        help="Force the gated HARD_BLOCK relocation recipe every iteration",
+    )
 
     args = parser.parse_args()
 
@@ -389,6 +404,12 @@ Examples:
         force_strategy = "CELL_RELOCATE"
     elif args.force_phys_opt:
         force_strategy = "PHYS_OPT"
+    elif args.force_critical_pin:
+        force_strategy = "CRITICAL_PIN"
+    elif args.force_route_preserve:
+        force_strategy = "ROUTE_PRESERVE"
+    elif args.force_hard_block:
+        force_strategy = "HARD_BLOCK"
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"

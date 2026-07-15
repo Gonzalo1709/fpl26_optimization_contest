@@ -1,8 +1,10 @@
 """Generation-search configuration and candidate state."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from src.scoring import ValidationStatus
 
 
 @dataclass
@@ -42,3 +44,23 @@ class SearchCandidate:
     steps_taken: int
     steps_since_peak: int
     summary: str
+    elapsed_seconds: float = 0.0
+    llm_cost_usd: float = 0.0
+    projected_score: float = 0.0
+    validation: ValidationStatus = field(default_factory=ValidationStatus)
+    validated_score: Optional[float] = None
+
+
+def should_stop_fast_search(
+    config: GenerationSearchConfig,
+    root: SearchCandidate,
+    best: SearchCandidate,
+) -> bool:
+    """Return whether a scored fast search has earned early termination."""
+    return (
+        config.budget_profile == "fast"
+        and best.projected_score > 0
+        and root.wns is not None
+        and best.wns is not None
+        and best.wns >= root.wns + config.min_wns_delta
+    )

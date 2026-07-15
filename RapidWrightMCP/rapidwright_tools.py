@@ -21,6 +21,11 @@ _initialized = False
 _current_design = None
 
 
+def _move_within_radius(distance: int | float, max_move_distance: int | float) -> bool:
+    """Return whether a proposed placement move stays within its local ECO radius."""
+    return 0 <= float(distance) <= float(max_move_distance)
+
+
 def _repair_logical_hier_net(design, net) -> tuple[Optional[object], Optional[str]]:
     """
     Best-effort restoration of a physical net's logical hierarchical net mapping.
@@ -735,6 +740,58 @@ def optimize_lut_input_cone(hierarchical_input_pins: list[str]) -> Dict[str, Any
     except Exception as e:
         logger.error(f"Error in LUT input cone optimization: {e}")
         return {"error": str(e)}
+
+
+def analyze_fanout_geography(net_names: list[str]) -> Dict[str, Any]:
+    """Return bounded sink-distribution metadata for candidate physical nets."""
+    if not _initialized:
+        return {"error": "RapidWright not initialized. Call initialize_rapidwright first."}
+    if _current_design is None:
+        return {"error": "No design loaded. Use read_checkpoint first."}
+
+    results = []
+    for net_name in net_names:
+        net = _current_design.getNet(net_name)
+        if net is None:
+            results.append({"net_name": net_name, "error": "net_not_found"})
+            continue
+
+        coordinates = []
+        for sink_pin in net.getSinkPins():
+            try:
+                tile = sink_pin.getTile()
+                if tile is not None:
+                    coordinates.append((int(tile.getColumn()), int(tile.getRow())))
+            except Exception:
+                continue
+
+        if coordinates:
+            columns = [coordinate[0] for coordinate in coordinates]
+            rows = [coordinate[1] for coordinate in coordinates]
+            x_span = max(columns) - min(columns)
+            y_span = max(rows) - min(rows)
+            centroid = {
+                "column": round(sum(columns) / len(columns), 2),
+                "row": round(sum(rows) / len(rows), 2),
+            }
+        else:
+            x_span = 0
+            y_span = 0
+            centroid = None
+
+        results.append(
+            {
+                "net_name": net_name,
+                "is_clock": bool(net.isClockNet()),
+                "sink_count": len(coordinates),
+                "x_span": x_span,
+                "y_span": y_span,
+                "sink_span": x_span + y_span,
+                "centroid": centroid,
+            }
+        )
+
+    return {"status": "success", "nets": results}
 
 
 def optimize_fanout(net_name: str, split_factor: int) -> Dict[str, Any]:
@@ -2893,6 +2950,7 @@ def hard_block_column_cascade_relocation(
 def optimize_cell_placement(
     cell_names: list,
     max_candidates: int = 10,
+    max_move_distance: int = 30,
 ) -> Dict[str, Any]:
     """
     Re-place cells at the centroid of their connections to reduce routing detours.
@@ -2910,6 +2968,7 @@ def optimize_cell_placement(
     Args:
         cell_names: List of cell names to re-place
         max_candidates: Maximum number of cells to process (default: 10)
+        max_move_distance: Maximum Manhattan tile distance for a local move
 
     Returns:
         Dictionary with per-cell re-placement results
@@ -2993,23 +3052,7 @@ def optimize_cell_placement(
                                 "message": "Could not compute centroid site"})
                 continue
 
-            # --- Perform the move ---
-            # 1. Unplace cell (pass None for immediate site wire cleanup)
-            DesignTools.fullyUnplaceCell(cell, None)
-
-            # 2. Unroute affected nets
-            affected_net_names = []
-            for net in connected_nets:
-                affected_net_names.append(str(net.getName()))
-                try:
-                    # Note: this removes all routing on the entire net.
-                    #       For incoming nets of a re-placed cell, this will also unroute
-                    #       any routing going to other unrelated cells.
-                    net.unroute()
-                except Exception:
-                    pass
-
-            # 3. Find available site spiraling out from centroid
+            # Find an available site before mutating the current placement.
             new_site = None
             new_bel = None
             search_limit = 200
@@ -3033,17 +3076,46 @@ def optimize_cell_placement(
                                 "message": "No available site near centroid"})
                 continue
 
-            # 4. Place cell at new site and route the intra-site wiring
+            move_distance = old_tile.getManhattanDistance(new_site.getTile())
+            if not _move_within_radius(move_distance, max_move_distance):
+                results.append({
+                    "cell": cell_name,
+                    "status": "rejected",
+                    "old_site": old_placement,
+                    "candidate_site": str(new_site.getName()),
+                    "distance_moved": int(move_distance),
+                    "max_move_distance": int(max_move_distance),
+                    "message": (
+                        f"Rejected non-local move of {move_distance} tiles "
+                        f"(limit {max_move_distance})"
+                    ),
+                })
+                continue
+
+            # Mutate only after the candidate passes the local-radius gate.
+            DesignTools.fullyUnplaceCell(cell, None)
+            affected_net_names = []
+            for net in connected_nets:
+                affected_net_names.append(str(net.getName()))
+                try:
+                    net.unroute()
+                except Exception:
+                    pass
+
             try:
                 design.placeCell(cell, new_site, new_bel)
                 cell.getSiteInst().routeSite()
             except Exception as e:
+                try:
+                    design.placeCell(cell, old_site, old_bel)
+                    cell.getSiteInst().routeSite()
+                except Exception:
+                    pass
                 results.append({"cell": cell_name, "status": "error",
                                 "message": f"Placement failed: {e}"})
                 continue
 
             new_placement = str(new_site.getName())
-            move_distance = old_tile.getManhattanDistance(new_site.getTile())
             results.append({
                 "cell": cell_name,
                 "status": "success",

@@ -30,6 +30,8 @@ from typing import Optional, Tuple
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from src.mcp import build_rapidwright_mcp_env
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -37,6 +39,24 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stderr)]
 )
 logger = logging.getLogger(__name__)
+
+SIMULATION_TOOL_TIMEOUT_SECONDS = {
+    "xvlog": 300,
+    "xelab": 900,
+    "xsim": 600,
+}
+
+
+def simulation_tool_timeout(command) -> int:
+    """Return the bounded timeout for a Vivado simulation subprocess."""
+    tool_name = Path(command[0]).name
+    return SIMULATION_TOOL_TIMEOUT_SECONDS[tool_name]
+
+
+def is_clock_port_name(name: str) -> bool:
+    """Return whether an input port name uses a conventional clock token."""
+    normalized = name.lower()
+    return "clk" in normalized or "clock" in normalized
 
 
 class DCPValidator:
@@ -88,7 +108,12 @@ class DCPValidator:
         rapidwright_config = {
             "command": sys.executable,
             "args": rapidwright_args,
-            "env": {**os.environ}
+            "cwd": str(self.temp_dir),
+            "env": build_rapidwright_mcp_env(
+                script_dir,
+                os.environ,
+                vivado_exec=os.environ.get("VIVADO_EXEC"),
+            ),
         }
         
         logger.info("Starting RapidWright MCP server...")
@@ -340,8 +365,8 @@ class DCPValidator:
             print("⚠ Warning: Design has no outputs - limited verification possible")
         
         # Filter out clock and reset (we'll drive those separately)
-        regular_inputs = [p for p in inputs if 'clk' not in p['name'].lower() and 'rst' not in p['name'].lower() and 'reset' not in p['name'].lower()]
-        clocks = [p for p in inputs if 'clk' in p['name'].lower()]
+        regular_inputs = [p for p in inputs if not is_clock_port_name(p['name']) and 'rst' not in p['name'].lower() and 'reset' not in p['name'].lower()]
+        clocks = [p for p in inputs if is_clock_port_name(p['name'])]
         resets = [p for p in inputs if 'rst' in p['name'].lower() or 'reset' in p['name'].lower()]
         
         if not clocks:
@@ -673,7 +698,7 @@ endmodule
                 cwd=xsim_dir,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=simulation_tool_timeout(compile_cmd)
             )
             
             if result.returncode != 0:
@@ -701,7 +726,7 @@ endmodule
                 cwd=xsim_dir,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=simulation_tool_timeout(elab_cmd)
             )
             
             if result.returncode != 0:
@@ -745,7 +770,7 @@ endmodule
                 cwd=xsim_dir,
                 capture_output=True,
                 text=True,
-                timeout=600
+                timeout=simulation_tool_timeout(sim_cmd)
             )
             
             # Parse simulation output

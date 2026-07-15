@@ -18,12 +18,18 @@ import re
 import signal
 import shutil
 import sys
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 import pexpect
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from src.parsers import parse_critical_route_net_report
 
 # Configure logging
 logging.basicConfig(
@@ -665,6 +671,52 @@ def extract_critical_path_pins(
         return json.dumps(all_paths)
 
 
+def extract_critical_route_nets(
+    num_paths: int = 20,
+    max_nets: int = 8,
+    timeout: float = 600.0,
+) -> str:
+    """Return bounded target-clock route candidates with delay and lock evidence."""
+    import json
+
+    max_nets = max(1, min(8, int(max_nets)))
+    num_paths = max(1, min(50, int(num_paths)))
+    cmd = (
+        "set clk_obj [get_clocks -quiet {clk_fpl26contest}]; "
+        "if {$clk_obj eq {}} {error {clk_fpl26contest not found}}; "
+        f"report_timing -return_string -max_paths {num_paths} -delay_type max "
+        "-sort_by slack -nworst 1 -to $clk_obj"
+    )
+    try:
+        report = run_tcl_command(cmd, timeout=timeout)
+    except Exception as exc:
+        return json.dumps({"error": f"Error generating target-clock timing report: {exc}"})
+
+    candidates = parse_critical_route_net_report(report)[:max_nets]
+    for candidate in candidates:
+        net_name = candidate["net_name"]
+        if any(character in net_name for character in "{};\r\n"):
+            candidate["is_route_fixed"] = True
+            continue
+        metadata_command = (
+            f"set route_net [get_nets -quiet {{{net_name}}}]; "
+            "if {[llength $route_net] == 0} {puts {__FPL_ROUTE_META__|missing}} "
+            "else {puts \"__FPL_ROUTE_META__|[get_property IS_ROUTE_FIXED $route_net]\"}"
+        )
+        try:
+            metadata = run_tcl_command(metadata_command, timeout=min(timeout, 60.0))
+            marker = next(
+                (line for line in metadata.splitlines() if "__FPL_ROUTE_META__|" in line),
+                "",
+            )
+            value = marker.rsplit("|", 1)[-1].strip().lower()
+            candidate["is_route_fixed"] = value in {"1", "true", "yes", "missing"}
+        except Exception:
+            candidate["is_route_fixed"] = True
+
+    return json.dumps(candidates)
+
+
 def report_utilization_for_pblock(timeout: float = 300.0) -> str:
     """
     Get detailed resource utilization report for pblock sizing.
@@ -1185,7 +1237,7 @@ async def list_tools():
         ),
         Tool(
             name="route_design",
-            description="Run routing on the current design.",
+            description="Run full routing or a bounded selected-net auto-delay/preserve pass.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1196,7 +1248,33 @@ async def list_tools():
                     "timeout": {
                         "type": "number",
                         "description": "Timeout in seconds (default: 3600 for routing)"
+                    },
+                    "nets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 8,
+                        "description": "At most eight explicitly selected target-clock net names"
+                    },
+                    "auto_delay": {
+                        "type": "boolean",
+                        "description": "Use -auto_delay for the selected nets"
+                    },
+                    "preserve": {
+                        "type": "boolean",
+                        "description": "Preserve routed nets while completing routing"
                     }
+                }
+            }
+        ),
+        Tool(
+            name="extract_critical_route_nets",
+            description="Extract a bounded set of target-clock critical nets with delay and route-lock evidence.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "num_paths": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "max_nets": {"type": "integer", "minimum": 1, "maximum": 8},
+                    "timeout": {"type": "number"}
                 }
             }
         ),
@@ -1647,14 +1725,57 @@ async def call_tool(name: str, arguments: dict):
         
         elif name == "route_design":
             directive = arguments.get("directive")
+            nets = arguments.get("nets") or []
+            auto_delay = bool(arguments.get("auto_delay"))
+            preserve = bool(arguments.get("preserve"))
             timeout = arguments.get("timeout", 3600)  # 1 hour default for routing
-            
+
+            if len(nets) > 8:
+                raise ValueError("Selected-net routing accepts at most 8 nets")
+            if directive and (nets or auto_delay or preserve):
+                raise ValueError("route_design directive cannot be combined with selected-net options")
+            if auto_delay and not nets:
+                raise ValueError("route_design -auto_delay requires an explicit net set")
+            if nets and preserve:
+                raise ValueError("route selected nets first, then call route_design -preserve")
+
             cmd = "route_design"
             if directive:
                 cmd += f" -directive {directive}"
-            
+            elif nets:
+                if any(any(character in net for character in "{};\r\n") for net in nets):
+                    raise ValueError("Route net names contain unsupported Tcl characters")
+                net_list = " ".join(f"{{{net}}}" for net in nets)
+                selected = f"[get_nets -quiet [list {net_list}]]"
+                preflight = run_tcl_command(
+                    f"set selected_nets {selected}; "
+                    "set locked_nets [filter $selected_nets {IS_ROUTE_FIXED == 1}]; "
+                    "puts \"__FPL_LOCKED_NETS__|$locked_nets\"",
+                    timeout=min(timeout, 60),
+                )
+                locked_line = next(
+                    (line for line in preflight.splitlines() if "__FPL_LOCKED_NETS__|" in line),
+                    "",
+                )
+                locked_names = locked_line.rsplit("|", 1)[-1].strip()
+                if locked_names:
+                    raise ValueError(f"Selected route set contains fixed nets: {locked_names}")
+                cmd += f" -nets {selected}"
+                if auto_delay:
+                    cmd += " -auto_delay"
+            elif preserve:
+                cmd += " -preserve"
+
             output = run_tcl_command(cmd, timeout=timeout)
             return [TextContent(type="text", text=f"Routing complete.\n\n{output}")]
+
+        elif name == "extract_critical_route_nets":
+            output = extract_critical_route_nets(
+                num_paths=arguments.get("num_paths", 20),
+                max_nets=arguments.get("max_nets", 8),
+                timeout=arguments.get("timeout", 600),
+            )
+            return [TextContent(type="text", text=output)]
         
         elif name == "run_tcl":
             command = arguments["command"]

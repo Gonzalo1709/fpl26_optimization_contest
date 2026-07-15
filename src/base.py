@@ -13,6 +13,9 @@ from typing import Optional
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from src.mcp import build_rapidwright_mcp_env
+from src.parsers import parse_high_fanout_nets_report, parse_target_clock_report
+
 logger = logging.getLogger(__name__)
 
 
@@ -84,11 +87,11 @@ class DCPOptimizerBase:
                 "--mcp-log", str(rapidwright_mcp_log),
             ])
 
-        env = {**os.environ}
-        rapidwright_submodule = repo_root / "RapidWright"
-        if rapidwright_submodule.is_dir() and "RAPIDWRIGHT_PATH" not in env:
-            env["RAPIDWRIGHT_PATH"] = str(rapidwright_submodule)
-            env["CLASSPATH"] = f"{rapidwright_submodule}/bin:{rapidwright_submodule}/jars/*"
+        env = build_rapidwright_mcp_env(
+            repo_root,
+            os.environ,
+            vivado_exec=os.environ.get("VIVADO_EXEC"),
+        )
 
         rapidwright_config = {
             "command": sys.executable,
@@ -181,43 +184,23 @@ class DCPOptimizerBase:
         return 1000.0 / achievable_period_ns
 
     async def get_clock_period(self, call_tool_fn) -> Optional[float]:
+        self.target_clock = "clk_fpl26contest"
         tcl_cmd = (
             "set contest_clk [get_clocks -quiet clk_fpl26contest]; "
             "if {$contest_clk ne {}} { "
             "  puts \"CLOCK:clk_fpl26contest\"; "
             "  puts [get_property PERIOD $contest_clk]; "
             "} else { "
-            "  set tp [get_timing_paths -max_paths 1 -setup]; "
-            "  if {$tp ne {}} { "
-            "    set clk [get_property ENDPOINT_CLOCK $tp]; "
-            "    if {$clk ne {}} { "
-            "      puts \"CLOCK:$clk\"; "
-            "      puts [get_property PERIOD [get_clocks $clk]]; "
-            "    } "
-            "  } "
+            "  puts \"ERROR: clk_fpl26contest not found\"; "
             "}"
         )
         try:
             result = await call_tool_fn("run_tcl", {"command": tcl_cmd})
-
-            clock_name = None
-            for token in result.strip().split():
-                if token.startswith("CLOCK:"):
-                    clock_name = token[len("CLOCK:"):]
-                    continue
-                if token.startswith("ERROR") or token.startswith("WARNING"):
-                    continue
-                try:
-                    period = float(token)
-                    if period > 0:
-                        if clock_name:
-                            self.target_clock = clock_name
-                            logger.info(f"Target clock: {clock_name}, period: {period:.3f} ns")
-                        else:
-                            logger.info(f"Critical clock period: {period:.3f} ns")
-                        return period
-                except ValueError:
-                    continue
+            clock_name, period = parse_target_clock_report(result)
+            if period is not None:
+                self.target_clock = clock_name or "clk_fpl26contest"
+                logger.info("Target clock: %s, period: %.3f ns", self.target_clock, period)
+                return period
         except Exception as e:
             logger.warning(f"Failed to get clock period: {e}")
 
@@ -225,22 +208,17 @@ class DCPOptimizerBase:
         return None
 
     async def get_wns_for_target_clock(self, call_tool_fn) -> Optional[float]:
-        if self.target_clock:
-            tcl_cmd = (
-                f"set clk_obj [get_clocks -quiet {{{self.target_clock}}}]; "
-                f"if {{$clk_obj ne {{}}}} {{ "
-                f"  set tp [get_timing_paths -max_paths 1 -setup -to $clk_obj]; "
-                f"  if {{[llength $tp] > 0}} {{get_property SLACK $tp}} else {{puts 0.0}} "
-                f"}} else {{ "
-                f"  set tp [get_timing_paths -max_paths 1 -slack_lesser_than 999]; "
-                f"  if {{[llength $tp] > 0}} {{get_property SLACK $tp}} else {{puts 0.0}} "
-                f"}}"
-            )
-        else:
-            tcl_cmd = (
-                "set tp [get_timing_paths -max_paths 1 -slack_lesser_than 999]; "
-                "if {[llength $tp] > 0} {get_property SLACK $tp} else {puts 0.0}"
-            )
+        self.target_clock = "clk_fpl26contest"
+        tcl_cmd = (
+            "set clk_obj [get_clocks -quiet {clk_fpl26contest}]; "
+            "if {$clk_obj ne {}} { "
+            "  set tp [get_timing_paths -max_paths 1 -setup -to $clk_obj]; "
+            "  if {[llength $tp] > 0} {get_property SLACK $tp} "
+            "  else {puts \"ERROR: no setup path for clk_fpl26contest\"} "
+            "} else { "
+            "  puts \"ERROR: clk_fpl26contest not found\"; "
+            "}"
+        )
 
         try:
             result = await call_tool_fn("run_tcl", {"command": tcl_cmd})
@@ -261,40 +239,7 @@ class DCPOptimizerBase:
         return None
 
     def parse_high_fanout_nets(self, report: str) -> list[tuple[str, int, int]]:
-        nets = []
-        lines = report.split("\n")
-        in_net_section = False
-
-        for line in lines:
-            if "Paths" in line and "Fanout" in line and "Parent Net Name" in line:
-                in_net_section = True
-                continue
-
-            if in_net_section:
-                if line.startswith("---") or not line.strip():
-                    continue
-                if line.startswith("==="):
-                    break
-
-                parts = line.split()
-                if len(parts) >= 3:
-                    try:
-                        path_count = int(parts[0])
-                        fanout = int(parts[1])
-                        net_name = parts[2]
-
-                        if (
-                            net_name
-                            and "/" in net_name
-                            and not net_name.startswith("get_")
-                            and not net_name.startswith("ERROR")
-                            and not net_name.startswith("WARNING")
-                        ):
-                            nets.append((net_name, fanout, path_count))
-                    except ValueError:
-                        continue
-
-        return nets
+        return parse_high_fanout_nets_report(report)
 
     def _format_fmax_results(
         self,
