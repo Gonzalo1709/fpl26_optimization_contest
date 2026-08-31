@@ -99,6 +99,13 @@ class DCPOptimizer(DCPOptimizerBase):
         self.fanout_blacklist: dict[str, str] = {}
         self.validation_status = ValidationStatus()
         self.design_signature: Optional[DesignSignature] = None
+        # The contest evaluates the output path that exists at the deadline.  Keep a
+        # separate on-disk incumbent, rather than relying on the search directory
+        # being copied only after the controller returns.
+        self.output_dcp: Optional[Path] = None
+        self._published_wns = float("-inf")
+        self._initial_port_count: Optional[int] = None
+        self._search_seed_metrics: Optional[dict] = None
 
     def _extract_llm_text(self, response) -> str:
         """Best-effort extraction of text content from a chat completion response."""
@@ -1697,6 +1704,198 @@ class DCPOptimizer(DCPOptimizerBase):
             self.best_wns = wns
         return wns
 
+    @staticmethod
+    def _last_tagged_int(text: str, tag: str) -> Optional[int]:
+        matches = re.findall(rf"{re.escape(tag)}\s*[:=]\s*(\d+)", text)
+        return int(matches[-1]) if matches else None
+
+    async def _current_port_count(self) -> Optional[int]:
+        """Return the current top-level port count without relying on report formatting."""
+        result = await self.v(
+            "run_tcl",
+            {"command": "puts {FPL26_PORT_COUNT=[llength [get_ports -quiet]]}"},
+        )
+        return self._last_tagged_int(result, "FPL26_PORT_COUNT")
+
+    async def _validate_current_publishable_design(self) -> ValidationStatus:
+        """Run the inexpensive implementation gates required before publishing a DCP.
+
+        Structural equivalence and simulation remain the final validator's job.  These
+        checks deliberately cover the cheap failure modes that otherwise let a high-WNS
+        but unrouted or hold-broken checkpoint replace the incumbent during the run.
+        """
+        port_count = await self._current_port_count()
+        if self._initial_port_count is None:
+            self._initial_port_count = port_count
+        ports_ok = (
+            self._initial_port_count is None
+            or port_count is None
+            or port_count == self._initial_port_count
+        )
+
+        route_status = await self.v("report_route_status", {})
+        failed = self._last_tagged_int(route_status, "Number of Failed Nets")
+        unrouted = self._last_tagged_int(route_status, "Number of Unrouted Nets")
+        partial = self._last_tagged_int(route_status, "Number of Partially Routed Nets")
+        routed = self._last_tagged_int(route_status, "Number of Fully Routed Nets")
+        routable = self._last_tagged_int(route_status, "Number of Routable Nets")
+        if failed is None:
+            match = re.search(r"nets with routing errors[^0-9]+(\d+)", route_status, re.IGNORECASE)
+            failed = int(match.group(1)) if match else None
+        if routed is None:
+            match = re.search(r"of fully routed nets[^0-9]+(\d+)", route_status, re.IGNORECASE)
+            routed = int(match.group(1)) if match else None
+        if routable is None:
+            match = re.search(r"of routable nets[^0-9]+(\d+)", route_status, re.IGNORECASE)
+            routable = int(match.group(1)) if match else None
+        route_ok = (
+            failed == 0
+            and (unrouted in (None, 0))
+            and (partial in (None, 0))
+            and (routed is None or routable is None or (routed == routable and routed > 0))
+        )
+
+        hold_result = await self.v(
+            "run_tcl",
+            {
+                "command": (
+                    "set p [lindex [get_timing_paths -quiet -max_paths 1 -nworst 1 -hold] 0]; "
+                    "if {$p eq \"\"} { puts {FPL26_HOLD_WNS=999.0} } "
+                    "else { puts \"FPL26_HOLD_WNS=[get_property SLACK $p]\" }"
+                )
+            },
+        )
+        hold_match = re.findall(r"FPL26_HOLD_WNS\s*=\s*(-?\d+(?:\.\d+)?)", hold_result)
+        hold_ok = bool(hold_match) and float(hold_match[-1]) >= 0.0
+
+        pulse_result = await self.v(
+            "run_tcl",
+            {"command": "report_pulse_width -quiet -return_string -all_violators"},
+        )
+        pulse_ok = not bool(re.search(r"(?:VIOLATED|pulse width[^\n]*-\d)", pulse_result, re.IGNORECASE))
+
+        drc_result = await self.v(
+            "run_tcl",
+            {"command": "report_drc -quiet -return_string -ruledeck default"},
+        )
+        drc_ok = not bool(
+            re.search(r"^\s*[1-9]\d*\s+(?:Critical Warning|Error)\b", drc_result, re.IGNORECASE | re.MULTILINE)
+        )
+
+        status = ValidationStatus(
+            par_routed=route_ok and ports_ok,
+            par_drc_clean=drc_ok,
+            hold_passed=hold_ok,
+            pulse_width_passed=pulse_ok,
+        )
+        self.validation_status = status
+        return status
+
+    async def _publish_current_candidate(self, metrics: dict, *, allow_equal: bool = False) -> bool:
+        """Atomically make the current legal Vivado design the deadline-safe incumbent."""
+        if self.output_dcp is None:
+            return False
+
+        wns = metrics.get("wns")
+        if wns is None:
+            logger.warning("Not publishing candidate with unknown target-clock WNS")
+            return False
+        if not allow_equal and wns <= self._published_wns + self.generation_config.min_wns_delta:
+            return False
+
+        status = await self._validate_current_publishable_design()
+        if not all(
+            value is True
+            for value in (
+                status.par_routed,
+                status.par_drc_clean,
+                status.hold_passed,
+                status.pulse_width_passed,
+            )
+        ):
+            logger.warning("Rejected candidate for publish: %s", status)
+            return False
+
+        output = self.output_dcp.resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_name(f".{output.name}.wip")
+        await self.v(
+            "write_checkpoint",
+            {"dcp_path": str(temporary), "force": True, "timeout": 900},
+        )
+        if not temporary.exists():
+            logger.warning("Vivado reported a checkpoint write but %s is absent", temporary)
+            return False
+        temporary.replace(output)
+        self._published_wns = wns
+        print(f"[PUBLISH] {self._display_name(output)} WNS {wns:.3f} ns")
+        return True
+
+    async def run_reimplementation_flow(self, baseline_checkpoint: Path) -> str:
+        """Run Slot-A-style Explore implementation from a routed checkpoint.
+
+        This is deliberately one deterministic seed candidate, not an LLM branch:
+        full implementation is too expensive to multiply across a beam search.  The
+        caller owns the baseline checkpoint and can restore it if acceptance fails.
+        """
+        baseline_report = await self.v("report_timing_summary")
+        baseline_metrics = await self._measure_current_metrics(baseline_report)
+        remaining = self._remaining_wall_clock_seconds()
+        reserve = self._current_budget_state().validation_reserve_seconds
+        if remaining is not None and remaining < reserve + 900:
+            logger.info("Skipping reimplementation: %.0fs remain, need %.0fs", remaining, reserve + 900)
+            return baseline_report
+
+        try:
+            await self.v("run_tcl", {"command": "route_design -unroute -quiet; place_design -unplace -quiet"})
+            cell_counts = await self.v(
+                "run_tcl",
+                {
+                    "command": (
+                        "set n0 [llength [get_cells -quiet -hier -filter {IS_PRIMITIVE}]]; "
+                        "opt_design -directive Explore -quiet; "
+                        "set n1 [llength [get_cells -quiet -hier -filter {IS_PRIMITIVE}]]; "
+                        "puts \"FPL26_REIMPL_CELLS=$n0,$n1\""
+                    )
+                },
+            )
+            counts = re.findall(r"FPL26_REIMPL_CELLS\s*=\s*(\d+)\s*,\s*(\d+)", cell_counts)
+            if not counts:
+                raise RuntimeError("Could not read primitive-cell counts after opt_design")
+            before, after = (int(value) for value in counts[-1])
+            if before > 0 and after < before / 2:
+                logger.warning("Reimplementation opt_design collapsed primitives %d -> %d; restoring baseline", before, after)
+                await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+                return baseline_report
+
+            place_started = time.time()
+            await self.v("place_design", {"directive": "Explore", "timeout": 3600})
+            place_seconds = time.time() - place_started
+            route_estimate = max(2.4 * place_seconds, 600.0)
+            phys_estimate = max(2.0 * place_seconds, 300.0)
+            remaining = self._remaining_wall_clock_seconds()
+            if remaining is not None and remaining < reserve + route_estimate:
+                logger.info("Reimplementation route skipped: %.0fs remain, need %.0fs", remaining, reserve + route_estimate)
+                await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+                return baseline_report
+            if remaining is None or remaining >= reserve + route_estimate + phys_estimate + 180:
+                await self.v("phys_opt_design", {"directive": "Explore", "timeout": 3600})
+
+            await self.v(
+                "run_tcl",
+                {"command": "route_design -directive Explore -tns_cleanup -quiet", "timeout": 3600},
+            )
+            report = await self.v("report_timing_summary")
+            metrics = await self._measure_current_metrics(report)
+            if self._is_metrics_improvement(metrics, baseline_metrics):
+                return report
+
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+            return baseline_report
+        except Exception:
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+            raise
+
     async def _save_best_checkpoint(self, dcp_path: Path) -> Path:
         """Persist the current Vivado design and return the saved checkpoint path."""
         if not await self._save_vivado_checkpoint(dcp_path):
@@ -1862,6 +2061,8 @@ class DCPOptimizer(DCPOptimizerBase):
     async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
         """Run the optimization workflow."""
         self.start_time = time.time()
+        self.output_dcp = output_dcp.resolve()
+        self._published_wns = float("-inf")
 
         try:
             initial_analysis = await self.perform_initial_analysis(input_dcp)
@@ -1871,31 +2072,35 @@ class DCPOptimizer(DCPOptimizerBase):
             self.end_time = time.time()
             return False
 
-        if self.initial_wns is not None and self.initial_wns >= 0:
-            print("✓ Design already meets timing! No optimization needed.\n")
-            await self.v(
-                "write_checkpoint",
-                {
-                    "dcp_path": str(output_dcp.resolve()),
-                    "force": True,
-                },
-            )
-            print(f"Saved design to: {self._display_name(output_dcp)}\n")
+        baseline_metrics = {
+            "wns": self.initial_wns,
+            "tns": self.initial_tns,
+            "failing_endpoints": self.initial_failing_endpoints,
+        }
+        self._search_seed_metrics = baseline_metrics
+        baseline_checkpoint = await self._save_best_checkpoint(Path(self.temp_dir) / "reimplementation_baseline.dcp")
+        await self._publish_current_candidate(baseline_metrics, allow_equal=True)
 
-            self.end_time = time.time()
-            total_runtime = self.end_time - self.start_time
-
-            print("\n=== No Optimization Required ===")
-            initial_fmax = self.calculate_fmax(self.initial_wns, self.clock_period)
-            if initial_fmax is not None:
-                print(f"Design already meets timing - Fmax: {initial_fmax:.2f} MHz (WNS: {self.initial_wns:.3f} ns)")
+        # A timing-clean input can still earn Fmax improvement, so it receives the
+        # same deterministic implementation attempt as a timing-failing input.
+        try:
+            reimplementation_report = await self.run_reimplementation_flow(baseline_checkpoint)
+            seed_metrics = await self._measure_current_metrics(reimplementation_report)
+            if self._is_metrics_improvement(seed_metrics, baseline_metrics):
+                if await self._publish_current_candidate(seed_metrics):
+                    self._search_seed_metrics = seed_metrics
+                    print("[REIMPLEMENT] Accepted deterministic Explore seed candidate.")
+                else:
+                    await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
             else:
-                print(f"Design already meets timing (WNS: {self.initial_wns:.3f} ns)")
-            print(f"Total runtime: {total_runtime:.2f} seconds ({total_runtime / 60:.2f} minutes)")
-            print("LLM API calls: 0 (analysis performed without LLM)")
-            print("Estimated cost: $0.00")
-            print("=" * 70 + "\n")
-            return True
+                await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+        except WallClockLimitReached:
+            print("[REIMPLEMENT] Budget expired; continuing from the published baseline.")
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+        except Exception as exc:
+            logger.exception("Deterministic reimplementation failed; continuing from baseline: %s", exc)
+            print(f"[REIMPLEMENT] Failed; continuing from baseline: {exc}")
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
 
         if self.generation_config.enabled:
             return await self._optimize_generational(input_dcp, output_dcp, initial_analysis)
@@ -1912,6 +2117,8 @@ class DCPOptimizer(DCPOptimizerBase):
     ) -> bool:
         """Run one selected optimization method exactly once, without LLM search."""
         self.start_time = time.time()
+        self.output_dcp = output_dcp.resolve()
+        self._published_wns = float("-inf")
         method = method.upper()
         if method not in SUPPORTED_SINGLE_METHODS:
             raise ValueError(
@@ -1920,6 +2127,12 @@ class DCPOptimizer(DCPOptimizerBase):
 
         try:
             await self.perform_initial_analysis(input_dcp)
+            baseline_metrics = {
+                "wns": self.initial_wns,
+                "tns": self.initial_tns,
+                "failing_endpoints": self.initial_failing_endpoints,
+            }
+            await self._publish_current_candidate(baseline_metrics, allow_equal=True)
 
             if method == "PBLOCK":
                 strategy_args = {}
@@ -1935,14 +2148,7 @@ class DCPOptimizer(DCPOptimizerBase):
             print(f"=== Running Single Method: {method} ===\n")
             timing_report, _ = await self._execute_strategy(method, strategy_args)
             final_metrics = await self._measure_current_metrics(timing_report)
-
-            await self.v(
-                "write_checkpoint",
-                {
-                    "dcp_path": str(output_dcp.resolve()),
-                    "force": True,
-                },
-            )
+            await self._publish_current_candidate(final_metrics)
 
             self.end_time = time.time()
             total_runtime = self.end_time - self.start_time
@@ -1973,14 +2179,15 @@ class DCPOptimizer(DCPOptimizerBase):
         """Run the recipe-driven linear optimization workflow."""
         print("=== Starting LLM-Driven Optimization ===\n")
 
-        best_wns = self.initial_wns
-        best_metrics = {
+        best_metrics = self._search_seed_metrics or {
             "wns": self.initial_wns,
             "tns": self.initial_tns,
             "failing_endpoints": self.initial_failing_endpoints,
         }
+        best_wns = best_metrics["wns"]
         stagnation = 0
         best_dcp_path = await self._save_best_checkpoint(Path(self.temp_dir) / "best_iter_000.dcp")
+        await self._reload_rapidwright_from_vivado_checkpoint(best_dcp_path)
         last_best_iteration = 0
         used_action_signatures: set[str] = set()
 
@@ -2096,6 +2303,7 @@ class DCPOptimizer(DCPOptimizerBase):
                     best_dcp_path = await self._save_best_checkpoint(
                         Path(self.temp_dir) / f"best_iter_{index + 1:03d}.dcp"
                     )
+                    await self._publish_current_candidate(best_metrics)
                     last_best_iteration = index + 1
                     used_action_signatures.clear()
                     if roi_accepted:
@@ -2118,7 +2326,16 @@ class DCPOptimizer(DCPOptimizerBase):
                 hit_wall_clock_limit = True
                 break
 
-        shutil.copy2(best_dcp_path, output_dcp)
+        if self.output_dcp is None:
+            # Internal callers of the search helper do not configure continuous
+            # publishing, so retain the helper's historical copy-out behavior.
+            shutil.copy2(best_dcp_path, output_dcp)
+        elif not output_dcp.exists():
+            logger.warning(
+                "No candidate cleared the publish gates; refusing to copy an unchecked "
+                "search checkpoint to %s",
+                output_dcp,
+            )
 
         self.end_time = time.time()
         self._print_optimization_summary(max_iterations_reached=hit_wall_clock_limit)
@@ -2137,20 +2354,25 @@ class DCPOptimizer(DCPOptimizerBase):
         if not await self._save_vivado_checkpoint(root_path):
             raise RuntimeError(f"Could not save root checkpoint: {root_path}")
 
+        seed_metrics = self._search_seed_metrics or {
+            "wns": self.initial_wns,
+            "tns": self.initial_tns,
+            "failing_endpoints": self.initial_failing_endpoints,
+        }
         root = SearchCandidate(
             candidate_id="root",
             dcp_path=root_path,
-            wns=self.initial_wns,
-            tns=self.initial_tns,
-            failing_endpoints=self.initial_failing_endpoints,
-            peak_wns=self.initial_wns,
+            wns=seed_metrics["wns"],
+            tns=seed_metrics["tns"],
+            failing_endpoints=seed_metrics["failing_endpoints"],
+            peak_wns=seed_metrics["wns"],
             generation=0,
             parent_id=None,
             branch_index=0,
             steps_taken=0,
             steps_since_peak=0,
-            summary="Initial analyzed checkpoint",
-            **self._candidate_score_metadata(self.initial_wns),
+            summary="Deterministic reimplementation seed",
+            **self._candidate_score_metadata(seed_metrics["wns"]),
         )
         self.search_candidates = [root]
         self.best_candidate = root
@@ -2215,6 +2437,13 @@ class DCPOptimizer(DCPOptimizerBase):
 
                         if self._is_candidate_improvement(candidate, self.best_candidate):
                             self.best_candidate = candidate
+                            await self._publish_current_candidate(
+                                {
+                                    "wns": candidate.wns,
+                                    "tns": candidate.tns,
+                                    "failing_endpoints": candidate.failing_endpoints,
+                                }
+                            )
                             print(f"[SEARCH] New global best: {candidate.candidate_id} ({self._format_wns(candidate.wns)})")
 
                         should_stop_fast = bool(
@@ -2279,14 +2508,24 @@ class DCPOptimizer(DCPOptimizerBase):
             return False
 
         output_dcp.parent.mkdir(parents=True, exist_ok=True)
-        if self.best_candidate.dcp_path.resolve() != output_dcp.resolve():
-            shutil.copy2(self.best_candidate.dcp_path, output_dcp)
+        if self.output_dcp is None:
+            if self.best_candidate.dcp_path.resolve() != output_dcp.resolve():
+                shutil.copy2(self.best_candidate.dcp_path, output_dcp)
+        elif not output_dcp.exists():
+            logger.warning(
+                "No candidate cleared the publish gates; refusing to copy an unchecked "
+                "search checkpoint to %s",
+                output_dcp,
+            )
         self.best_wns = self.best_candidate.wns if self.best_candidate.wns is not None else self.best_wns
         self.end_time = time.time()
 
         print(f"\n[SEARCH] Best candidate: {self.best_candidate.candidate_id}")
         print(f"[SEARCH] Best WNS: {self._format_wns(self.best_candidate.wns)}")
-        print(f"[SEARCH] Copied best checkpoint to: {self._display_name(output_dcp)}")
+        if output_dcp.exists():
+            print(f"[SEARCH] Published checkpoint: {self._display_name(output_dcp)}")
+        else:
+            print("[SEARCH] No checkpoint passed the publish gates.")
 
         self._print_optimization_summary(max_iterations_reached=hit_wall_clock_limit)
         return True
@@ -2596,6 +2835,13 @@ class DCPOptimizer(DCPOptimizerBase):
 
             if self._is_candidate_improvement(latest_candidate, self.best_candidate):
                 self.best_candidate = latest_candidate
+                await self._publish_current_candidate(
+                    {
+                        "wns": latest_candidate.wns,
+                        "tns": latest_candidate.tns,
+                        "failing_endpoints": latest_candidate.failing_endpoints,
+                    }
+                )
                 print(f"[SEARCH] New global best inside branch: {latest_candidate.candidate_id}")
 
             if cfg.stop_when_timing_met and current_wns is not None and current_wns >= 0:
