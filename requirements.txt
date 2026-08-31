@@ -1,7 +1,9 @@
 # FPGA Design Optimization Agent Dependencies
 
 # Core dependencies
-mcp>=1.0.0
+# RapidWrightMCP uses the MCP 1.x server decorator API (for example,
+# ``@app.list_tools()``).  MCP 2.x removed that API.
+mcp>=1.0.0,<2.0.0
 
 # OpenAI client (only needed for full agent mode using OpenRouter, not test mode)
 openai>=1.0.0

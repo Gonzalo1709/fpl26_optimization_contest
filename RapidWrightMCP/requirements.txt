@@ -1,2 +1,3 @@
-mcp>=1.0.0
+# This server implements the MCP 1.x decorator API; MCP 2.x is incompatible.
+mcp>=1.0.0,<2.0.0
 rapidwright>=2025.2.0
