@@ -96,6 +96,34 @@ class SlotATransferTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(published)
         self.assertEqual(output.read_bytes(), b"existing incumbent")
 
+    async def test_publish_rejects_unreadable_port_count(self):
+        output = self.run_dir / "optimized.dcp"
+        output.write_bytes(b"existing incumbent")
+        self.optimizer.output_dcp = output
+
+        async def fake_v(name, arguments=None):
+            arguments = arguments or {}
+            if name == "run_tcl":
+                command = arguments["command"]
+                if "FPL26_PORT_COUNT" in command:
+                    return "FPL26_PORT_COUNT=[llength [get_ports -quiet]]"
+                if "FPL26_HOLD_WNS" in command:
+                    return "FPL26_HOLD_WNS=0.025"
+                if "report_pulse_width" in command or "report_drc" in command:
+                    return ""
+            if name == "report_route_status":
+                return "Number of Failed Nets = 0\nNumber of Fully Routed Nets = 12\nNumber of Routable Nets = 12"
+            raise AssertionError(f"Unexpected Vivado call: {name}")
+
+        self.optimizer.v = fake_v
+        published = await self.optimizer._publish_current_candidate(
+            {"wns": -0.10, "tns": -1.0, "failing_endpoints": 1},
+            allow_equal=True,
+        )
+
+        self.assertFalse(published)
+        self.assertEqual(output.read_bytes(), b"existing incumbent")
+
     async def test_reimplementation_uses_explore_and_keeps_an_improved_result(self):
         baseline = self.run_dir / "baseline.dcp"
         baseline.write_bytes(b"baseline")

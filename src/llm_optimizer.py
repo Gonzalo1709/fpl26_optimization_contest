@@ -106,6 +106,7 @@ class DCPOptimizer(DCPOptimizerBase):
         self._published_wns = float("-inf")
         self._initial_port_count: Optional[int] = None
         self._search_seed_metrics: Optional[dict] = None
+        self.critical_paths_report: Optional[str] = None
 
     def _extract_llm_text(self, response) -> str:
         """Best-effort extraction of text content from a chat completion response."""
@@ -533,6 +534,7 @@ class DCPOptimizer(DCPOptimizerBase):
             )
             try:
                 critical_paths_report = temp_path.read_text(encoding="utf-8")
+                self.critical_paths_report = critical_paths_report
             except OSError as exc:
                 logger.warning("Could not read critical-path analysis file: %s", exc)
             spread_result = await self.call_tool(
@@ -1080,20 +1082,47 @@ class DCPOptimizer(DCPOptimizerBase):
         return self.sanitize_action({"strategy": strategy, "args": args})
 
     async def run_pblock_flow(self) -> str:
-        """Execute a staged PBLOCK recipe with progressively stronger constraints."""
+        """Constrain a bounded set of critical-path cells, never the whole design."""
         baseline_checkpoint = Path(self.temp_dir) / "pblock_baseline.dcp"
         await self.v("write_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "force": True})
         baseline_report = await self.v("report_timing_summary")
         baseline_metrics = await self._measure_current_metrics(baseline_report)
 
-        util_report = await self.v("report_utilization_for_pblock")
-        util = self.parse_utilization(util_report)
+        try:
+            paths = json.loads(self.critical_paths_report or "[]")
+        except json.JSONDecodeError as exc:
+            raise ValueError("PBLOCK requires valid critical-path cell data") from exc
+
+        # A full-design Pblock only forces a fresh implementation and conceals that
+        # fact as a locality optimization. Use a bounded, deduplicated window of
+        # actual critical-path cells instead.
+        target_cells: list[str] = []
+        seen_cells: set[str] = set()
+        for path in paths:
+            if not isinstance(path, list):
+                continue
+            for cell in path:
+                if isinstance(cell, str) and cell and cell not in seen_cells:
+                    seen_cells.add(cell)
+                    target_cells.append(cell)
+                    if len(target_cells) == 160:
+                        break
+            if len(target_cells) == 160:
+                break
+        if len(target_cells) < 2:
+            raise ValueError("PBLOCK requires at least two extracted critical-path cells")
+
+        # The fabric heuristic needs only a conservative estimate for this selected
+        # cone; it must not be sized from whole-design utilization.
+        target_lut_count = max(64, len(target_cells) * 2)
+        target_ff_count = max(64, len(target_cells) * 2)
+        cell_selection = " ".join(target_cells)
 
         fabric = await self.rw(
             "analyze_fabric_for_pblock",
             {
-                "target_lut_count": int(util["lut"] * 1.5),
-                "target_ff_count": int(util["ff"] * 1.5),
+                "target_lut_count": target_lut_count,
+                "target_ff_count": target_ff_count,
             },
         )
 
@@ -1116,7 +1145,7 @@ class DCPOptimizer(DCPOptimizerBase):
 
         attempt_plans_by_effort = {
             "fast": [
-                {"suffix": "fast", "is_soft": False, "place_directive": "Quick", "phys_opt_directive": None},
+                {"suffix": "fast", "is_soft": True, "place_directive": "Quick", "phys_opt_directive": None},
             ],
             "balanced": [
                 {"suffix": "soft", "is_soft": True, "place_directive": "Default", "phys_opt_directive": "Default"},
@@ -1159,7 +1188,9 @@ class DCPOptimizer(DCPOptimizerBase):
             await self.v("create_and_apply_pblock", {
                 "pblock_name": f"opt_pblock_{plan['suffix']}",
                 "ranges": pblock_ranges,
+                "apply_to": cell_selection,
                 "is_soft": plan["is_soft"],
+                "max_expansion_attempts": 0,
             })
             await self.v("run_tcl", {"command": "place_design -unplace"})
             await self.v("place_design", {"directive": plan["place_directive"]})
@@ -1713,7 +1744,7 @@ class DCPOptimizer(DCPOptimizerBase):
         """Return the current top-level port count without relying on report formatting."""
         result = await self.v(
             "run_tcl",
-            {"command": "puts {FPL26_PORT_COUNT=[llength [get_ports -quiet]]}"},
+            {"command": "puts \"FPL26_PORT_COUNT=[llength [get_ports -quiet]]\""},
         )
         return self._last_tagged_int(result, "FPL26_PORT_COUNT")
 
@@ -1728,9 +1759,9 @@ class DCPOptimizer(DCPOptimizerBase):
         if self._initial_port_count is None:
             self._initial_port_count = port_count
         ports_ok = (
-            self._initial_port_count is None
-            or port_count is None
-            or port_count == self._initial_port_count
+            self._initial_port_count is not None
+            and port_count is not None
+            and port_count == self._initial_port_count
         )
 
         route_status = await self.v("report_route_status", {})

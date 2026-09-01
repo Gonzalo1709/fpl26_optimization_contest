@@ -1012,7 +1012,8 @@ def create_and_apply_pblock(
     is_soft: bool = False,
     timeout: float = 300.0,
     validate_resources: bool = True,
-    max_expansion_attempts: int = 3
+    max_expansion_attempts: int = 0,
+    allow_full_design: bool = False,
 ) -> str:
     """
     Create a pblock and apply it to the design with resource validation.
@@ -1021,17 +1022,24 @@ def create_and_apply_pblock(
         pblock_name: Name for the pblock (e.g., "pblock_tight")
         ranges: Pblock range specification (e.g., "SLICE_X0Y0:SLICE_X100Y100" or 
                 "CLOCKREGION_X0Y0:CLOCKREGION_X2Y3")
-        apply_to: What to apply pblock to - "current_design" applies to all cells in the design,
-                 or provide a cell pattern (e.g., "design_1_wrapper_i/*")
+        apply_to: A specific cell pattern or Tcl cell list to constrain.
         is_soft: If False, sets IS_SOFT property to 0 (hard constraint)
         validate_resources: If True, validate resources and auto-expand if needed
-        max_expansion_attempts: Maximum times to try expanding the pblock
+        max_expansion_attempts: Maximum times to try expanding the pblock. Defaults to
+            zero because an unconstrained expansion can silently become full-chip.
+        allow_full_design: Explicitly permit constraining every cell. This is disabled
+            by default because it is a global reimplementation, not a Pblock recipe.
     
     Returns:
         Status message
     """
     result_lines = []
     current_ranges = ranges
+    if apply_to == "current_design" and not allow_full_design:
+        raise ValueError(
+            "Refusing a full-design Pblock. Pass an explicit cell selection, or set "
+            "allow_full_design=True for a deliberate global reimplementation."
+        )
     
     logger.info(f"Creating pblock '{pblock_name}' with range: {ranges}")
     logger.info(f"validate_resources={validate_resources}, max_expansion_attempts={max_expansion_attempts}")
@@ -1095,7 +1103,11 @@ def create_and_apply_pblock(
                         current_ranges = expand_pblock_range(current_ranges, expansion_factor)
                         continue  # Try again with expanded pblock
                     else:
-                        result_lines.append(f"\n  Maximum expansion attempts reached. Consider using a larger region.")
+                        raise ValueError(
+                            "Pblock resource validation failed; refusing to place with "
+                            "an undersized or automatically expanded constraint: "
+                            + "; ".join(validation["errors"][:5])
+                        )
                 else:
                     result_lines.append(f"\n✓ Resource validation PASSED")
             
@@ -1454,7 +1466,7 @@ async def list_tools():
                     },
                     "apply_to": {
                         "type": "string",
-                        "description": "What to constrain: 'current_design' (all cells) or a cell pattern (default: 'current_design')"
+                        "description": "Specific cell pattern or Tcl cell list to constrain. Full-design application is rejected unless explicitly allowed."
                     },
                     "is_soft": {
                         "type": "boolean",
@@ -1463,6 +1475,14 @@ async def list_tools():
                     "timeout": {
                         "type": "number",
                         "description": "Timeout in seconds (default: 300)"
+                    },
+                    "max_expansion_attempts": {
+                        "type": "integer",
+                        "description": "Maximum automatic expansion retries (default: 0)"
+                    },
+                    "allow_full_design": {
+                        "type": "boolean",
+                        "description": "Allow applying the Pblock to all design cells (default: false)"
                     }
                 },
                 "required": ["pblock_name", "ranges"]
@@ -1832,8 +1852,18 @@ async def call_tool(name: str, arguments: dict):
             apply_to = arguments.get("apply_to", "current_design")
             is_soft = arguments.get("is_soft", False)
             timeout = arguments.get("timeout", 300)
+            max_expansion_attempts = arguments.get("max_expansion_attempts", 0)
+            allow_full_design = arguments.get("allow_full_design", False)
             
-            output = create_and_apply_pblock(pblock_name, ranges, apply_to, is_soft, timeout)
+            output = create_and_apply_pblock(
+                pblock_name,
+                ranges,
+                apply_to,
+                is_soft,
+                timeout,
+                max_expansion_attempts=max_expansion_attempts,
+                allow_full_design=allow_full_design,
+            )
             return [TextContent(type="text", text=output)]
         
         elif name == "write_verilog_simulation":
