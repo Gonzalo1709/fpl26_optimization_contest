@@ -32,6 +32,28 @@ def make_signature(
 
 
 class RecipePolicyTests(unittest.TestCase):
+    def test_expensive_recipe_gates_and_placement_diversification(self):
+        signature = make_signature()
+        short_budget = BudgetState(remaining_runtime_seconds=800, validation_reserve_seconds=60)
+        self.assertNotIn(
+            "PLACEMENT_SHOT",
+            {action.strategy for action in gate_actions(signature, budget=short_budget)},
+        )
+
+        long_budget = BudgetState(remaining_runtime_seconds=1200, validation_reserve_seconds=60)
+        actions = gate_actions(
+            signature,
+            budget=long_budget,
+            history=[{"strategy": "PLACEMENT_SHOT", "args": {"directive": "ExtraNetDelay_low"}}],
+        )
+        by_strategy = {action.strategy: action for action in actions}
+        self.assertIn("PHYS_OPT_REROUTE", by_strategy)
+        self.assertIn("PLACEMENT_SHOT", by_strategy)
+        self.assertNotIn(
+            "ExtraNetDelay_low",
+            by_strategy["PLACEMENT_SHOT"].allowed_args["directive"],
+        )
+
     def test_pblock_requires_extreme_multi_path_spread(self):
         logicnets_like = make_signature(
             spread={

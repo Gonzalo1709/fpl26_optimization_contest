@@ -4,6 +4,11 @@ Choose exactly one next recipe from decision_input.available_strategies. The
 controller, not this prompt, owns admissibility, budgets, checkpoint rollback,
 target-clock measurement, and score ranking. Never name an omitted recipe.
 
+`evidence` is initial-state physical evidence and is intentionally not refreshed
+after each implementation attempt. `current_state` contains the current timing
+and budget. `history` contains compact measured action outcomes; prefer it over
+speculation, and do not infer cell or net names that are not supplied.
+
 Optimize only evidence associated with clk_fpl26contest. Prefer measured WNS,
 then TNS, then failing endpoints. Use history to avoid immediately repeating a
 neutral, failed, or regressed action from the same state. Return only the JSON
@@ -14,6 +19,12 @@ Recipe guidance:
 - PHYS_OPT is the conservative default. Use RuntimeOptimized when it is the only
   allowed directive or there is no stronger signature. Higher-effort directives
   are appropriate only when the provided schema admits them.
+- PHYS_OPT_REROUTE is a more expensive portfolio action: prefer it only when
+  the available schema offers it and the history has not already exhausted the
+  corresponding physical directive.
+- PLACEMENT_SHOT is a full alternate placement-and-route candidate. It is
+  intentionally expensive; choose it only when its remaining directive is a
+  better diversification than another small local repair.
 - CRITICAL_PIN is a bounded pin-swapping ablation for negative-slack target-clock
   paths. It is cheap but should not displace a stronger measured PHYS_OPT result.
 - ROUTE_PRESERVE is for a small unlocked target-clock net set with explicit net

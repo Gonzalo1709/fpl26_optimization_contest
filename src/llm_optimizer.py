@@ -32,9 +32,16 @@ from src.search import GenerationSearchConfig, SearchCandidate, should_stop_fast
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "~openai/gpt-latest"
-SUPPORTED_SINGLE_METHODS = ("PBLOCK", "FANOUT", "CELL_RELOCATE", "PHYS_OPT", "HARD_BLOCK")
+SUPPORTED_SINGLE_METHODS = (
+    "PBLOCK", "FANOUT", "CELL_RELOCATE", "PHYS_OPT", "HARD_BLOCK",
+    "PHYS_OPT_REROUTE", "PLACEMENT_SHOT",
+)
 PLANNER_MAX_TOKENS = 320
 PLANNER_RETRY_MAX_TOKENS = 512
+# This is an input budget, unlike ``max_tokens`` above, which only limits the
+# completion.  3,600 JSON characters is roughly 900 tokens and leaves room for
+# the system prompt on small-context models.
+PLANNER_CONTEXT_MAX_CHARS = 3600
 
 
 class ToolExecutionError(RuntimeError):
@@ -235,66 +242,141 @@ class DCPOptimizer(DCPOptimizerBase):
             return text
         return text[: max_chars - 3].rstrip() + "..."
 
-    def _compact_analysis_summary(self, analysis_summary: str) -> str:
-        """Keep only the most decision-relevant parts of the initial analysis."""
-        kept_lines: list[str] = []
-        high_fanout_count = 0
-        for raw_line in analysis_summary.splitlines():
-            line = raw_line.rstrip()
-            stripped = line.strip()
-            if not stripped:
-                if kept_lines and kept_lines[-1] != "":
-                    kept_lines.append("")
-                continue
-            if stripped.startswith("Clock period:") or stripped.startswith("WNS:") or stripped.startswith("TNS:"):
-                kept_lines.append(line)
-            elif stripped.startswith("Failing endpoints:") or stripped.startswith("Achievable fmax:"):
-                kept_lines.append(line)
-            elif stripped.startswith("Max cell distance:") or stripped.startswith("Avg cell distance:"):
-                kept_lines.append(line)
-            elif stripped.startswith("RECOMMENDATION:"):
-                kept_lines.append(line)
-            elif re.match(r"^\d+\.\s", stripped):
-                if high_fanout_count < 3:
-                    kept_lines.append(line)
-                    high_fanout_count += 1
-            elif stripped.startswith("Fanout:") and high_fanout_count <= 3:
-                kept_lines.append(line)
-            elif stripped.startswith("Total nets available for optimization:"):
-                kept_lines.append(line)
+    @staticmethod
+    def _rounded(value, digits: int = 3):
+        """Keep numeric planner evidence stable and compact."""
+        return round(value, digits) if isinstance(value, (int, float)) and not isinstance(value, bool) else value
 
-        compact = "\n".join(kept_lines).strip()
-        return self._truncate_text(compact or analysis_summary, 1400)
+    def _planner_evidence(self) -> dict:
+        """Return one non-duplicated, initial-state evidence record for the planner."""
+        signature = self.design_signature
+        if signature is None:
+            return {"available": False}
+
+        return {
+            "available": True,
+            "clock": {
+                "name": signature.target_clock,
+                "period_ns": self._rounded(signature.clock_period_ns),
+            },
+            "initial_timing": {
+                "wns_ns": self._rounded(signature.wns_ns),
+                "tns_ns": self._rounded(signature.tns_ns),
+                "failing_endpoints": signature.failing_endpoints,
+            },
+            "physical": {
+                "path_spread": (
+                    {
+                        "max_tiles": self._rounded(signature.path_spread.max_distance, 1),
+                        "avg_tiles": self._rounded(signature.path_spread.avg_distance, 1),
+                        "paths": signature.path_spread.paths_analyzed,
+                    }
+                    if signature.path_spread
+                    else None
+                ),
+                "congestion": signature.congestion,
+                "critical_hard_blocks": list(signature.critical_hard_block_types),
+            },
+            # Net names are not planner arguments: the controller selects and validates
+            # them.  Keeping only evidence statistics prevents long hierarchical names
+            # from consuming most of the context window.
+            "fanout": [
+                {"fanout": candidate.fanout, "critical_paths": candidate.critical_path_count}
+                for candidate in signature.high_fanout_candidates[:3]
+            ],
+            "unavailable": list(signature.unavailable),
+        }
 
     def _compact_history(self, recent_history: list[dict]) -> list[dict]:
-        """Reduce planner history to the fields needed for next-step choice."""
+        """Encode recent action outcomes, not raw logs, for the next planner choice."""
         compact_history: list[dict] = []
         for entry in recent_history[-4:]:
+            error = str(entry.get("error") or "")
+            delta = entry.get("delta_wns")
+            if error:
+                outcome = "failed"
+            elif isinstance(delta, (int, float)) and delta > 0:
+                outcome = "improved"
+            elif isinstance(delta, (int, float)) and delta < 0:
+                outcome = "regressed"
+            else:
+                outcome = "neutral"
             compact_entry = {
                 "iteration": entry.get("iteration") or entry.get("step"),
                 "strategy": entry.get("strategy"),
-                "wns": entry.get("wns"),
-                "delta_wns": entry.get("delta_wns"),
-                "error": self._truncate_text(str(entry["error"]), 120) if entry.get("error") else None,
+                "outcome": outcome,
+                "d_wns_ns": self._rounded(delta),
+                "d_tns_ns": self._rounded(entry.get("delta_tns")),
+                "d_endpoints": entry.get("delta_failing_endpoints"),
+                "seconds": self._rounded(entry.get("elapsed_seconds"), 1),
+                "roi": "accepted" if entry.get("roi_accepted") is True else "rejected" if entry.get("roi_accepted") is False else None,
+                "failure_kind": self._failure_kind(error) if error else None,
             }
             args = entry.get("args")
             if args:
                 compact_entry["args"] = args
             if entry.get("delta_vs_best") is not None:
-                compact_entry["delta_vs_best"] = entry.get("delta_vs_best")
+                compact_entry["d_best_ns"] = self._rounded(entry.get("delta_vs_best"))
+            elif entry.get("delta_vs_peak") is not None:
+                compact_entry["d_peak_ns"] = self._rounded(entry.get("delta_vs_peak"))
             compact_history.append({key: value for key, value in compact_entry.items() if value is not None})
         return compact_history
+
+    @staticmethod
+    def _failure_kind(error: str) -> str:
+        """Classify verbose tool errors without sending implementation logs to the model."""
+        lowered = error.lower()
+        if "timeout" in lowered or "wall-clock" in lowered:
+            return "timeout"
+        if "resource" in lowered or "pblock" in lowered or "util" in lowered:
+            return "resource"
+        if "route" in lowered:
+            return "route"
+        if "drc" in lowered or "hold" in lowered or "pulse" in lowered or "validation" in lowered:
+            return "validation"
+        return "tool"
 
     def _compact_branch_context(self, branch_context: str) -> str:
         """Shorten branch context to a compact summary."""
         return self._truncate_text(branch_context.strip(), 260) if branch_context else ""
 
     def _compact_candidate_summaries(self, tried_summaries: str) -> str:
-        """Keep only the most recent candidate summaries."""
+        """Keep a very small branch breadcrumb; history carries the actual outcomes."""
         if not tried_summaries:
             return ""
         lines = [line for line in tried_summaries.splitlines() if line.strip()]
-        return self._truncate_text("\n".join(lines[-6:]), 500)
+        return self._truncate_text("\n".join(lines[-3:]), 220)
+
+    @staticmethod
+    def _fit_planner_context(payload: dict) -> dict:
+        """Apply deterministic degradation while preserving valid JSON and key evidence."""
+        def encoded_size() -> int:
+            return len(json.dumps(payload, separators=(",", ":"), ensure_ascii=True))
+
+        if encoded_size() <= PLANNER_CONTEXT_MAX_CHARS:
+            return payload
+        payload["branch_context"] = ""
+        payload["recent_candidates"] = ""
+        if encoded_size() <= PLANNER_CONTEXT_MAX_CHARS:
+            return payload
+        payload["history"] = payload.get("history", [])[-2:]
+        if encoded_size() <= PLANNER_CONTEXT_MAX_CHARS:
+            return payload
+        payload["fanout_blacklist"]["examples"] = []
+        for action in payload.get("available_strategies", {}).values():
+            action.pop("evidence", None)
+        if encoded_size() <= PLANNER_CONTEXT_MAX_CHARS:
+            return payload
+        # Malformed or externally supplied history can still be arbitrarily large.
+        # Retain only action and outcome rather than returning over-budget JSON.
+        payload["history"] = [
+            {key: entry.get(key) for key in ("strategy", "outcome", "failure_kind") if entry.get(key) is not None}
+            for entry in payload.get("history", [])[-1:]
+        ]
+        evidence = payload.get("evidence", {})
+        evidence["fanout"] = []
+        evidence["physical"] = {"path_spread": None, "congestion": None, "critical_hard_blocks": []}
+        return payload
 
     @staticmethod
     def _planner_user_message(decision_input: dict, retry: bool = False) -> str:
@@ -307,7 +389,7 @@ class DCPOptimizer(DCPOptimizerBase):
         return (
             "Choose one optimization action.\n"
             "Return one JSON object only.\n"
-            'Schema: {"strategy":"PBLOCK|FANOUT|CELL_RELOCATE|PHYS_OPT|HARD_BLOCK","args":{...}}\n'
+            'Schema: {"strategy":"PBLOCK|FANOUT|CELL_RELOCATE|PHYS_OPT|PHYS_OPT_REROUTE|PLACEMENT_SHOT|HARD_BLOCK","args":{...}}\n'
             "Keep args minimal. No markdown or explanation.\n"
             f"{retry_line}"
             "Decision input:\n"
@@ -796,6 +878,24 @@ class DCPOptimizer(DCPOptimizerBase):
                 directive = "RuntimeOptimized"
             return strategy, {"directive": directive}
 
+        if strategy == "PHYS_OPT_REROUTE":
+            directive = args.get("directive", "RuntimeOptimized")
+            if directive not in ["RuntimeOptimized", "Default", "Explore", "AggressiveExplore"]:
+                directive = "RuntimeOptimized"
+            return strategy, {"directive": directive}
+
+        if strategy == "PLACEMENT_SHOT":
+            directive = args.get("directive", "ExtraNetDelay_low")
+            if directive not in [
+                "ExtraNetDelay_low",
+                "AltSpreadLogic_medium",
+                "WLDrivenBlockPlacement",
+                "ExtraTimingOpt",
+                "EarlyBlockPlacement",
+            ]:
+                directive = "ExtraNetDelay_low"
+            return strategy, {"directive": directive}
+
         if strategy == "CRITICAL_PIN":
             return strategy, {}
 
@@ -898,7 +998,7 @@ class DCPOptimizer(DCPOptimizerBase):
             allowed_types = set(eligible[strategy].default_args.get("hard_block_types", []))
             requested_types = [item for item in args["hard_block_types"] if item in allowed_types]
             args["hard_block_types"] = requested_types or sorted(allowed_types)
-        elif strategy == "PHYS_OPT":
+        elif strategy in {"PHYS_OPT", "PHYS_OPT_REROUTE", "PLACEMENT_SHOT"}:
             allowed_directives = eligible[strategy].allowed_args.get("directive", [])
             if args["directive"] not in allowed_directives:
                 args = dict(eligible[strategy].default_args)
@@ -1429,6 +1529,77 @@ class DCPOptimizer(DCPOptimizerBase):
         await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
         return baseline_report
 
+    async def run_phys_opt_reroute_flow(self, directive: str = "RuntimeOptimized") -> str:
+        """Try physical optimization followed by a clean global reroute.
+
+        The post-phys checkpoint is retained if rerouting regresses it, so this
+        recipe never throws away an otherwise useful physical improvement.
+        """
+        baseline_checkpoint = Path(self.temp_dir) / "phys_opt_reroute_baseline.dcp"
+        phys_checkpoint = Path(self.temp_dir) / "phys_opt_reroute_phys.dcp"
+        await self.v("write_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "force": True})
+        baseline_report = await self.v("report_timing_summary")
+        baseline_metrics = await self._measure_current_metrics(baseline_report)
+
+        try:
+            tool_args = {
+                "RuntimeOptimized": {"directive": "RuntimeOptimized"},
+                "Default": {"directive": "Default"},
+                "Explore": {"directive": "Explore"},
+                "AggressiveExplore": {"directive": "AggressiveExplore"},
+            }.get(directive, {"directive": "RuntimeOptimized"})
+            await self.v("phys_opt_design", tool_args)
+            phys_report = await self.v("report_timing_summary")
+            phys_metrics = await self._measure_current_metrics(phys_report)
+            best_report, best_metrics, best_checkpoint = baseline_report, baseline_metrics, baseline_checkpoint
+            if self._is_metrics_improvement(phys_metrics, best_metrics):
+                await self.v("write_checkpoint", {"dcp_path": str(phys_checkpoint.resolve()), "force": True})
+                best_report, best_metrics, best_checkpoint = phys_report, phys_metrics, phys_checkpoint
+
+            remaining = self._remaining_wall_clock_seconds()
+            reserve = self._current_budget_state().validation_reserve_seconds
+            if remaining is None or remaining >= reserve + 240:
+                try:
+                    await self.v("route_design", {"timeout": 3600})
+                    reroute_report = await self.v("report_timing_summary")
+                    reroute_metrics = await self._measure_current_metrics(reroute_report)
+                    if self._is_metrics_improvement(reroute_metrics, best_metrics):
+                        return reroute_report
+                except Exception as exc:
+                    logger.warning("Post-phys reroute failed; retaining the pre-reroute best: %s", exc)
+
+            await self.v("open_checkpoint", {"dcp_path": str(best_checkpoint.resolve())})
+            return best_report
+        except Exception:
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve())})
+            raise
+
+    async def run_placement_shot_flow(self, directive: str = "ExtraNetDelay_low") -> str:
+        """Run one bounded alternate placement seed from the routed incumbent."""
+        baseline_checkpoint = Path(self.temp_dir) / "placement_shot_baseline.dcp"
+        await self.v("write_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "force": True})
+        baseline_report = await self.v("report_timing_summary")
+        baseline_metrics = await self._measure_current_metrics(baseline_report)
+        remaining = self._remaining_wall_clock_seconds()
+        reserve = self._current_budget_state().validation_reserve_seconds
+        if remaining is not None and remaining < reserve + 900:
+            logger.info("Skipping placement shot: %.0fs remain, need %.0fs", remaining, reserve + 900)
+            return baseline_report
+
+        try:
+            await self.v("run_tcl", {"command": "route_design -unroute -quiet; place_design -unplace -quiet"})
+            await self.v("place_design", {"directive": directive, "timeout": 3600})
+            await self.v("run_tcl", {"command": "route_design -directive Explore -tns_cleanup -quiet", "timeout": 3600})
+            report = await self.v("report_timing_summary")
+            metrics = await self._measure_current_metrics(report)
+            if self._is_metrics_improvement(metrics, baseline_metrics):
+                return report
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+            return baseline_report
+        except Exception:
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+            raise
+
     async def run_critical_pin_flow(self) -> str:
         """Run only Vivado's target-timing critical pin-swapping optimization."""
         return await self.run_phys_opt_flow(directive="CriticalPin")
@@ -1646,6 +1817,10 @@ class DCPOptimizer(DCPOptimizerBase):
             result = await self.run_critical_pin_flow()
         elif strategy == "ROUTE_PRESERVE":
             result = await self.run_route_preserve_flow(**args)
+        elif strategy == "PHYS_OPT_REROUTE":
+            result = await self.run_phys_opt_reroute_flow(**args)
+        elif strategy == "PLACEMENT_SHOT":
+            result = await self.run_placement_shot_flow(**args)
         else:
             result = await self.run_phys_opt_flow(**args)
 
@@ -1672,6 +1847,8 @@ class DCPOptimizer(DCPOptimizerBase):
                 "max_move_distance": "int (5-80 tiles)",
             },
             "PHYS_OPT": {"directive": ["RuntimeOptimized"]},
+            "PHYS_OPT_REROUTE": {"directive": ["RuntimeOptimized"]},
+            "PLACEMENT_SHOT": {"directive": ["ExtraNetDelay_low"]},
             "HARD_BLOCK": {"hard_block_types": ["DSP", "BRAM", "URAM"]},
             "CRITICAL_PIN": {},
             "ROUTE_PRESERVE": {
@@ -1687,13 +1864,21 @@ class DCPOptimizer(DCPOptimizerBase):
                 schema["hard_block_types"] = action.default_args["hard_block_types"]
             elif action.strategy == "PHYS_OPT":
                 schema["directive"] = action.allowed_args["directive"]
+            elif action.strategy in {"PHYS_OPT_REROUTE", "PLACEMENT_SHOT"}:
+                schema["directive"] = action.allowed_args["directive"]
             available_strategies[action.strategy] = schema
-        return {
-            "analysis": self._compact_analysis_summary(analysis_summary),
-            "design_signature": self.design_signature.to_dict() if self.design_signature else None,
+        budget = self._current_budget_state()
+        payload = {
+            "context_version": 2,
+            "evidence_epoch": "initial",  # Dynamic timing appears below; physical analysis is initial-state evidence.
+            "evidence": self._planner_evidence(),
+            "current_state": {
+                "best_wns_ns": self._rounded(self.best_wns) if math.isfinite(self.best_wns) else None,
+                "stagnation": stagnation,
+                "remaining_runtime_s": self._rounded(budget.remaining_runtime_seconds, 1) if math.isfinite(budget.remaining_runtime_seconds) else None,
+                "validation_reserve_s": self._rounded(budget.validation_reserve_seconds, 1),
+            },
             "history": self._compact_history(recent_history),
-            "best_wns": self.best_wns,
-            "stagnation": stagnation,
             "branch_context": self._compact_branch_context(branch_context),
             "recent_candidates": self._compact_candidate_summaries(tried_summaries),
             "fanout_blacklist": {
@@ -1707,11 +1892,15 @@ class DCPOptimizer(DCPOptimizerBase):
                 "max_steps_per_branch": self.generation_config.max_steps_per_branch,
                 "max_steps_without_improvement": self.generation_config.max_steps_without_improvement,
             },
-            "available_strategies": available_strategies,
-            "eligibility_reasons": {
-                action.strategy: action.reason for action in eligible_actions
+            "available_strategies": {
+                action.strategy: {
+                    "args": available_strategies[action.strategy],
+                    "evidence": self._truncate_text(action.reason, 100),
+                }
+                for action in eligible_actions
             },
         }
+        return self._fit_planner_context(payload)
 
     def _is_wns_improvement(self, new_wns: Optional[float], old_wns: Optional[float]) -> bool:
         """Return True if new_wns beats old_wns by the configured threshold."""
@@ -1863,7 +2052,7 @@ class DCPOptimizer(DCPOptimizerBase):
         return True
 
     async def run_reimplementation_flow(self, baseline_checkpoint: Path) -> str:
-        """Run Slot-A-style Explore implementation from a routed checkpoint.
+        """Run Slot-A-style RQS-guided implementation from a routed checkpoint.
 
         This is deliberately one deterministic seed candidate, not an LLM branch:
         full implementation is too expensive to multiply across a beam search.  The
@@ -1877,6 +2066,10 @@ class DCPOptimizer(DCPOptimizerBase):
             logger.info("Skipping reimplementation: %.0fs remain, need %.0fs", remaining, reserve + 900)
             return baseline_report
 
+        # Suggestions are optional: a missing/unsupported RQS flow must retain
+        # the original deterministic Explore implementation path.
+        rqs_ready = await self._prepare_rqs_strategy()
+        impl_directive = "RQS" if rqs_ready else "Explore"
         try:
             await self.v("run_tcl", {"command": "route_design -unroute -quiet; place_design -unplace -quiet"})
             cell_counts = await self.v(
@@ -1884,7 +2077,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 {
                     "command": (
                         "set n0 [llength [get_cells -quiet -hier -filter {IS_PRIMITIVE}]]; "
-                        "opt_design -directive Explore -quiet; "
+                        f"opt_design -directive {impl_directive} -quiet; "
                         "set n1 [llength [get_cells -quiet -hier -filter {IS_PRIMITIVE}]]; "
                         "puts \"FPL26_REIMPL_CELLS=$n0,$n1\""
                     )
@@ -1900,7 +2093,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 return baseline_report
 
             place_started = time.time()
-            await self.v("place_design", {"directive": "Explore", "timeout": 3600})
+            await self.v("place_design", {"directive": impl_directive, "timeout": 3600})
             place_seconds = time.time() - place_started
             route_estimate = max(2.4 * place_seconds, 600.0)
             phys_estimate = max(2.0 * place_seconds, 300.0)
@@ -1910,12 +2103,15 @@ class DCPOptimizer(DCPOptimizerBase):
                 await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
                 return baseline_report
             if remaining is None or remaining >= reserve + route_estimate + phys_estimate + 180:
-                await self.v("phys_opt_design", {"directive": "Explore", "timeout": 3600})
+                await self.v("phys_opt_design", {"directive": impl_directive, "timeout": 3600})
 
-            await self.v(
-                "run_tcl",
-                {"command": "route_design -directive Explore -tns_cleanup -quiet", "timeout": 3600},
-            )
+            if rqs_ready:
+                await self.v("route_design", {"directive": "RQS", "timeout": 3600})
+            else:
+                await self.v(
+                    "run_tcl",
+                    {"command": "route_design -directive Explore -tns_cleanup -quiet", "timeout": 3600},
+                )
             report = await self.v("report_timing_summary")
             metrics = await self._measure_current_metrics(report)
             if self._is_metrics_improvement(metrics, baseline_metrics):
@@ -1926,6 +2122,41 @@ class DCPOptimizer(DCPOptimizerBase):
         except Exception:
             await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
             raise
+
+    async def _prepare_rqs_strategy(self) -> bool:
+        """Export and read Vivado strategy suggestions, returning whether usable.
+
+        RQS is deliberately prepared before unplacing the design.  It remains a
+        best-effort enhancement because Vivado versions and licenses differ.
+        """
+        rqs_dir = Path(self.temp_dir) / "rqs"
+        rqs_dir.mkdir(parents=True, exist_ok=True)
+        qor_assessment = rqs_dir / "qor_assessment.rpt"
+        qor_suggestions = rqs_dir / "qor_suggestions.rpt"
+        tcl_dir = str(rqs_dir.resolve()).replace("\\", "/")
+        tcl_assessment = str(qor_assessment.resolve()).replace("\\", "/")
+        tcl_suggestions = str(qor_suggestions.resolve()).replace("\\", "/")
+        command = (
+            f"report_qor_assessment -file {{{tcl_assessment}}}; "
+            f"report_qor_suggestions -file {{{tcl_suggestions}}}; "
+            "set fpl26_qs [get_qor_suggestions -quiet -filter {Category == Strategy}]; "
+            "if {[llength $fpl26_qs] > 0} {"
+            f"write_qor_suggestions -force -strategy_dir {{{tcl_dir}}} "
+            "-of_objects [get_qor_suggestions -filter {APPLIED || Category == Strategy}]; "
+            f"set fpl26_files [lsort [glob -nocomplain -directory {{{tcl_dir}}} *.rqs]]; "
+            "if {[llength $fpl26_files] > 0} {read_qor_suggestions [lindex $fpl26_files 0]; puts FPL26_RQS_READY=1} "
+            "else {puts FPL26_RQS_READY=0}"
+            "} else {puts FPL26_RQS_READY=0}"
+        )
+        try:
+            result = await self.v("run_tcl", {"command": command, "timeout": 900})
+        except Exception as exc:
+            logger.info("RQS preparation unavailable; using Explore fallback: %s", exc)
+            return False
+        ready = bool(re.search(r"FPL26_RQS_READY\s*=\s*1", str(result)))
+        if not ready:
+            logger.info("No usable strategy suggestions; using Explore reimplementation")
+        return ready
 
     async def _save_best_checkpoint(self, dcp_path: Path) -> Path:
         """Persist the current Vivado design and return the saved checkpoint path."""
@@ -2173,6 +2404,8 @@ class DCPOptimizer(DCPOptimizerBase):
                 strategy_args = {"num_paths": 10, "detour_threshold": 2.0, "max_cells": 3}
             elif method == "HARD_BLOCK":
                 strategy_args = {"hard_block_types": ["DSP", "BRAM", "URAM"]}
+            elif method == "PLACEMENT_SHOT":
+                strategy_args = {"directive": "ExtraNetDelay_low"}
             else:
                 strategy_args = {"directive": phys_opt_directive}
 

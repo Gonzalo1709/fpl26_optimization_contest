@@ -95,6 +95,8 @@ Examples:
   python dcp_optimizer.py input.dcp --single-method PBLOCK
   python dcp_optimizer.py input.dcp --single-method FANOUT --top-n-nets 3
   python dcp_optimizer.py input.dcp --single-method PHYS_OPT --phys-opt-directive Explore
+  python dcp_optimizer.py input.dcp --single-method PHYS_OPT_REROUTE --phys-opt-directive Explore
+  python dcp_optimizer.py input.dcp --single-method PLACEMENT_SHOT
   python dcp_optimizer.py input.dcp --debug
   python dcp_optimizer.py fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp --test
   python dcp_optimizer.py fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp --test
@@ -252,7 +254,7 @@ Examples:
         "--phys-opt-directive",
         choices=["Default", "Explore", "AggressiveExplore"],
         default="Default",
-        help="When using --single-method PHYS_OPT, use this phys_opt_design directive (default: Default)",
+        help="When using --single-method PHYS_OPT or PHYS_OPT_REROUTE, use this phys_opt_design directive (default: Default)",
     )
     force_group = parser.add_mutually_exclusive_group()
     force_group.add_argument(
@@ -339,7 +341,7 @@ Examples:
         print(f"Method:       {args.single_method}")
         if args.single_method == "FANOUT":
             print(f"Top nets:     {args.top_n_nets}")
-        elif args.single_method == "PHYS_OPT":
+        elif args.single_method in {"PHYS_OPT", "PHYS_OPT_REROUTE"}:
             print(f"Directive:    {args.phys_opt_directive}")
         print()
 

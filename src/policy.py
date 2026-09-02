@@ -239,6 +239,7 @@ def gate_actions(
 ) -> tuple[EligibleAction, ...]:
     """Return only recipes supported by current evidence and remaining budget."""
     budget = budget or BudgetState()
+    history = tuple(history)
     if (
         budget.remaining_runtime_seconds <= budget.validation_reserve_seconds
         or budget.remaining_cost_usd <= 0
@@ -282,6 +283,50 @@ def gate_actions(
             reason="low-risk physical optimization remains the deterministic fallback",
         )
     ]
+
+    if budget.remaining_runtime_seconds >= budget.validation_reserve_seconds + 300:
+        reroute_directives = [
+            attempt.name
+            for attempt in phys_opt_attempts
+            if attempt.name in {"RuntimeOptimized", "Default", "Explore", "AggressiveExplore"}
+        ]
+        if reroute_directives:
+            actions.append(
+                EligibleAction(
+                    strategy="PHYS_OPT_REROUTE",
+                    default_args={"directive": reroute_directives[0]},
+                    allowed_args={"directive": reroute_directives},
+                    reason="a full reroute can realize physical changes that incremental routing leaves unused",
+                )
+            )
+
+    placement_directives = (
+        "ExtraNetDelay_low",
+        "AltSpreadLogic_medium",
+        "WLDrivenBlockPlacement",
+        "ExtraTimingOpt",
+        "EarlyBlockPlacement",
+    )
+    used_placement_directives = {
+        str(item.get("args", {}).get("directive"))
+        for item in history
+        if item.get("strategy") == "PLACEMENT_SHOT" and isinstance(item.get("args"), dict)
+    }
+    remaining_placement_directives = [
+        directive for directive in placement_directives if directive not in used_placement_directives
+    ]
+    if (
+        remaining_placement_directives
+        and budget.remaining_runtime_seconds >= budget.validation_reserve_seconds + 900
+    ):
+        actions.append(
+            EligibleAction(
+                strategy="PLACEMENT_SHOT",
+                default_args={"directive": remaining_placement_directives[0]},
+                allowed_args={"directive": remaining_placement_directives},
+                reason="a bounded alternate placement seed remains available for a routing-sensitive design",
+            )
+        )
 
     if (
         signature.wns_ns is not None
