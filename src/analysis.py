@@ -4,9 +4,11 @@ from dataclasses import asdict, dataclass
 
 from src.parsers import (
     parse_congestion_report,
+    parse_critical_hard_block_topology,
     parse_critical_hard_block_types,
     parse_high_fanout_nets_report,
     parse_spread_analysis,
+    parse_timing_anatomy_report,
 )
 from src.scoring import target_clock_fmax_mhz
 
@@ -46,6 +48,9 @@ class DesignSignature:
     path_spread: PathSpread | None
     critical_hard_block_types: tuple[str, ...]
     congestion: dict[str, int | bool] | None
+    timing_anatomy: dict[str, float | int | bool] | None
+    hard_block_topology: dict[str, int] | None
+    primitive_cell_count: int | None
     analysis_duration_seconds: float
     unavailable: tuple[str, ...]
 
@@ -63,6 +68,8 @@ class DesignSignature:
         analysis_duration_seconds: float,
         critical_paths_report: str | None = None,
         congestion_report: str | None = None,
+        primitive_cell_count: int | None = None,
+        timing_anatomy_report: str | None = None,
     ) -> "DesignSignature":
         fanout_candidates = tuple(
             HighFanoutCandidate(
@@ -78,6 +85,8 @@ class DesignSignature:
         path_spread = PathSpread(**spread_payload) if spread_payload else None
         hard_block_types = parse_critical_hard_block_types(critical_paths_report)
         congestion = parse_congestion_report(congestion_report)
+        timing_anatomy = parse_timing_anatomy_report(timing_anatomy_report)
+        hard_block_topology = parse_critical_hard_block_topology(critical_paths_report)
 
         unavailable = []
         if clock_period_ns is None:
@@ -94,6 +103,12 @@ class DesignSignature:
             unavailable.append("critical_hard_blocks")
         if congestion is None:
             unavailable.append("congestion")
+        if primitive_cell_count is None:
+            unavailable.append("primitive_cell_count")
+        if timing_anatomy is None:
+            unavailable.append("timing_anatomy")
+        if hard_block_topology is None:
+            unavailable.append("hard_block_topology")
 
         fmax_mhz = None
         if clock_period_ns is not None and wns_ns is not None:
@@ -110,6 +125,9 @@ class DesignSignature:
             path_spread=path_spread,
             critical_hard_block_types=hard_block_types,
             congestion=congestion,
+            timing_anatomy=timing_anatomy,
+            hard_block_topology=hard_block_topology,
+            primitive_cell_count=primitive_cell_count,
             analysis_duration_seconds=analysis_duration_seconds,
             unavailable=tuple(unavailable),
         )
@@ -128,6 +146,9 @@ class DesignSignature:
             "path_spread": asdict(self.path_spread) if self.path_spread else None,
             "critical_hard_block_types": list(self.critical_hard_block_types),
             "congestion": self.congestion,
+            "timing_anatomy": self.timing_anatomy,
+            "hard_block_topology": self.hard_block_topology,
+            "primitive_cell_count": self.primitive_cell_count,
             "analysis_duration_seconds": self.analysis_duration_seconds,
             "unavailable": list(self.unavailable),
         }

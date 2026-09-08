@@ -160,6 +160,80 @@ def parse_congestion_report(report: str | None) -> dict[str, int | bool] | None:
 	return {"max_level": max_level, "severe": max_level >= 5}
 
 
+def parse_timing_anatomy_report(report: str | None) -> dict[str, float | int] | None:
+    """Summarize logic-versus-route delay from ordinary Vivado timing text.
+
+    Vivado has changed the surrounding report layout across releases, but the
+    ``logic ... route`` parenthetical is stable.  Treat absent fields as
+    unavailable instead of guessing from the total path delay.
+    """
+    if not report:
+        return None
+    matches = re.findall(
+        r"logic\s+[-+]?\d+(?:\.\d+)?\s*ns\s*\(([-+]?\d+(?:\.\d+)?)%\).*?"
+        r"route\s+[-+]?\d+(?:\.\d+)?\s*ns\s*\(([-+]?\d+(?:\.\d+)?)%\)",
+        report,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not matches:
+        return None
+    logic = [float(match[0]) for match in matches]
+    route = [float(match[1]) for match in matches]
+    return {
+        "paths_analyzed": len(matches),
+        "avg_logic_delay_pct": sum(logic) / len(logic),
+        "avg_route_delay_pct": sum(route) / len(route),
+        "route_dominated": (sum(route) / len(route)) >= 55.0,
+    }
+
+
+def parse_critical_hard_block_topology(report: str | None) -> dict[str, int] | None:
+    """Measure resource transitions in extracted critical paths.
+
+    This intentionally uses only resource-family names available in the DCP
+    path extraction.  It is a conservative proxy for macro-boundary evidence;
+    it does not infer dedicated-cascade connectivity that is not present.
+    """
+    if not report:
+        return None
+    try:
+        paths = json.loads(report)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(paths, list):
+        return None
+
+    def family(cell: object) -> str:
+        name = str(cell).upper()
+        if "URAM" in name:
+            return "URAM"
+        if "RAMB" in name or "BRAM" in name:
+            return "BRAM"
+        if "DSP48" in name or "/DSP" in name or "_DSP" in name:
+            return "DSP"
+        return "LOGIC"
+
+    hard_block_paths = 0
+    boundary_transitions = 0
+    same_family_hard_adjacencies = 0
+    for path in paths:
+        if not isinstance(path, list) or not path:
+            continue
+        families = [family(cell) for cell in path]
+        if any(item != "LOGIC" for item in families):
+            hard_block_paths += 1
+        for left, right in zip(families, families[1:]):
+            if left != right and (left != "LOGIC" or right != "LOGIC"):
+                boundary_transitions += 1
+            if left == right and left != "LOGIC":
+                same_family_hard_adjacencies += 1
+    return {
+        "hard_block_paths": hard_block_paths,
+        "boundary_transitions": boundary_transitions,
+        "same_family_hard_adjacencies": same_family_hard_adjacencies,
+    }
+
+
 def parse_timing_summary_static(timing_report: str) -> dict:
 	"""
 	Parse timing summary report to extract WNS, TNS, and failing endpoints.

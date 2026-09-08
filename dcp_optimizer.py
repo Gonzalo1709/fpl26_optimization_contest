@@ -97,6 +97,7 @@ Examples:
   python dcp_optimizer.py input.dcp --single-method PHYS_OPT --phys-opt-directive Explore
   python dcp_optimizer.py input.dcp --single-method PHYS_OPT_REROUTE --phys-opt-directive Explore
   python dcp_optimizer.py input.dcp --single-method PLACEMENT_SHOT
+  python dcp_optimizer.py input.dcp --single-method FULL_PLACE_ROUTE
   python dcp_optimizer.py input.dcp --debug
   python dcp_optimizer.py fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp --test
   python dcp_optimizer.py fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp --test

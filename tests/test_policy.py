@@ -16,6 +16,7 @@ def make_signature(
     spread: dict | None = None,
     critical_paths: list[list[str]] | None = None,
     congestion_report: str | None = None,
+    primitive_cell_count: int | None = None,
 ) -> DesignSignature:
     return DesignSignature.from_reports(
         target_clock="clk_fpl26contest",
@@ -28,10 +29,34 @@ def make_signature(
         analysis_duration_seconds=1.0,
         critical_paths_report=json.dumps(critical_paths) if critical_paths else None,
         congestion_report=congestion_report,
+        primitive_cell_count=primitive_cell_count,
     )
 
 
 class RecipePolicyTests(unittest.TestCase):
+    def test_full_place_route_is_early_and_bounded_by_size_time_and_history(self):
+        signature = make_signature(primitive_cell_count=50_000)
+        budget = BudgetState(remaining_runtime_seconds=1_800, validation_reserve_seconds=600)
+        actions = gate_actions(signature, budget=budget)
+        self.assertEqual(actions[0].strategy, "FULL_PLACE_ROUTE")
+
+        too_large = make_signature(primitive_cell_count=50_001)
+        self.assertNotIn(
+            "FULL_PLACE_ROUTE",
+            {action.strategy for action in gate_actions(too_large, budget=budget)},
+        )
+        self.assertNotIn(
+            "FULL_PLACE_ROUTE",
+            {
+                action.strategy
+                for action in gate_actions(
+                    signature,
+                    budget=budget,
+                    history=[{"strategy": "FULL_PLACE_ROUTE"}],
+                )
+            },
+        )
+
     def test_expensive_recipe_gates_and_placement_diversification(self):
         signature = make_signature()
         short_budget = BudgetState(remaining_runtime_seconds=800, validation_reserve_seconds=60)

@@ -16,6 +16,9 @@ object requested by the application output contract.
 
 Recipe guidance:
 
+- FULL_PLACE_ROUTE is an early, whole-design Explore placement-and-route
+  candidate. Choose it only when the controller exposes it: that means the
+  measured design size and remaining time already passed its safety gate.
 - PHYS_OPT is the conservative default. Use RuntimeOptimized when it is the only
   allowed directive or there is no stronger signature. Higher-effort directives
   are appropriate only when the provided schema admits them.

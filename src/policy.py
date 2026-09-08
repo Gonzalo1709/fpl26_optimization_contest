@@ -9,6 +9,85 @@ from src.scoring import ValidationStatus
 
 
 MAX_ROUTE_PRESERVE_NETS = 8
+# A complete unplace/place/route is only affordable for modest designs.  The
+# count is measured from Vivado's placed primitive cells, not inferred from one
+# critical cone.
+MAX_FULL_PLACE_ROUTE_PRIMITIVE_CELLS = 50_000
+FULL_PLACE_ROUTE_MIN_SECONDS = 1_200
+
+
+def estimate_reimplementation_seconds(signature: DesignSignature) -> float | None:
+    """Return a conservative, design-derived implementation budget estimate.
+
+    This is deliberately a gate, not a benchmark classifier.  The estimate is
+    only used when no measured implementation duration is available.
+    """
+    if signature.primitive_cell_count is None:
+        return None
+    estimate = 420.0 + (signature.primitive_cell_count * 0.018)
+    if signature.congestion and bool(signature.congestion.get("severe")):
+        estimate *= 1.45
+    if signature.timing_anatomy and bool(signature.timing_anatomy.get("route_dominated")):
+        estimate *= 1.15
+    return estimate
+
+
+def should_attempt_reimplementation(
+    signature: DesignSignature,
+    budget: "BudgetState",
+    measured_seconds: float | None = None,
+) -> bool:
+    """Gate a fresh implementation candidate on evidence and a safe reserve."""
+    estimate = measured_seconds if measured_seconds is not None else estimate_reimplementation_seconds(signature)
+    if estimate is None:
+        return False
+    placement_sensitive = bool(
+        (signature.timing_anatomy and signature.timing_anatomy.get("route_dominated"))
+        or (signature.path_spread and signature.path_spread.avg_distance >= 40)
+        or (signature.congestion and signature.congestion.get("severe"))
+    )
+    return (
+        placement_sensitive
+        and budget.remaining_runtime_seconds >= budget.validation_reserve_seconds + estimate
+    )
+
+
+def _action_key(strategy: str, args: dict | None) -> tuple[str, tuple[tuple[str, str], ...]]:
+    args = args or {}
+    return strategy, tuple(sorted((str(key), repr(value)) for key, value in args.items()))
+
+
+def apply_action_cooldowns(
+    actions: Iterable["EligibleAction"], history: Iterable[dict],
+) -> tuple["EligibleAction", ...]:
+    """Remove actions that were inert or failed in this lane's current state."""
+    cooldowns = set()
+    for item in history:
+        strategy = item.get("strategy")
+        if not strategy or strategy == "NO_OP":
+            continue
+        failed = item.get("error") is not None or item.get("wns") is None
+        delta = item.get("delta_wns")
+        inert = isinstance(delta, (int, float)) and not isinstance(delta, bool) and delta <= 0.0
+        if failed or inert:
+            cooldowns.add(_action_key(str(strategy), item.get("args")))
+
+    filtered = []
+    for action in actions:
+        if action.allowed_args.get("directive"):
+            directives = [
+                directive for directive in action.allowed_args["directive"]
+                if _action_key(action.strategy, {"directive": directive}) not in cooldowns
+            ]
+            if not directives:
+                continue
+            default = action.default_args
+            if default.get("directive") not in directives:
+                default = {**default, "directive": directives[0]}
+            filtered.append(EligibleAction(action.strategy, default, {**action.allowed_args, "directive": directives}, action.reason))
+        elif _action_key(action.strategy, action.default_args) not in cooldowns:
+            filtered.append(action)
+    return tuple(filtered)
 
 
 def validate_route_net_set(
@@ -180,16 +259,14 @@ def plan_phys_opt_portfolio(
         > 0.0
         for item in history
     )
-    if not prior_gain:
-        return tuple(attempts)
-
     reserve = budget.validation_reserve_seconds
     hold_pulse_not_failed = (
         validation.hold_passed is not False
         and validation.pulse_width_passed is not False
     )
     if (
-        hold_pulse_not_failed
+        prior_gain
+        and hold_pulse_not_failed
         and budget.remaining_runtime_seconds >= reserve + 300
     ):
         attempts.extend(
@@ -205,6 +282,11 @@ def plan_phys_opt_portfolio(
             ]
         )
 
+    # Explore remains worthwhile as one bounded default escalation when the
+    # run has enough time to preserve the validation reserve.  Unlike the
+    # intermediate specialist modes above, it must not depend on a previous
+    # improvement: a neutral incumbent is exactly when a broader search can
+    # still discover a different implementation solution.
     if (
         hold_pulse_not_failed
         and budget.remaining_runtime_seconds >= reserve + 600
@@ -218,7 +300,8 @@ def plan_phys_opt_portfolio(
         and validation.pulse_width_passed is True
     )
     if (
-        clean_hold_pulse
+        prior_gain
+        and clean_hold_pulse
         and budget.remaining_runtime_seconds >= reserve + 900
     ):
         attempts.append(
@@ -273,7 +356,28 @@ def gate_actions(
         for attempt in neutral_phys_opt_attempts
         if attempt.name not in existing_phys_opt_names
     )
-    actions = [
+    actions = []
+    full_place_route_attempted = any(
+        item.get("strategy") == "FULL_PLACE_ROUTE" for item in history
+    )
+    if (
+        signature.primitive_cell_count is not None
+        and signature.primitive_cell_count <= MAX_FULL_PLACE_ROUTE_PRIMITIVE_CELLS
+        and not full_place_route_attempted
+        and budget.remaining_runtime_seconds
+        >= budget.validation_reserve_seconds + FULL_PLACE_ROUTE_MIN_SECONDS
+    ):
+        actions.append(
+            EligibleAction(
+                strategy="FULL_PLACE_ROUTE",
+                reason=(
+                    "the complete design is small enough for one bounded "
+                    "Explore placement-and-route candidate before local repairs"
+                ),
+            )
+        )
+
+    actions.append(
         EligibleAction(
             strategy="PHYS_OPT",
             default_args={"directive": phys_opt_attempts[0].name},
@@ -282,7 +386,7 @@ def gate_actions(
             },
             reason="low-risk physical optimization remains the deterministic fallback",
         )
-    ]
+    )
 
     if budget.remaining_runtime_seconds >= budget.validation_reserve_seconds + 300:
         reroute_directives = [
@@ -379,8 +483,12 @@ def gate_actions(
             )
         )
 
+    topology = signature.hard_block_topology or {}
     hard_block_locality_evidence = bool(
-        spread is not None and spread.avg_distance >= 80
+        spread is not None
+        and spread.avg_distance >= 80
+        and int(topology.get("hard_block_paths", 0)) >= 1
+        and int(topology.get("boundary_transitions", 0)) >= 1
     )
     if (
         signature.critical_hard_block_types
@@ -416,4 +524,4 @@ def gate_actions(
             )
         )
 
-    return tuple(actions)
+    return apply_action_cooldowns(actions, history)

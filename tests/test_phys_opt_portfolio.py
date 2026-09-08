@@ -139,7 +139,7 @@ class PhysOptPortfolioPolicyTests(unittest.TestCase):
             ],
         )
 
-    def test_skips_escalation_without_gain_or_clean_hold_pulse(self):
+    def test_explore_remains_available_without_gain_when_time_allows(self):
         without_gain = plan_phys_opt_portfolio(
             BudgetState(remaining_runtime_seconds=1800.0),
             history=[{"strategy": "PHYS_OPT", "delta_vs_peak": 0.0}],
@@ -151,7 +151,10 @@ class PhysOptPortfolioPolicyTests(unittest.TestCase):
             validation=ValidationStatus(),
         )
 
-        self.assertEqual([attempt.name for attempt in without_gain], ["RuntimeOptimized"])
+        self.assertEqual(
+            [attempt.name for attempt in without_gain],
+            ["RuntimeOptimized", "Explore"],
+        )
         self.assertNotIn("AggressiveExplore", [attempt.name for attempt in unknown_signoff])
 
         failed_signoff = plan_phys_opt_portfolio(

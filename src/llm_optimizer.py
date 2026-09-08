@@ -20,10 +20,12 @@ from src.parsers import parse_spread_analysis, parse_timing_summary_static, spre
 from src.policy import (
     BudgetState,
     EligibleAction,
+    MAX_FULL_PLACE_ROUTE_PRIMITIVE_CELLS,
     gate_actions,
     plan_neutral_phys_opt_fallback,
     rank_fanout_candidates,
     select_route_preserve_nets,
+    should_attempt_reimplementation,
 )
 from src.prompting import DEFAULT_SYSTEM_PROMPT_PATH, build_planner_system_prompt, prompt_sha256
 from src.scoring import ContestScoreInput, ValidationStatus, calculate_contest_score
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "~openai/gpt-latest"
 SUPPORTED_SINGLE_METHODS = (
     "PBLOCK", "FANOUT", "CELL_RELOCATE", "PHYS_OPT", "HARD_BLOCK",
-    "PHYS_OPT_REROUTE", "PLACEMENT_SHOT",
+    "PHYS_OPT_REROUTE", "PLACEMENT_SHOT", "FULL_PLACE_ROUTE",
 )
 PLANNER_MAX_TOKENS = 320
 PLANNER_RETRY_MAX_TOKENS = 512
@@ -103,6 +105,12 @@ class DCPOptimizer(DCPOptimizerBase):
         self.end_time: Optional[float] = None
 
         self.history: list[dict] = []
+        # ``history`` is the run audit trail.  Planning uses a lineage-local
+        # view so an inert action on one root does not suppress a distinct lane.
+        self._planning_history: list[dict] | None = None
+        self.candidate_histories: dict[str, list[dict]] = {}
+        self._search_roots: list[tuple[Path, dict, str]] = []
+        self.measured_recipe_seconds: dict[str, float] = {}
         self.fanout_blacklist: dict[str, str] = {}
         self.validation_status = ValidationStatus()
         self.design_signature: Optional[DesignSignature] = None
@@ -276,6 +284,11 @@ class DCPOptimizer(DCPOptimizerBase):
                 ),
                 "congestion": signature.congestion,
                 "critical_hard_blocks": list(signature.critical_hard_block_types),
+                "timing_anatomy": signature.timing_anatomy,
+                "hard_block_topology": signature.hard_block_topology,
+            },
+            "implementation_size": {
+                "primitive_cells": signature.primitive_cell_count,
             },
             # Net names are not planner arguments: the controller selects and validates
             # them.  Keeping only evidence statistics prevents long hierarchical names
@@ -389,7 +402,7 @@ class DCPOptimizer(DCPOptimizerBase):
         return (
             "Choose one optimization action.\n"
             "Return one JSON object only.\n"
-            'Schema: {"strategy":"PBLOCK|FANOUT|CELL_RELOCATE|PHYS_OPT|PHYS_OPT_REROUTE|PLACEMENT_SHOT|HARD_BLOCK","args":{...}}\n'
+            'Schema: {"strategy":"FULL_PLACE_ROUTE|PBLOCK|FANOUT|CELL_RELOCATE|PHYS_OPT|PHYS_OPT_REROUTE|PLACEMENT_SHOT|HARD_BLOCK","args":{...}}\n'
             "Keep args minimal. No markdown or explanation.\n"
             f"{retry_line}"
             "Decision input:\n"
@@ -648,6 +661,39 @@ class DCPOptimizer(DCPOptimizerBase):
         except Exception as exc:
             logger.warning("Optional congestion analysis unavailable: %s", exc)
 
+        timing_anatomy_report = None
+        try:
+            timing_anatomy_report = await self.call_tool(
+                "vivado_run_tcl",
+                {
+                    "command": (
+                        "report_timing -from [get_clocks clk_fpl26contest] "
+                        "-max_paths 20 -nworst 1 -delay_type max -return_string"
+                    ),
+                    "timeout": 90,
+                },
+            )
+        except Exception as exc:
+            logger.warning("Optional timing-anatomy analysis unavailable: %s", exc)
+
+        primitive_cell_count = None
+        try:
+            primitive_report = await self.call_tool(
+                "vivado_run_tcl",
+                {
+                    "command": (
+                        "puts \"FPL26_PRIMITIVE_CELLS="
+                        "[llength [get_cells -quiet -hier -filter {IS_PRIMITIVE}]]\""
+                    ),
+                    "timeout": 60,
+                },
+            )
+            primitive_cell_count = self._last_tagged_int(
+                primitive_report, "FPL26_PRIMITIVE_CELLS"
+            )
+        except Exception as exc:
+            logger.warning("Optional primitive-cell count unavailable: %s", exc)
+
         self.design_signature = DesignSignature.from_reports(
             target_clock=self.target_clock or "clk_fpl26contest",
             clock_period_ns=self.clock_period,
@@ -659,6 +705,8 @@ class DCPOptimizer(DCPOptimizerBase):
             analysis_duration_seconds=time.time() - analysis_started,
             critical_paths_report=critical_paths_report,
             congestion_report=congestion_report,
+            primitive_cell_count=primitive_cell_count,
+            timing_anatomy_report=timing_anatomy_report,
         )
 
         summary = ["=== Initial Design Analysis ===\n", "TIMING STATUS:"]
@@ -677,6 +725,8 @@ class DCPOptimizer(DCPOptimizerBase):
             summary.append(f"  TNS: {self.initial_tns:.3f} ns")
         if self.initial_failing_endpoints is not None:
             summary.append(f"  Failing endpoints: {self.initial_failing_endpoints}")
+        if primitive_cell_count is not None:
+            summary.append(f"  Primitive cells: {primitive_cell_count}")
         summary.append("")
 
         if critical_path_spread_info:
@@ -896,6 +946,9 @@ class DCPOptimizer(DCPOptimizerBase):
                 directive = "ExtraNetDelay_low"
             return strategy, {"directive": directive}
 
+        if strategy == "FULL_PLACE_ROUTE":
+            return strategy, {}
+
         if strategy == "CRITICAL_PIN":
             return strategy, {}
 
@@ -965,7 +1018,7 @@ class DCPOptimizer(DCPOptimizerBase):
         actions = gate_actions(
             self.design_signature,
             budget=self._current_budget_state(),
-            history=self.history,
+            history=self._planning_history if self._planning_history is not None else self.history,
             validation=self.validation_status,
         )
         if self.fanout_blacklist:
@@ -1162,11 +1215,11 @@ class DCPOptimizer(DCPOptimizerBase):
         """Force recipe diversity for the first generation from the root candidate."""
         if self.generation_config.strategy_effort == "fast" or self.generation_config.branch_factor < 2:
             return None
-        if generation != 1 or parent.candidate_id != "root" or step != 1:
+        if generation != 1 or parent.parent_id is not None or step != 1:
             return None
 
         eligible = {action.strategy: action for action in self._eligible_actions()}
-        preferred_order = ("FANOUT", "PBLOCK", "CELL_RELOCATE", "HARD_BLOCK", "PHYS_OPT")
+        preferred_order = ("FULL_PLACE_ROUTE", "FANOUT", "PBLOCK", "CELL_RELOCATE", "HARD_BLOCK", "PHYS_OPT")
         forced_strategies = []
         for strategy in preferred_order:
             if strategy not in eligible:
@@ -1599,7 +1652,58 @@ class DCPOptimizer(DCPOptimizerBase):
         except Exception:
             await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
             raise
+    async def run_full_place_route_flow(self) -> str:
+        """Reimplement placement and routing once for a small complete design.
 
+        This intentionally leaves logical optimization untouched.  It is an early,
+        isolated alternative to local recipes, and only runs when policy evidence
+        identifies a small enough design with enough time left for a safe route.
+        """
+        baseline_checkpoint = Path(self.temp_dir) / "full_place_route_baseline.dcp"
+        await self.v("write_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "force": True})
+        baseline_report = await self.v("report_timing_summary")
+        baseline_metrics = await self._measure_current_metrics(baseline_report)
+        primitive_cells = (
+            self.design_signature.primitive_cell_count
+            if self.design_signature is not None
+            else None
+        )
+        if (
+            primitive_cells is None
+            or primitive_cells > MAX_FULL_PLACE_ROUTE_PRIMITIVE_CELLS
+        ):
+            logger.info(
+                "Skipping full place/route: primitive count %s exceeds safe limit %d",
+                primitive_cells,
+                MAX_FULL_PLACE_ROUTE_PRIMITIVE_CELLS,
+            )
+            return baseline_report
+        remaining = self._remaining_wall_clock_seconds()
+        reserve = self._current_budget_state().validation_reserve_seconds
+        if remaining is not None and remaining < reserve + 1200:
+            logger.info("Skipping full place/route: %.0fs remain, need %.0fs", remaining, reserve + 1200)
+            return baseline_report
+
+        try:
+            await self.v("run_tcl", {"command": "route_design -unroute -quiet; place_design -unplace -quiet"})
+            place_started = time.time()
+            await self.v("place_design", {"directive": "Explore", "timeout": 3600})
+            route_estimate = max(2.4 * (time.time() - place_started), 600.0)
+            remaining = self._remaining_wall_clock_seconds()
+            if remaining is not None and remaining < reserve + route_estimate:
+                logger.info("Full place/route skipped before route: %.0fs remain, need %.0fs", remaining, reserve + route_estimate)
+                await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+                return baseline_report
+            await self.v("run_tcl", {"command": "route_design -directive Explore -tns_cleanup -quiet", "timeout": 3600})
+            report = await self.v("report_timing_summary")
+            metrics = await self._measure_current_metrics(report)
+            if self._is_metrics_improvement(metrics, baseline_metrics):
+                return report
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+            return baseline_report
+        except Exception:
+            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+            raise
     async def run_critical_pin_flow(self) -> str:
         """Run only Vivado's target-timing critical pin-swapping optimization."""
         return await self.run_phys_opt_flow(directive="CriticalPin")
@@ -1821,6 +1925,8 @@ class DCPOptimizer(DCPOptimizerBase):
             result = await self.run_phys_opt_reroute_flow(**args)
         elif strategy == "PLACEMENT_SHOT":
             result = await self.run_placement_shot_flow(**args)
+        elif strategy == "FULL_PLACE_ROUTE":
+            result = await self.run_full_place_route_flow()
         else:
             result = await self.run_phys_opt_flow(**args)
 
@@ -1838,6 +1944,7 @@ class DCPOptimizer(DCPOptimizerBase):
         """Assemble the planner input for one recipe-selection decision."""
         eligible_actions = self._eligible_actions()
         schemas = {
+            "FULL_PLACE_ROUTE": {},
             "PBLOCK": {},
             "FANOUT": {"top_n_nets": "int (1-10)"},
             "CELL_RELOCATE": {
@@ -2340,22 +2447,33 @@ class DCPOptimizer(DCPOptimizerBase):
             "failing_endpoints": self.initial_failing_endpoints,
         }
         self._search_seed_metrics = baseline_metrics
-        baseline_checkpoint = await self._save_best_checkpoint(Path(self.temp_dir) / "reimplementation_baseline.dcp")
+        baseline_checkpoint = await self._save_best_checkpoint(Path(self.temp_dir) / "baseline_root.dcp")
+        self._search_roots = [(baseline_checkpoint, baseline_metrics, "Original routed incumbent")]
         await self._publish_current_candidate(baseline_metrics, allow_equal=True)
 
-        # A timing-clean input can still earn Fmax improvement, so it receives the
-        # same deterministic implementation attempt as a timing-failing input.
+        # A fresh global implementation is a separate, budgeted lane.  It is not
+        # automatically justified merely because the input has negative slack.
         try:
-            reimplementation_report = await self.run_reimplementation_flow(baseline_checkpoint)
-            seed_metrics = await self._measure_current_metrics(reimplementation_report)
-            if self._is_metrics_improvement(seed_metrics, baseline_metrics):
-                if await self._publish_current_candidate(seed_metrics):
-                    self._search_seed_metrics = seed_metrics
-                    print("[REIMPLEMENT] Accepted deterministic Explore seed candidate.")
-                else:
-                    await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
-            else:
+            should_reimplement = self.design_signature is not None and should_attempt_reimplementation(
+                self.design_signature,
+                self._current_budget_state(),
+                self.measured_recipe_seconds.get("REIMPLEMENTATION"),
+            )
+            if should_reimplement:
+                implementation_started = time.time()
+                reimplementation_report = await self.run_reimplementation_flow(baseline_checkpoint)
+                self.measured_recipe_seconds["REIMPLEMENTATION"] = time.time() - implementation_started
+                seed_metrics = await self._measure_current_metrics(reimplementation_report)
+                if self._is_metrics_improvement(seed_metrics, baseline_metrics):
+                    seed_checkpoint = Path(self.temp_dir) / "reimplementation_root.dcp"
+                    await self._save_best_checkpoint(seed_checkpoint)
+                    if await self._publish_current_candidate(seed_metrics):
+                        self._search_seed_metrics = seed_metrics
+                        self._search_roots.append((seed_checkpoint, seed_metrics, "RQS/Explore reimplementation"))
+                        print("[REIMPLEMENT] Accepted independent reimplementation root.")
                 await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
+            else:
+                print("[REIMPLEMENT] Skipped: timing anatomy or budget does not justify a global candidate.")
         except WallClockLimitReached:
             print("[REIMPLEMENT] Budget expired; continuing from the published baseline.")
             await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
@@ -2397,6 +2515,8 @@ class DCPOptimizer(DCPOptimizerBase):
             await self._publish_current_candidate(baseline_metrics, allow_equal=True)
 
             if method == "PBLOCK":
+                strategy_args = {}
+            elif method == "FULL_PLACE_ROUTE":
                 strategy_args = {}
             elif method == "FANOUT":
                 strategy_args = {"top_n_nets": top_n_nets}
@@ -2614,33 +2734,34 @@ class DCPOptimizer(DCPOptimizerBase):
         print("=== Starting Generation Search Optimization ===")
         print(json.dumps(asdict(cfg), indent=2))
 
-        root_path = search_dir / "root.dcp"
-        if not await self._save_vivado_checkpoint(root_path):
-            raise RuntimeError(f"Could not save root checkpoint: {root_path}")
+        if not self._search_roots:
+            root_path = search_dir / "baseline_root.dcp"
+            if not await self._save_vivado_checkpoint(root_path):
+                raise RuntimeError(f"Could not save root checkpoint: {root_path}")
+            self._search_roots = [(
+                root_path,
+                self._search_seed_metrics or {
+                    "wns": self.initial_wns, "tns": self.initial_tns,
+                    "failing_endpoints": self.initial_failing_endpoints,
+                },
+                "Original routed incumbent",
+            )]
 
-        seed_metrics = self._search_seed_metrics or {
-            "wns": self.initial_wns,
-            "tns": self.initial_tns,
-            "failing_endpoints": self.initial_failing_endpoints,
-        }
-        root = SearchCandidate(
-            candidate_id="root",
-            dcp_path=root_path,
-            wns=seed_metrics["wns"],
-            tns=seed_metrics["tns"],
-            failing_endpoints=seed_metrics["failing_endpoints"],
-            peak_wns=seed_metrics["wns"],
-            generation=0,
-            parent_id=None,
-            branch_index=0,
-            steps_taken=0,
-            steps_since_peak=0,
-            summary="Deterministic reimplementation seed",
-            **self._candidate_score_metadata(seed_metrics["wns"]),
-        )
-        self.search_candidates = [root]
-        self.best_candidate = root
-        active_candidates = [root]
+        self.search_candidates = []
+        self.candidate_histories = {}
+        for index, (path, metrics, summary) in enumerate(self._search_roots, start=1):
+            candidate = SearchCandidate(
+                candidate_id="baseline" if index == 1 else f"reimplementation_{index - 1}",
+                dcp_path=path, wns=metrics["wns"], tns=metrics["tns"],
+                failing_endpoints=metrics["failing_endpoints"], peak_wns=metrics["wns"],
+                generation=0, parent_id=None, branch_index=0, steps_taken=0,
+                steps_since_peak=0, summary=summary,
+                **self._candidate_score_metadata(metrics["wns"]),
+            )
+            self.search_candidates.append(candidate)
+            self.candidate_histories[candidate.candidate_id] = []
+        self.best_candidate = max(self.search_candidates, key=self._candidate_sort_key)
+        active_candidates = list(self.search_candidates)
         hit_wall_clock_limit = False
         fast_search_stopped = False
 
@@ -2712,7 +2833,7 @@ class DCPOptimizer(DCPOptimizerBase):
 
                         should_stop_fast = bool(
                             self.best_candidate
-                            and should_stop_fast_search(cfg, root, self.best_candidate)
+                            and should_stop_fast_search(cfg, self.search_candidates[0], self.best_candidate)
                         )
 
                         if cfg.stop_when_timing_met and candidate.wns is not None and candidate.wns >= 0:
@@ -2825,7 +2946,11 @@ class DCPOptimizer(DCPOptimizerBase):
         current_wns = parent.wns
         steps_since_peak = parent.steps_since_peak
         latest_candidate = parent
-        branch_history: list[dict] = []
+        # Carry only this candidate lineage into planning.  The global history
+        # remains an audit log and must not make one root's failed recipe poison
+        # the other independent root.
+        branch_history: list[dict] = list(self.candidate_histories.get(parent.candidate_id, []))
+        self._planning_history = branch_history
         used_action_signatures: set[str] = set()
 
         for step in range(1, cfg.max_steps_per_branch + 1):
@@ -2940,7 +3065,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 plan_neutral_phys_opt_fallback(
                     self.design_signature,
                     self._current_budget_state(),
-                    history=self.history,
+                    history=branch_history,
                     validation=self.validation_status,
                 )
                 if self.design_signature is not None
@@ -3090,6 +3215,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 **self._candidate_score_metadata(current_wns),
             )
             self.search_candidates.append(latest_candidate)
+            self.candidate_histories[latest_candidate.candidate_id] = list(branch_history)
 
             print(
                 f"[SEARCH] {latest_candidate.candidate_id}: current {self._format_wns(current_wns)}, "
