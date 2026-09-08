@@ -33,7 +33,7 @@ from src.search import GenerationSearchConfig, SearchCandidate, should_stop_fast
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "~openai/gpt-latest"
+DEFAULT_MODEL = "openai/gpt-5.6-terra"
 SUPPORTED_SINGLE_METHODS = (
     "PBLOCK", "FANOUT", "CELL_RELOCATE", "PHYS_OPT", "HARD_BLOCK",
     "PHYS_OPT_REROUTE", "PLACEMENT_SHOT", "FULL_PLACE_ROUTE",
