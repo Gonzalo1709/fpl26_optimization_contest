@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import re
-import shutil
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -15,6 +14,9 @@ from typing import Optional
 from openai import OpenAI
 
 from src.analysis import DesignSignature, require_target_clock_wns
+from src.controller import AdaptiveController
+from src.admission import tagged_number, route_admission, pulse_admission
+from src.recipes import NEW_STRATEGIES, execute_recipe, normalize_recipe
 from src.base import DCPOptimizerBase
 from src.parsers import parse_spread_analysis, parse_timing_summary_static, spread_recommends_pblock
 from src.policy import (
@@ -29,7 +31,7 @@ from src.policy import (
 )
 from src.prompting import DEFAULT_SYSTEM_PROMPT_PATH, build_planner_system_prompt, prompt_sha256
 from src.scoring import ContestScoreInput, ValidationStatus, calculate_contest_score
-from src.search import GenerationSearchConfig, SearchCandidate, should_stop_fast_search
+from src.search import GenerationSearchConfig, SearchCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ DEFAULT_MODEL = "openai/gpt-5.6-terra"
 SUPPORTED_SINGLE_METHODS = (
     "PBLOCK", "FANOUT", "CELL_RELOCATE", "PHYS_OPT", "HARD_BLOCK",
     "PHYS_OPT_REROUTE", "PLACEMENT_SHOT", "FULL_PLACE_ROUTE",
+    "CRITICAL_PIN", "ROUTE_PRESERVE", *NEW_STRATEGIES,
 )
 PLANNER_MAX_TOKENS = 320
 PLANNER_RETRY_MAX_TOKENS = 512
@@ -54,7 +57,7 @@ class WallClockLimitReached(RuntimeError):
     """Raised when the optimizer reaches its configured wall-clock budget."""
 
 
-class DCPOptimizer(DCPOptimizerBase):
+class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
     """FPGA Design Optimization Agent using recipe selection plus generation search."""
 
     def __init__(
@@ -84,6 +87,7 @@ class DCPOptimizer(DCPOptimizerBase):
         self.openai = OpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
+            max_retries=0,
         )
 
         self.iteration = 0
@@ -95,6 +99,7 @@ class DCPOptimizer(DCPOptimizerBase):
         self.total_completion_tokens = 0
         self.total_tokens = 0
         self.total_cost = 0.0
+        self._llm_cost_unknown = False
         self.api_call_details: list[dict] = []
         self.tool_call_details: list[dict] = []
 
@@ -122,6 +127,8 @@ class DCPOptimizer(DCPOptimizerBase):
         self._initial_port_count: Optional[int] = None
         self._search_seed_metrics: Optional[dict] = None
         self.critical_paths_report: Optional[str] = None
+        self._tool_session_poisoned = False
+        self._init_controller()
 
     def _extract_llm_text(self, response) -> str:
         """Best-effort extraction of text content from a chat completion response."""
@@ -208,6 +215,9 @@ class DCPOptimizer(DCPOptimizerBase):
 
     def _raise_if_tool_reported_error(self, tool_name: str, result_text: str) -> None:
         """Raise when a tool encodes failure in its textual payload."""
+        error = re.search(r"(?im)^\s*(?:error\b|invalid command name|traceback \(most recent call last\))[^\n]*", result_text)
+        if error:
+            raise ToolExecutionError(f"{tool_name} failed: {error.group(0).strip()}")
         try:
             payload = json.loads(result_text)
         except json.JSONDecodeError:
@@ -227,10 +237,12 @@ class DCPOptimizer(DCPOptimizerBase):
         """Return remaining runtime budget in seconds, or None if unbounded."""
         if self.start_time is None:
             return None
-        limit = self.generation_config.wall_clock_limit_seconds
-        if limit <= 0:
+        limits = [self.generation_config.wall_clock_limit_seconds] if self.generation_config.wall_clock_limit_seconds > 0 else []
+        if self.generation_config.max_runtime_minutes is not None:
+            limits.append(self.generation_config.max_runtime_minutes * 60)
+        if not limits:
             return None
-        return limit - (time.time() - self.start_time)
+        return min(limits) - (time.time() - self.start_time)
 
     def _wall_clock_message(self, context: str = "") -> str:
         """Build a consistent wall-clock exhaustion message."""
@@ -267,7 +279,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 "name": signature.target_clock,
                 "period_ns": self._rounded(signature.clock_period_ns),
             },
-            "initial_timing": {
+            "timing": {
                 "wns_ns": self._rounded(signature.wns_ns),
                 "tns_ns": self._rounded(signature.tns_ns),
                 "failing_endpoints": signature.failing_endpoints,
@@ -402,7 +414,7 @@ class DCPOptimizer(DCPOptimizerBase):
         return (
             "Choose one optimization action.\n"
             "Return one JSON object only.\n"
-            'Schema: {"strategy":"FULL_PLACE_ROUTE|PBLOCK|FANOUT|CELL_RELOCATE|PHYS_OPT|PHYS_OPT_REROUTE|PLACEMENT_SHOT|HARD_BLOCK","args":{...}}\n'
+            'Schema: {"strategy":"one key from available_strategies","args":{...}}\n'
             "Keep args minimal. No markdown or explanation.\n"
             f"{retry_line}"
             "Decision input:\n"
@@ -422,6 +434,8 @@ class DCPOptimizer(DCPOptimizerBase):
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Execute a tool call on the appropriate MCP server."""
+        if self._tool_session_poisoned:
+            raise WallClockLimitReached("Tool session timed out; no further commands may use its uncertain state")
         if tool_name.startswith("rapidwright_"):
             session = self.rapidwright_session
             actual_name = tool_name[len("rapidwright_"):]
@@ -436,15 +450,16 @@ class DCPOptimizer(DCPOptimizerBase):
 
         try:
             logger.info("Calling %s with args: %s...", tool_name, json.dumps(arguments)[:200])
-            if tool_name != "vivado_write_checkpoint":
-                self._raise_if_wall_clock_expired(f"before {tool_name}")
+            self._raise_if_wall_clock_expired(f"before {tool_name}")
 
             remaining = self._remaining_wall_clock_seconds()
-            if remaining is not None and tool_name != "vivado_write_checkpoint":
+            if remaining is not None:
                 result = await asyncio.wait_for(session.call_tool(actual_name, arguments), timeout=max(0.1, remaining))
             else:
                 result = await session.call_tool(actual_name, arguments)
 
+            if getattr(result, "isError", False):
+                raise ToolExecutionError(f"{tool_name}: MCP reported an error")
             if result.content:
                 text_parts = [chunk.text for chunk in result.content if hasattr(chunk, "text")]
                 result_text = "\n".join(text_parts)
@@ -488,6 +503,8 @@ class DCPOptimizer(DCPOptimizerBase):
             )
             return result_text
         except ToolExecutionError as exc:
+            if "timed out" in str(exc).lower() or "timeout" in str(exc).lower():
+                self._tool_session_poisoned = True
             elapsed_time = time.time() - start_time
             self.tool_call_details.append(
                 {
@@ -502,6 +519,7 @@ class DCPOptimizer(DCPOptimizerBase):
             logger.error("Tool call failed: %s", exc)
             raise
         except asyncio.TimeoutError as exc:
+            self._tool_session_poisoned = True
             elapsed_time = time.time() - start_time
             message = self._wall_clock_message(f"during {tool_name}")
             self.tool_call_details.append(
@@ -532,25 +550,9 @@ class DCPOptimizer(DCPOptimizerBase):
             raise ToolExecutionError(f"{tool_name} failed: {exc}") from exc
 
     def _update_best_wns(self, current_wns: float, source: str = "timing_summary"):
-        current_fmax = self.calculate_fmax(current_wns, self.clock_period)
-        fmax_str = f", fmax: {current_fmax:.2f} MHz" if current_fmax is not None else ""
-        if current_wns > self.best_wns:
-            logger.info(
-                "New best WNS (%s): %.3f ns%s (improved from %.3f ns)",
-                source,
-                current_wns,
-                fmax_str,
-                self.best_wns,
-            )
-            self.best_wns = current_wns
-        else:
-            logger.info(
-                "Current WNS (%s): %.3f ns%s (best is still %.3f ns)",
-                source,
-                current_wns,
-                fmax_str,
-                self.best_wns,
-            )
+        # Timing observations are speculative until checkpoint admission.
+        self.last_measured_wns = current_wns
+        logger.info("Observed WNS (%s): %.4f ns", source, current_wns)
 
     async def _call_vivado_tool(self, tool_name: str, arguments: dict) -> str:
         """Helper to call Vivado tools for base-class methods."""
@@ -667,7 +669,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 "vivado_run_tcl",
                 {
                     "command": (
-                        "report_timing -from [get_clocks clk_fpl26contest] "
+                        "report_timing -to [get_clocks clk_fpl26contest] "
                         "-max_paths 20 -nworst 1 -delay_type max -return_string"
                     ),
                     "timeout": 90,
@@ -766,33 +768,56 @@ class DCPOptimizer(DCPOptimizerBase):
         last_finish_reason = None
 
         for attempt_index, max_tokens in enumerate(attempt_max_tokens, start=1):
-            response = self.openai.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.planner_system_prompt},
-                    {"role": "user", "content": self._planner_user_message(decision_input, retry=attempt_index > 1)},
-                ],
-                max_tokens=max_tokens,
-                temperature=0,
-                extra_body={"usage": {"include": True}},
-            )
-
+            budget = self._current_budget_state()
+            if (self._llm_cost_unknown or self.llm_call_count >= self.generation_config.max_llm_calls
+                    or budget.remaining_cost_usd <= 0
+                    or budget.remaining_runtime_seconds <= budget.validation_reserve_seconds):
+                fallback = self._eligible_actions()[0]
+                return {"strategy": fallback.strategy, "args": fallback.default_args}
+            timeout = min(60.0, budget.remaining_runtime_seconds - budget.validation_reserve_seconds)
             self.llm_call_count += 1
+            try:
+                response = await asyncio.wait_for(asyncio.to_thread(self.openai.chat.completions.create,
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self.planner_system_prompt},
+                        {"role": "user", "content": self._planner_user_message(decision_input, retry=attempt_index > 1)},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=0,
+                    extra_body={"usage": {"include": True}},
+                    timeout=timeout,
+                ), timeout=timeout)
+            except Exception as exc:
+                # A timed-out request may still incur provider cost. Do not call
+                # it free or launch another request with an unknown spend total.
+                self._llm_cost_unknown = True
+                self.api_call_details.append({"call_number": self.llm_call_count, "error": str(exc), "cost": None})
+                fallback = self._eligible_actions()[0]
+                return {"strategy": fallback.strategy, "args": fallback.default_args}
 
             usage = getattr(response, "usage", None)
             if usage:
-                prompt_tokens = getattr(usage, "prompt_tokens", 0)
-                completion_tokens = getattr(usage, "completion_tokens", 0)
-                total_tokens = getattr(usage, "total_tokens", 0)
+                prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                total_tokens = getattr(usage, "total_tokens", 0) or 0
                 self.total_prompt_tokens += prompt_tokens
                 self.total_completion_tokens += completion_tokens
                 self.total_tokens += total_tokens
 
                 call_cost = 0.0
                 if hasattr(usage, "cost") and usage.cost is not None:
-                    call_cost = float(usage.cost)
-                    self.total_cost += call_cost
+                    try:
+                        call_cost = float(usage.cost)
+                    except (ValueError, TypeError):
+                        call_cost = math.nan
+                    if math.isfinite(call_cost) and call_cost >= 0:
+                        self.total_cost += call_cost
+                    else:
+                        self._llm_cost_unknown = True
+                        call_cost = 0.0
                 else:
+                    self._llm_cost_unknown = True
                     logger.warning("OpenRouter did not provide cost information")
 
                 cached_tokens = 0
@@ -810,7 +835,7 @@ class DCPOptimizer(DCPOptimizerBase):
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,
-                        "cost": call_cost,
+                        "cost": None if self._llm_cost_unknown else call_cost,
                         "cached_tokens": cached_tokens,
                         "reasoning_tokens": reasoning_tokens,
                     }
@@ -824,6 +849,8 @@ class DCPOptimizer(DCPOptimizerBase):
                     f"[API Call #{self.llm_call_count}] Tokens: {total_tokens:,} "
                     f"(Prompt: {prompt_tokens:,}, Completion: {completion_tokens:,}{cache_info}{reasoning_info}{retry_info}){cost_info}"
                 )
+            else:
+                self._llm_cost_unknown = True
 
             content = self._extract_llm_text(response)
             finish_reason = self._get_finish_reason(response)
@@ -873,13 +900,21 @@ class DCPOptimizer(DCPOptimizerBase):
 
     def _sanitize_action_shape(self, action: dict) -> tuple[str, dict]:
         """Normalize the shape and bounded arguments of one proposed action."""
+        if not isinstance(action, dict):
+            action = {}
         strategy = action.get("strategy", "PHYS_OPT")
         args = action.get("args", {})
         if not isinstance(args, dict):
             args = {}
 
+        if strategy in NEW_STRATEGIES:
+            return strategy, normalize_recipe(strategy, args)
+
         if strategy == "FANOUT":
-            top_n = int(args.get("top_n_nets", 5))
+            try:
+                top_n = int(args.get("top_n_nets", 5))
+            except (ValueError, TypeError, OverflowError):
+                top_n = 5
             top_n = max(1, min(10, top_n))
             return strategy, {"top_n_nets": top_n}
 
@@ -1002,17 +1037,18 @@ class DCPOptimizer(DCPOptimizerBase):
         return BudgetState(
             remaining_runtime_seconds=remaining_runtime,
             remaining_cost_usd=remaining_cost,
+            validation_reserve_seconds=self.generation_config.validation_reserve_seconds,
         )
 
     def _eligible_actions(self) -> tuple[EligibleAction, ...]:
         """Return the single authoritative allow-list for the current state."""
+        if self._llm_cost_unknown:
+            return (EligibleAction("NO_OP", reason="provider cost is unverified; retain the admitted artifact"),)
         if self.design_signature is None:
             return (
                 EligibleAction(
-                    strategy="PHYS_OPT",
-                    default_args={"directive": "RuntimeOptimized"},
-                    allowed_args={"directive": ["RuntimeOptimized"]},
-                    reason="design signature is unavailable; use the conservative fallback",
+                    strategy="NO_OP",
+                    reason="this checkpoint has no current design evidence",
                 ),
             )
         actions = gate_actions(
@@ -1020,7 +1056,21 @@ class DCPOptimizer(DCPOptimizerBase):
             budget=self._current_budget_state(),
             history=self._planning_history if self._planning_history is not None else self.history,
             validation=self.validation_status,
+            enable_retiming=self.generation_config.enable_retiming,
+            equivalence_ready=bool(self.generation_config.equivalence_command and self._retiming_directives),
         )
+        if self._retiming_directives:
+            from dataclasses import replace
+            supported = []
+            for action in actions:
+                if action.strategy != "RETIME":
+                    supported.append(action)
+                    continue
+                directives = [d for d in action.allowed_args["directive"] if d in self._retiming_directives]
+                if directives:
+                    supported.append(replace(action, default_args={"directive": directives[0]},
+                                             allowed_args={"directive": directives}))
+            actions = tuple(supported)
         if self.fanout_blacklist:
             available_fanout_names = {
                 candidate.net_name
@@ -1028,8 +1078,8 @@ class DCPOptimizer(DCPOptimizerBase):
                 if candidate.net_name not in self.fanout_blacklist
             }
             if not available_fanout_names:
-                actions = tuple(action for action in actions if action.strategy != "FANOUT")
-        return actions
+                actions = tuple(action for action in actions if action.strategy not in {"FANOUT", "TARGETED_REPLICATION"})
+        return self._adaptive_actions(actions)
 
     def sanitize_action(self, action: dict) -> tuple[str, dict]:
         """Normalize a proposed action and enforce deterministic eligibility gates."""
@@ -1051,10 +1101,17 @@ class DCPOptimizer(DCPOptimizerBase):
             allowed_types = set(eligible[strategy].default_args.get("hard_block_types", []))
             requested_types = [item for item in args["hard_block_types"] if item in allowed_types]
             args["hard_block_types"] = requested_types or sorted(allowed_types)
-        elif strategy in {"PHYS_OPT", "PHYS_OPT_REROUTE", "PLACEMENT_SHOT"}:
+        elif strategy in {"PHYS_OPT", "PHYS_OPT_REROUTE", "PLACEMENT_SHOT", "RETIME"}:
             allowed_directives = eligible[strategy].allowed_args.get("directive", [])
             if args["directive"] not in allowed_directives:
                 args = dict(eligible[strategy].default_args)
+        elif strategy == "GRANULAR_PHYS_OPT":
+            if args["flag"] not in eligible[strategy].allowed_args.get("flag", []):
+                args = dict(eligible[strategy].default_args)
+        elif strategy in NEW_STRATEGIES:
+            # Operand counts are controller-costed defaults; the LLM must not
+            # expand a bounded action beyond the forecast used to admit it.
+            args = dict(eligible[strategy].default_args)
         return strategy, args
 
     def _canonicalize_action_args(self, strategy: str, args: dict) -> dict:
@@ -1198,11 +1255,18 @@ class DCPOptimizer(DCPOptimizerBase):
         # Keep all improvement comparisons aligned to the same WNS source used by
         # branch scoring/logging: prefer the target clock's WNS when available.
         target_wns = await super().get_wns_for_target_clock(self._call_vivado_tool)
-        if target_wns is not None:
-            metrics["wns"] = target_wns
-
-        if metrics["wns"] is not None and metrics["wns"] > self.best_wns:
-            self.best_wns = metrics["wns"]
+        metrics["wns"] = require_target_clock_wns(target_wns)
+        population = await self.v("run_tcl", {"command": (
+            "set paths [get_timing_paths -to [get_clocks clk_fpl26contest] "
+            "-slack_lesser_than 0 -max_paths 2001 -nworst 1]; "
+            "set tns 0.0; foreach p $paths {set tns [expr {$tns + [get_property SLACK $p]}]}; "
+            'puts "FPL26_TARGET_ENDPOINTS=[llength $paths]"; puts "FPL26_TARGET_TNS=$tns"'
+        ), "timeout": 60})
+        count = self._last_tagged_int(population, "FPL26_TARGET_ENDPOINTS")
+        # The bounded query is enough to establish scoped-recipe eligibility.
+        # At the cap, do not mislabel a partial sum/count as the full population.
+        metrics["failing_endpoints"] = count if count is not None and count < 2001 else None
+        metrics["tns"] = tagged_number(population, "FPL26_TARGET_TNS") if metrics["failing_endpoints"] is not None else None
         return metrics
 
     def _forced_branch_strategy(
@@ -1907,7 +1971,11 @@ class DCPOptimizer(DCPOptimizerBase):
 
     async def _execute_strategy(self, strategy: str, args: dict) -> tuple[str, Optional[float]]:
         """Run a chosen recipe and return the timing report plus measured WNS."""
-        if strategy == "NO_OP":
+        if strategy == "REIMPLEMENTATION":
+            result = await self.run_reimplementation_flow(self._baseline_candidate.dcp_path)
+        elif strategy in NEW_STRATEGIES:
+            result = await execute_recipe(self, strategy, args)
+        elif strategy == "NO_OP":
             result = await self.v("report_timing_summary")
         elif strategy == "PBLOCK":
             result = await self.run_pblock_flow()
@@ -1966,7 +2034,7 @@ class DCPOptimizer(DCPOptimizerBase):
         }
         available_strategies = {}
         for action in eligible_actions:
-            schema = dict(schemas[action.strategy])
+            schema = dict(schemas.get(action.strategy, action.allowed_args or action.default_args))
             if action.strategy == "HARD_BLOCK":
                 schema["hard_block_types"] = action.default_args["hard_block_types"]
             elif action.strategy == "PHYS_OPT":
@@ -1977,7 +2045,7 @@ class DCPOptimizer(DCPOptimizerBase):
         budget = self._current_budget_state()
         payload = {
             "context_version": 2,
-            "evidence_epoch": "initial",  # Dynamic timing appears below; physical analysis is initial-state evidence.
+            "evidence_epoch": self._state_candidate.candidate_id if self._state_candidate else "initial",
             "evidence": self._planner_evidence(),
             "current_state": {
                 "best_wns_ns": self._rounded(self.best_wns) if math.isfinite(self.best_wns) else None,
@@ -2018,18 +2086,10 @@ class DCPOptimizer(DCPOptimizerBase):
         return new_wns > old_wns + self.generation_config.min_wns_delta
 
     async def _measure_current_wns(self, timing_report: Optional[str] = None) -> Optional[float]:
-        """Measure current Vivado WNS and update the global best scalar."""
-        wns = await super().get_wns_for_target_clock(self._call_vivado_tool)
-        if wns is None:
-            report = timing_report
-            if report is None:
-                report = await self.v("report_timing_summary")
-            timing_info = parse_timing_summary_static(report)
-            wns = timing_info["wns"]
-
-        if wns is not None and wns > self.best_wns:
-            self.best_wns = wns
-        return wns
+        """Only the scored clock can supply a candidate's WNS."""
+        return require_target_clock_wns(
+            await super().get_wns_for_target_clock(self._call_vivado_tool)
+        )
 
     @staticmethod
     def _last_tagged_int(text: str, tag: str) -> Optional[int]:
@@ -2045,118 +2105,34 @@ class DCPOptimizer(DCPOptimizerBase):
         return self._last_tagged_int(result, "FPL26_PORT_COUNT")
 
     async def _validate_current_publishable_design(self) -> ValidationStatus:
-        """Run the inexpensive implementation gates required before publishing a DCP.
-
-        Structural equivalence and simulation remain the final validator's job.  These
-        checks deliberately cover the cheap failure modes that otherwise let a high-WNS
-        but unrouted or hold-broken checkpoint replace the incumbent during the run.
-        """
-        port_count = await self._current_port_count()
-        if self._initial_port_count is None:
-            self._initial_port_count = port_count
-        ports_ok = (
-            self._initial_port_count is not None
-            and port_count is not None
-            and port_count == self._initial_port_count
-        )
-
-        route_status = await self.v("report_route_status", {})
-        failed = self._last_tagged_int(route_status, "Number of Failed Nets")
-        unrouted = self._last_tagged_int(route_status, "Number of Unrouted Nets")
-        partial = self._last_tagged_int(route_status, "Number of Partially Routed Nets")
-        routed = self._last_tagged_int(route_status, "Number of Fully Routed Nets")
-        routable = self._last_tagged_int(route_status, "Number of Routable Nets")
-        if failed is None:
-            match = re.search(r"nets with routing errors[^0-9]+(\d+)", route_status, re.IGNORECASE)
-            failed = int(match.group(1)) if match else None
-        if routed is None:
-            match = re.search(r"of fully routed nets[^0-9]+(\d+)", route_status, re.IGNORECASE)
-            routed = int(match.group(1)) if match else None
-        if routable is None:
-            match = re.search(r"of routable nets[^0-9]+(\d+)", route_status, re.IGNORECASE)
-            routable = int(match.group(1)) if match else None
-        route_ok = (
-            failed == 0
-            and (unrouted in (None, 0))
-            and (partial in (None, 0))
-            and (routed is None or routable is None or (routed == routable and routed > 0))
-        )
-
-        hold_result = await self.v(
-            "run_tcl",
-            {
-                "command": (
-                    "set p [lindex [get_timing_paths -quiet -max_paths 1 -nworst 1 -hold] 0]; "
-                    "if {$p eq \"\"} { puts {FPL26_HOLD_WNS=999.0} } "
-                    "else { puts \"FPL26_HOLD_WNS=[get_property SLACK $p]\" }"
-                )
-            },
-        )
-        hold_match = re.findall(r"FPL26_HOLD_WNS\s*=\s*(-?\d+(?:\.\d+)?)", hold_result)
-        hold_ok = bool(hold_match) and float(hold_match[-1]) >= 0.0
-
-        pulse_result = await self.v(
-            "run_tcl",
-            {"command": "report_pulse_width -quiet -return_string -all_violators"},
-        )
-        pulse_ok = not bool(re.search(r"(?:VIOLATED|pulse width[^\n]*-\d)", pulse_result, re.IGNORECASE))
-
-        drc_result = await self.v(
-            "run_tcl",
-            {"command": "report_drc -quiet -return_string -ruledeck default"},
-        )
-        drc_ok = not bool(
-            re.search(r"^\s*[1-9]\d*\s+(?:Critical Warning|Error)\b", drc_result, re.IGNORECASE | re.MULTILINE)
-        )
-
+        """Require measured routing, hold, pulse-width and DRC evidence."""
+        route_report = await self.v("report_route_status", {})
+        hold_report = await self.v("run_tcl", {"command": (
+            'set p [lindex [get_timing_paths -max_paths 1 -nworst 1 -hold] 0]; '
+            'if {$p eq ""} {puts {FPL26_HOLD_WNS=UNAVAILABLE}} '
+            'else {puts "FPL26_HOLD_WNS=[get_property SLACK $p]"}'
+        )})
+        hold = tagged_number(hold_report, "FPL26_HOLD_WNS")
+        pulse_report = await self.v("run_tcl", {"command": "report_timing_summary -delay_type min_max -return_string"})
+        drc_report = await self.v("run_tcl", {"command": (
+            'report_drc -ruledeck default; '
+            'puts "FPL26_DRC_ERRORS=[llength [get_drc_violations -filter {SEVERITY == Error || SEVERITY == {Critical Warning}}]]"'
+        )})
+        drc = tagged_number(drc_report, "FPL26_DRC_ERRORS")
         status = ValidationStatus(
-            par_routed=route_ok and ports_ok,
-            par_drc_clean=drc_ok,
-            hold_passed=hold_ok,
-            pulse_width_passed=pulse_ok,
+            par_routed=route_admission(route_report),
+            par_drc_clean=(drc == 0) if drc is not None else None,
+            hold_passed=(hold >= 0) if hold is not None else None,
+            pulse_width_passed=pulse_admission(pulse_report),
         )
-        self.validation_status = status
+        # The caller attaches this status to the measured candidate. Never change
+        # the published incumbent's validation from an unrelated tool observation.
         return status
 
     async def _publish_current_candidate(self, metrics: dict, *, allow_equal: bool = False) -> bool:
-        """Atomically make the current legal Vivado design the deadline-safe incumbent."""
-        if self.output_dcp is None:
-            return False
-
-        wns = metrics.get("wns")
-        if wns is None:
-            logger.warning("Not publishing candidate with unknown target-clock WNS")
-            return False
-        if not allow_equal and wns <= self._published_wns + self.generation_config.min_wns_delta:
-            return False
-
-        status = await self._validate_current_publishable_design()
-        if not all(
-            value is True
-            for value in (
-                status.par_routed,
-                status.par_drc_clean,
-                status.hold_passed,
-                status.pulse_width_passed,
-            )
-        ):
-            logger.warning("Rejected candidate for publish: %s", status)
-            return False
-
-        output = self.output_dcp.resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output.with_name(f".{output.name}.wip")
-        await self.v(
-            "write_checkpoint",
-            {"dcp_path": str(temporary), "force": True, "timeout": 900},
-        )
-        if not temporary.exists():
-            logger.warning("Vivado reported a checkpoint write but %s is absent", temporary)
-            return False
-        temporary.replace(output)
-        self._published_wns = wns
-        print(f"[PUBLISH] {self._display_name(output)} WNS {wns:.3f} ns")
-        return True
+        """Compatibility entry point: supplied numbers cannot bypass admission."""
+        candidate = await self._snapshot_candidate("candidate", self._state_candidate)
+        return self._publish_admitted(candidate)
 
     async def run_reimplementation_flow(self, baseline_checkpoint: Path) -> str:
         """Run Slot-A-style RQS-guided implementation from a routed checkpoint.
@@ -2286,27 +2262,6 @@ class DCPOptimizer(DCPOptimizerBase):
             return False
         return dcp_path.exists()
 
-    async def _restore_candidate_state(self, candidate: SearchCandidate) -> None:
-        """Restore a candidate checkpoint into Vivado and RapidWright."""
-        print(f"\n[SEARCH] Restoring candidate {candidate.candidate_id} (WNS: {self._format_wns(candidate.wns)})")
-        result = await self.v(
-            "open_checkpoint",
-            {
-                "dcp_path": str(candidate.dcp_path.resolve()),
-                "timeout": 900,
-            },
-        )
-        if "error" in result.lower():
-            raise RuntimeError(f"Could not restore Vivado checkpoint {candidate.dcp_path}: {result}")
-
-        result = await self.rw("read_checkpoint", {"dcp_path": str(candidate.dcp_path.resolve())})
-        if "error" in result.lower() and "success" not in result.lower():
-            logger.warning(
-                "RapidWright could not load restored candidate %s. Vivado-only branches can still continue. Result: %s",
-                candidate.candidate_id,
-                result[:500],
-            )
-
     def _format_wns(self, wns: Optional[float]) -> str:
         """Format WNS for logs."""
         return f"{wns:.3f} ns" if wns is not None else "unknown"
@@ -2348,38 +2303,24 @@ class DCPOptimizer(DCPOptimizerBase):
 
     @staticmethod
     def _candidate_validation_rank(candidate: SearchCandidate) -> int:
-        """Order passed, speculative, and failed candidates conservatively."""
-        if candidate.validation.passed:
-            return 2
-        if candidate.validation.complete:
+        if candidate.validation.failed:
             return 0
+        if candidate.validation.passed:
+            return 3
+        if candidate.validation.implementation_passed:
+            return 2
         return 1
 
-    def _candidate_sort_key(
-        self, candidate: SearchCandidate
-    ) -> tuple[int, float, tuple[float, float, float], float, float, float]:
-        """Rank candidates by validation and contest score, then timing and cost."""
-        current = self._metrics_sort_key(
-            {
-                "wns": candidate.wns,
-                "tns": candidate.tns,
-                "failing_endpoints": candidate.failing_endpoints,
-            }
-        )
-        peak = candidate.peak_wns if candidate.peak_wns is not None else float("-inf")
-        effective_score = (
-            candidate.validated_score
-            if candidate.validated_score is not None
-            else candidate.projected_score
-        )
-        return (
-            self._candidate_validation_rank(candidate),
-            effective_score,
-            current,
-            peak,
-            -candidate.elapsed_seconds,
-            -candidate.llm_cost_usd,
-        )
+    def _candidate_sort_key(self, candidate: SearchCandidate) -> tuple:
+        """At a common run cost, equally valid artifacts rank by achievable Fmax.
+
+        All candidates share the same clock period and sunk run cost. Stored
+        historical projected scores are diagnostics, never a promotion gate.
+        """
+        metrics = self._metrics_sort_key({"wns": candidate.wns, "tns": candidate.tns,
+                                         "failing_endpoints": candidate.failing_endpoints})
+        return (self._candidate_validation_rank(candidate), metrics,
+                candidate.peak_wns if candidate.peak_wns is not None else float("-inf"))
 
     def _is_candidate_improvement(
         self,
@@ -2391,7 +2332,12 @@ class DCPOptimizer(DCPOptimizerBase):
 
     def _budget_stop_reason(self) -> Optional[str]:
         """Return a human-readable stop reason when configured budgets are exhausted."""
+        if self._llm_cost_unknown:
+            return "provider cost is unverified"
         cfg = self.generation_config
+        budget = self._current_budget_state()
+        if budget.remaining_runtime_seconds <= budget.validation_reserve_seconds:
+            return "validation and publication reserve reached"
         if cfg.max_runtime_minutes is not None and self.start_time is not None:
             elapsed_minutes = (time.time() - self.start_time) / 60.0
             if elapsed_minutes >= cfg.max_runtime_minutes:
@@ -2406,6 +2352,7 @@ class DCPOptimizer(DCPOptimizerBase):
         """Print and return True when no new expensive search step should start."""
         reason = self._budget_stop_reason()
         if reason:
+            self._stop_reason = reason
             print(f"{prefix} {reason}; stopping before starting another search step.")
             return True
         return False
@@ -2426,825 +2373,6 @@ class DCPOptimizer(DCPOptimizerBase):
         if delta_wns is None or elapsed_minutes <= 0:
             return f"elapsed {elapsed_minutes:.2f} min, WNS ROI unknown"
         return f"elapsed {elapsed_minutes:.2f} min, WNS ROI {delta_wns / max(elapsed_minutes, 1e-9):.4f} ns/min"
-
-    async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
-        """Run the optimization workflow."""
-        self.start_time = time.time()
-        self.output_dcp = output_dcp.resolve()
-        self._published_wns = float("-inf")
-
-        try:
-            initial_analysis = await self.perform_initial_analysis(input_dcp)
-        except Exception as exc:
-            logger.exception("Initial analysis failed: %s", exc)
-            print(f"\n✗ Initial analysis failed: {exc}\n")
-            self.end_time = time.time()
-            return False
-
-        baseline_metrics = {
-            "wns": self.initial_wns,
-            "tns": self.initial_tns,
-            "failing_endpoints": self.initial_failing_endpoints,
-        }
-        self._search_seed_metrics = baseline_metrics
-        baseline_checkpoint = await self._save_best_checkpoint(Path(self.temp_dir) / "baseline_root.dcp")
-        self._search_roots = [(baseline_checkpoint, baseline_metrics, "Original routed incumbent")]
-        await self._publish_current_candidate(baseline_metrics, allow_equal=True)
-
-        # A fresh global implementation is a separate, budgeted lane.  It is not
-        # automatically justified merely because the input has negative slack.
-        try:
-            should_reimplement = self.design_signature is not None and should_attempt_reimplementation(
-                self.design_signature,
-                self._current_budget_state(),
-                self.measured_recipe_seconds.get("REIMPLEMENTATION"),
-            )
-            if should_reimplement:
-                implementation_started = time.time()
-                reimplementation_report = await self.run_reimplementation_flow(baseline_checkpoint)
-                self.measured_recipe_seconds["REIMPLEMENTATION"] = time.time() - implementation_started
-                seed_metrics = await self._measure_current_metrics(reimplementation_report)
-                if self._is_metrics_improvement(seed_metrics, baseline_metrics):
-                    seed_checkpoint = Path(self.temp_dir) / "reimplementation_root.dcp"
-                    await self._save_best_checkpoint(seed_checkpoint)
-                    if await self._publish_current_candidate(seed_metrics):
-                        self._search_seed_metrics = seed_metrics
-                        self._search_roots.append((seed_checkpoint, seed_metrics, "RQS/Explore reimplementation"))
-                        print("[REIMPLEMENT] Accepted independent reimplementation root.")
-                await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
-            else:
-                print("[REIMPLEMENT] Skipped: timing anatomy or budget does not justify a global candidate.")
-        except WallClockLimitReached:
-            print("[REIMPLEMENT] Budget expired; continuing from the published baseline.")
-            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
-        except Exception as exc:
-            logger.exception("Deterministic reimplementation failed; continuing from baseline: %s", exc)
-            print(f"[REIMPLEMENT] Failed; continuing from baseline: {exc}")
-            await self.v("open_checkpoint", {"dcp_path": str(baseline_checkpoint.resolve()), "timeout": 900})
-
-        if self.generation_config.enabled:
-            return await self._optimize_generational(input_dcp, output_dcp, initial_analysis)
-        return await self._optimize_linear(input_dcp, output_dcp, initial_analysis)
-
-    async def run_single_method(
-        self,
-        input_dcp: Path,
-        output_dcp: Path,
-        method: str,
-        *,
-        top_n_nets: int = 5,
-        phys_opt_directive: str = "Default",
-    ) -> bool:
-        """Run one selected optimization method exactly once, without LLM search."""
-        self.start_time = time.time()
-        self.output_dcp = output_dcp.resolve()
-        self._published_wns = float("-inf")
-        method = method.upper()
-        if method not in SUPPORTED_SINGLE_METHODS:
-            raise ValueError(
-                f"Unsupported single method '{method}'. Supported methods: {', '.join(SUPPORTED_SINGLE_METHODS)}"
-            )
-
-        try:
-            await self.perform_initial_analysis(input_dcp)
-            baseline_metrics = {
-                "wns": self.initial_wns,
-                "tns": self.initial_tns,
-                "failing_endpoints": self.initial_failing_endpoints,
-            }
-            await self._publish_current_candidate(baseline_metrics, allow_equal=True)
-
-            if method == "PBLOCK":
-                strategy_args = {}
-            elif method == "FULL_PLACE_ROUTE":
-                strategy_args = {}
-            elif method == "FANOUT":
-                strategy_args = {"top_n_nets": top_n_nets}
-            elif method == "CELL_RELOCATE":
-                strategy_args = {"num_paths": 10, "detour_threshold": 2.0, "max_cells": 3}
-            elif method == "HARD_BLOCK":
-                strategy_args = {"hard_block_types": ["DSP", "BRAM", "URAM"]}
-            elif method == "PLACEMENT_SHOT":
-                strategy_args = {"directive": "ExtraNetDelay_low"}
-            else:
-                strategy_args = {"directive": phys_opt_directive}
-
-            print(f"=== Running Single Method: {method} ===\n")
-            timing_report, _ = await self._execute_strategy(method, strategy_args)
-            final_metrics = await self._measure_current_metrics(timing_report)
-            await self._publish_current_candidate(final_metrics)
-
-            self.end_time = time.time()
-            total_runtime = self.end_time - self.start_time
-            self.final_wns = final_metrics.get("wns")
-
-            print("=== Single-Method Summary ===")
-            print(f"Method: {method}")
-            if self.initial_wns is not None:
-                print(f"Initial WNS: {self.initial_wns:.3f} ns")
-            if self.final_wns is not None:
-                print(f"Final WNS:   {self.final_wns:.3f} ns")
-            if self.clock_period is not None and self.initial_wns is not None and self.final_wns is not None:
-                initial_fmax = self.calculate_fmax(self.initial_wns, self.clock_period)
-                final_fmax = self.calculate_fmax(self.final_wns, self.clock_period)
-                if initial_fmax is not None and final_fmax is not None:
-                    print(f"Fmax:        {initial_fmax:.2f} -> {final_fmax:.2f} MHz")
-            print(f"Runtime:     {total_runtime:.2f} seconds")
-            print(f"Saved DCP:   {self._display_name(output_dcp)}")
-            print("=" * 70 + "\n")
-            return True
-        except Exception as exc:
-            logger.exception("Single-method run failed: %s", exc)
-            print(f"\n✗ Single-method run failed: {exc}\n")
-            self.end_time = time.time()
-            return False
-
-    async def _optimize_linear(self, input_dcp: Path, output_dcp: Path, initial_analysis: str) -> bool:
-        """Run the recipe-driven linear optimization workflow."""
-        print("=== Starting LLM-Driven Optimization ===\n")
-
-        best_metrics = self._search_seed_metrics or {
-            "wns": self.initial_wns,
-            "tns": self.initial_tns,
-            "failing_endpoints": self.initial_failing_endpoints,
-        }
-        best_wns = best_metrics["wns"]
-        stagnation = 0
-        best_dcp_path = await self._save_best_checkpoint(Path(self.temp_dir) / "best_iter_000.dcp")
-        await self._reload_rapidwright_from_vivado_checkpoint(best_dcp_path)
-        last_best_iteration = 0
-        used_action_signatures: set[str] = set()
-
-        max_iterations = self.generation_config.max_llm_calls
-        hit_wall_clock_limit = False
-
-        for index in range(max_iterations):
-            if self._should_stop_for_budget():
-                hit_wall_clock_limit = True
-                break
-
-            try:
-                self._raise_if_wall_clock_expired("before starting the next iteration")
-            except WallClockLimitReached as exc:
-                print(f"{exc} Stopping search and keeping the best checkpoint saved so far.")
-                hit_wall_clock_limit = True
-                break
-
-            self.iteration += 1
-            print(f"\n=== Iteration {index + 1} ===")
-
-            try:
-                if best_dcp_path.exists() and last_best_iteration != index:
-                    await self.v("open_checkpoint", {"dcp_path": str(best_dcp_path)})
-                    await self.rw("read_checkpoint", {"dcp_path": str(best_dcp_path)})
-
-                decision_input = self._build_decision_input(
-                    initial_analysis,
-                    stagnation,
-                    self.history[-5:],
-                )
-                if self.force_strategy:
-                    strategy, args = self.sanitize_action({"strategy": self.force_strategy, "args": {}})
-                    print(f"Forced strategy: {strategy} with args {args}")
-                else:
-                    action = await self.choose_action_llm(decision_input)
-                    strategy, args = self.sanitize_action(action)
-                strategy, args, deduped = self._dedupe_action_choice(strategy, args, used_action_signatures)
-                if deduped:
-                    print(f"Chosen action repeated in current search state; using fallback: {strategy} with args {args}")
-                print(f"Chosen: {strategy} with args {args}")
-                previous_metrics = await self._measure_current_metrics()
-                previous_wns = previous_metrics["wns"]
-
-                try:
-                    step_start_time = time.time()
-                    result_report, current_wns = await self._execute_strategy(strategy, args)
-                    step_elapsed_time = time.time() - step_start_time
-                except Exception as exc:
-                    logger.exception("Error during linear iteration %s", index + 1)
-                    self.history.append(
-                        {
-                            "iteration": index + 1,
-                            "strategy": strategy,
-                            "args": args,
-                            "wns": None,
-                            "error": str(exc),
-                            "stagnation_count": stagnation,
-                        }
-                    )
-                    print(f"Iteration failed: {exc}")
-                    used_action_signatures.add(self._action_signature(strategy, args))
-                    stagnation += 1
-
-                    if stagnation >= self.generation_config.max_steps_without_improvement:
-                        print("No improvement. Stopping.")
-                        break
-                    continue
-
-                current_metrics = await self._measure_current_metrics(result_report)
-                delta = current_wns - previous_wns if (current_wns is not None and previous_wns is not None) else None
-                delta_vs_best = (
-                    current_wns - best_metrics["wns"]
-                    if current_wns is not None and best_metrics.get("wns") is not None
-                    else None
-                )
-                roi_accepted = self._is_step_roi_acceptable(delta_vs_best, step_elapsed_time)
-                self.history.append(
-                    {
-                        "iteration": index + 1,
-                        "strategy": strategy,
-                        "args": args,
-                        "wns": current_wns,
-                        "tns": current_metrics.get("tns"),
-                        "failing_endpoints": current_metrics.get("failing_endpoints"),
-                        "delta_wns": delta,
-                        "delta_vs_best": delta_vs_best,
-                        "elapsed_seconds": step_elapsed_time,
-                        "roi_accepted": roi_accepted,
-                        "previous_wns": previous_wns,
-                        "delta_tns": (
-                            current_metrics.get("tns") - previous_metrics["tns"]
-                            if current_metrics.get("tns") is not None and previous_metrics["tns"] is not None
-                            else None
-                        ),
-                        "delta_failing_endpoints": (
-                            current_metrics.get("failing_endpoints") - previous_metrics["failing_endpoints"]
-                            if current_metrics.get("failing_endpoints") is not None
-                            and previous_metrics["failing_endpoints"] is not None
-                            else None
-                        ),
-                        "stagnation_count": stagnation,
-                    }
-                )
-
-                print(f"WNS: {self._format_wns(current_wns)}")
-                print(f"Step cost: {self._format_step_roi(delta_vs_best, step_elapsed_time)}")
-                used_action_signatures.add(self._action_signature(strategy, args))
-
-                if self._is_metrics_improvement(current_metrics, best_metrics):
-                    best_wns = current_wns
-                    best_metrics = current_metrics
-                    best_dcp_path = await self._save_best_checkpoint(
-                        Path(self.temp_dir) / f"best_iter_{index + 1:03d}.dcp"
-                    )
-                    await self._publish_current_candidate(best_metrics)
-                    last_best_iteration = index + 1
-                    used_action_signatures.clear()
-                    if roi_accepted:
-                        stagnation = 0
-                    else:
-                        stagnation += 1
-                        print("Improvement saved, but below configured WNS/runtime ROI; patience was not reset.")
-                else:
-                    stagnation += 1
-
-                if best_wns is not None and best_wns >= 0:
-                    print("Timing met.")
-                    break
-
-                if stagnation >= self.generation_config.max_steps_without_improvement:
-                    print("No improvement. Stopping.")
-                    break
-            except WallClockLimitReached as exc:
-                print(f"{exc} Stopping search and keeping the best checkpoint saved so far.")
-                hit_wall_clock_limit = True
-                break
-
-        if self.output_dcp is None:
-            # Internal callers of the search helper do not configure continuous
-            # publishing, so retain the helper's historical copy-out behavior.
-            shutil.copy2(best_dcp_path, output_dcp)
-        elif not output_dcp.exists():
-            logger.warning(
-                "No candidate cleared the publish gates; refusing to copy an unchecked "
-                "search checkpoint to %s",
-                output_dcp,
-            )
-
-        self.end_time = time.time()
-        self._print_optimization_summary(max_iterations_reached=hit_wall_clock_limit)
-        return True
-
-    async def _optimize_generational(self, input_dcp: Path, output_dcp: Path, initial_analysis: str) -> bool:
-        """Run branch-and-generation search over recipe choices."""
-        cfg = self.generation_config
-        search_dir = self.run_dir / "generation_search"
-        search_dir.mkdir(parents=True, exist_ok=True)
-
-        print("=== Starting Generation Search Optimization ===")
-        print(json.dumps(asdict(cfg), indent=2))
-
-        if not self._search_roots:
-            root_path = search_dir / "baseline_root.dcp"
-            if not await self._save_vivado_checkpoint(root_path):
-                raise RuntimeError(f"Could not save root checkpoint: {root_path}")
-            self._search_roots = [(
-                root_path,
-                self._search_seed_metrics or {
-                    "wns": self.initial_wns, "tns": self.initial_tns,
-                    "failing_endpoints": self.initial_failing_endpoints,
-                },
-                "Original routed incumbent",
-            )]
-
-        self.search_candidates = []
-        self.candidate_histories = {}
-        for index, (path, metrics, summary) in enumerate(self._search_roots, start=1):
-            candidate = SearchCandidate(
-                candidate_id="baseline" if index == 1 else f"reimplementation_{index - 1}",
-                dcp_path=path, wns=metrics["wns"], tns=metrics["tns"],
-                failing_endpoints=metrics["failing_endpoints"], peak_wns=metrics["wns"],
-                generation=0, parent_id=None, branch_index=0, steps_taken=0,
-                steps_since_peak=0, summary=summary,
-                **self._candidate_score_metadata(metrics["wns"]),
-            )
-            self.search_candidates.append(candidate)
-            self.candidate_histories[candidate.candidate_id] = []
-        self.best_candidate = max(self.search_candidates, key=self._candidate_sort_key)
-        active_candidates = list(self.search_candidates)
-        hit_wall_clock_limit = False
-        fast_search_stopped = False
-
-        for generation in range(1, cfg.max_generations + 1):
-            if self._should_stop_for_budget("[SEARCH]"):
-                break
-
-            if self.llm_call_count >= cfg.max_llm_calls:
-                print(f"[SEARCH] Reached max LLM calls ({cfg.max_llm_calls}); stopping search.")
-                break
-
-            print(f"\n{'=' * 70}")
-            print(f"GENERATION {generation}/{cfg.max_generations}")
-            print(f"{'=' * 70}")
-
-            branch_results: list[SearchCandidate] = []
-            tried_summaries = "\n".join(
-                f"- {candidate.candidate_id}: WNS {self._format_wns(candidate.wns)}; {candidate.summary}"
-                for candidate in self.search_candidates[-12:]
-            )
-
-            for parent in active_candidates:
-                for branch_index in range(1, cfg.branch_factor + 1):
-                    if self._should_stop_for_budget("[SEARCH]"):
-                        break
-
-                    if self.llm_call_count >= cfg.max_llm_calls:
-                        break
-            try:
-                self._raise_if_wall_clock_expired("before starting the next generation")
-                if self.llm_call_count >= cfg.max_llm_calls:
-                    print(f"[SEARCH] Reached max LLM calls ({cfg.max_llm_calls}); stopping search.")
-                    break
-
-                branch_results: list[SearchCandidate] = []
-                tried_summaries = "\n".join(
-                    f"- {candidate.candidate_id}: WNS {self._format_wns(candidate.wns)}; {candidate.summary}"
-                    for candidate in self.search_candidates[-12:]
-                )
-
-                for parent in active_candidates:
-                    for branch_index in range(1, cfg.branch_factor + 1):
-                        if self.llm_call_count >= cfg.max_llm_calls:
-                            break
-
-                        candidate = await self._run_generation_branch(
-                            initial_analysis=initial_analysis,
-                            search_dir=search_dir,
-                            parent=parent,
-                            generation=generation,
-                            branch_index=branch_index,
-                            tried_summaries=tried_summaries,
-                        )
-                        if candidate is None:
-                            continue
-
-                        branch_results.append(candidate)
-
-                        if self._is_candidate_improvement(candidate, self.best_candidate):
-                            self.best_candidate = candidate
-                            await self._publish_current_candidate(
-                                {
-                                    "wns": candidate.wns,
-                                    "tns": candidate.tns,
-                                    "failing_endpoints": candidate.failing_endpoints,
-                                }
-                            )
-                            print(f"[SEARCH] New global best: {candidate.candidate_id} ({self._format_wns(candidate.wns)})")
-
-                        should_stop_fast = bool(
-                            self.best_candidate
-                            and should_stop_fast_search(cfg, self.search_candidates[0], self.best_candidate)
-                        )
-
-                        if cfg.stop_when_timing_met and candidate.wns is not None and candidate.wns >= 0:
-                            print("[SEARCH] Timing met; stopping search because stop_when_timing_met is enabled.")
-                            active_candidates = [candidate]
-                            branch_results = [candidate]
-                            break
-
-                        if should_stop_fast and self.best_candidate:
-                            print(
-                                f"[SEARCH] Candidate {self.best_candidate.candidate_id} has projected score "
-                                f"{self.best_candidate.projected_score:.6f}; later fast-profile expansion is skipped."
-                            )
-                            fast_search_stopped = True
-                            break
-
-                    if fast_search_stopped:
-                        break
-
-                    if cfg.stop_when_timing_met and self.best_candidate and self.best_candidate.wns is not None and self.best_candidate.wns >= 0:
-                        break
-
-                if fast_search_stopped:
-                    break
-
-                if not branch_results:
-                    print("[SEARCH] No viable branches produced this generation; stopping.")
-                    break
-
-                expandable_results = [
-                    candidate for candidate in branch_results if candidate.steps_since_peak < cfg.max_steps_without_improvement
-                ]
-                if not expandable_results:
-                    print("[SEARCH] All branches reached patience from their peak; stopping.")
-                    break
-
-                active_candidates = sorted(expandable_results, key=self._candidate_sort_key, reverse=True)[: cfg.beam_width]
-
-                print("\n[SEARCH] Beam for next generation:")
-                for candidate in active_candidates:
-                    print(
-                        f"  - {candidate.candidate_id}: current {self._format_wns(candidate.wns)}, "
-                        f"peak {self._format_wns(candidate.peak_wns)}, "
-                        f"steps since peak {candidate.steps_since_peak}"
-                    )
-
-                if cfg.stop_when_timing_met and self.best_candidate and self.best_candidate.wns is not None and self.best_candidate.wns >= 0:
-                    break
-            except WallClockLimitReached as exc:
-                print(f"[SEARCH] {exc} Stopping search and keeping the best checkpoint saved so far.")
-                hit_wall_clock_limit = True
-                break
-
-        if self.best_candidate is None:
-            self.end_time = time.time()
-            self._print_optimization_summary(max_iterations_reached=True)
-            return False
-
-        output_dcp.parent.mkdir(parents=True, exist_ok=True)
-        if self.output_dcp is None:
-            if self.best_candidate.dcp_path.resolve() != output_dcp.resolve():
-                shutil.copy2(self.best_candidate.dcp_path, output_dcp)
-        elif not output_dcp.exists():
-            logger.warning(
-                "No candidate cleared the publish gates; refusing to copy an unchecked "
-                "search checkpoint to %s",
-                output_dcp,
-            )
-        self.best_wns = self.best_candidate.wns if self.best_candidate.wns is not None else self.best_wns
-        self.end_time = time.time()
-
-        print(f"\n[SEARCH] Best candidate: {self.best_candidate.candidate_id}")
-        print(f"[SEARCH] Best WNS: {self._format_wns(self.best_candidate.wns)}")
-        if output_dcp.exists():
-            print(f"[SEARCH] Published checkpoint: {self._display_name(output_dcp)}")
-        else:
-            print("[SEARCH] No checkpoint passed the publish gates.")
-
-        self._print_optimization_summary(max_iterations_reached=hit_wall_clock_limit)
-        return True
-
-    async def _run_generation_branch(
-        self,
-        initial_analysis: str,
-        search_dir: Path,
-        parent: SearchCandidate,
-        generation: int,
-        branch_index: int,
-        tried_summaries: str,
-    ) -> Optional[SearchCandidate]:
-        """Expand one branch from a parent candidate across recipe decisions."""
-        cfg = self.generation_config
-        parent_token = self._short_candidate_token(parent.candidate_id)
-        branch_id = f"g{generation:02d}_p{parent_token}_b{branch_index:02d}"
-        print(f"\n[SEARCH] Branch {branch_id} from {parent.candidate_id}")
-
-        try:
-            await self._restore_candidate_state(parent)
-        except Exception as exc:
-            logger.exception("Could not restore parent candidate %s", parent.candidate_id)
-            print(f"[SEARCH] Skipping branch {branch_id}: restore failed: {exc}")
-            return None
-
-        peak_wns = parent.peak_wns
-        peak_metrics = {
-            "wns": parent.peak_wns,
-            "tns": parent.tns,
-            "failing_endpoints": parent.failing_endpoints,
-        }
-        current_wns = parent.wns
-        steps_since_peak = parent.steps_since_peak
-        latest_candidate = parent
-        # Carry only this candidate lineage into planning.  The global history
-        # remains an audit log and must not make one root's failed recipe poison
-        # the other independent root.
-        branch_history: list[dict] = list(self.candidate_histories.get(parent.candidate_id, []))
-        self._planning_history = branch_history
-        used_action_signatures: set[str] = set()
-
-        for step in range(1, cfg.max_steps_per_branch + 1):
-            if self._should_stop_for_budget("[SEARCH]"):
-                break
-
-            self._raise_if_wall_clock_expired(f"before starting branch step {step}")
-            if self.llm_call_count >= cfg.max_llm_calls:
-                break
-
-            self.iteration += 1
-            logger.info("=== Generation %s Branch %s Step %s ===", generation, branch_id, step)
-            print(f"\n[SEARCH] {branch_id} step {step}/{cfg.max_steps_per_branch}")
-
-            branch_context = (
-                f"Branch id: {branch_id}\n"
-                f"Parent candidate: {parent.candidate_id}\n"
-                f"Parent current WNS: {self._format_wns(parent.wns)}\n"
-                f"Parent peak WNS along this line: {self._format_wns(parent.peak_wns)}\n"
-                "Use one recipe decision for this step, then let the controller score it."
-            )
-            decision_input = self._build_decision_input(
-                initial_analysis,
-                steps_since_peak,
-                branch_history[-5:],
-                branch_context=branch_context,
-                tried_summaries=tried_summaries,
-            )
-
-            forced_action = self._forced_branch_strategy(generation, parent, branch_index, step)
-            if self.force_strategy:
-                strategy, args = self.sanitize_action({"strategy": self.force_strategy, "args": {}})
-                print(f"[SEARCH] Forced CLI choice: {strategy} with args {args}")
-            elif forced_action is not None:
-                strategy, args = forced_action
-                print(f"[SEARCH] Forced diversity choice: {strategy} with args {args}")
-            else:
-                action = await self.choose_action_llm(decision_input)
-                strategy, args = self.sanitize_action(action)
-            strategy, args, deduped = self._dedupe_action_choice(strategy, args, used_action_signatures)
-            if deduped:
-                print(f"[SEARCH] Repeated action avoided; using fallback: {strategy} with args {args}")
-            else:
-                print(f"[SEARCH] Chosen: {strategy} with args {args}")
-            previous_wns = current_wns
-            previous_metrics = {
-                "wns": current_wns,
-                "tns": latest_candidate.tns,
-                "failing_endpoints": latest_candidate.failing_endpoints,
-            }
-
-            try:
-                step_start_time = time.time()
-                result_report, current_wns = await self._execute_strategy(strategy, args)
-                step_elapsed_time = time.time() - step_start_time
-            except Exception as exc:
-                logger.exception("Error during branch %s step %s", branch_id, step)
-                failed_step = {
-                    "step": step,
-                    "strategy": strategy,
-                    "args": args,
-                    "wns": None,
-                    "error": str(exc),
-                }
-                branch_history.append(failed_step)
-                self.history.append(failed_step)
-                used_action_signatures.add(self._action_signature(strategy, args))
-                steps_since_peak += 1
-                continue
-
-            current_metrics = await self._measure_current_metrics(result_report)
-            delta_vs_peak = (
-                current_wns - peak_metrics["wns"]
-                if current_wns is not None and peak_metrics.get("wns") is not None
-                else None
-            )
-            roi_accepted = self._is_step_roi_acceptable(delta_vs_peak, step_elapsed_time)
-            used_action_signatures.add(self._action_signature(strategy, args))
-            completed_step = {
-                "step": step,
-                "strategy": strategy,
-                "args": args,
-                "wns": current_wns,
-                "tns": current_metrics.get("tns"),
-                "failing_endpoints": current_metrics.get("failing_endpoints"),
-                "delta_wns": (
-                    current_wns - previous_wns if current_wns is not None and previous_wns is not None else None
-                ),
-                "delta_vs_peak": delta_vs_peak,
-                "elapsed_seconds": step_elapsed_time,
-                "roi_accepted": roi_accepted,
-                "previous_wns": previous_wns,
-                "delta_tns": (
-                    current_metrics.get("tns") - previous_metrics["tns"]
-                    if current_metrics.get("tns") is not None and previous_metrics["tns"] is not None
-                    else None
-                ),
-                "delta_failing_endpoints": (
-                    current_metrics.get("failing_endpoints") - previous_metrics["failing_endpoints"]
-                    if current_metrics.get("failing_endpoints") is not None
-                    and previous_metrics["failing_endpoints"] is not None
-                    else None
-                ),
-                "delta_vs_parent": (
-                    current_wns - parent.wns if current_wns is not None and parent.wns is not None else None
-                ),
-            }
-            branch_history.append(completed_step)
-            self.history.append(completed_step)
-
-            neutral_fallback = (
-                plan_neutral_phys_opt_fallback(
-                    self.design_signature,
-                    self._current_budget_state(),
-                    history=branch_history,
-                    validation=self.validation_status,
-                )
-                if self.design_signature is not None
-                else ()
-            )
-            if neutral_fallback:
-                fallback_args = {"directive": neutral_fallback[0].name}
-                fallback_previous_wns = current_wns
-                fallback_previous_metrics = current_metrics
-                fallback_start_time = time.time()
-                try:
-                    result_report, current_wns = await self._execute_strategy(
-                        "PHYS_OPT", fallback_args
-                    )
-                    fallback_elapsed_time = time.time() - fallback_start_time
-                    current_metrics = await self._measure_current_metrics(result_report)
-                except Exception as exc:
-                    fallback_elapsed_time = time.time() - fallback_start_time
-                    logger.exception(
-                        "Error during bounded neutral PHYS_OPT fallback in branch %s step %s",
-                        branch_id,
-                        step,
-                    )
-                    fallback_restore_confirmed = True
-                    try:
-                        baseline_checkpoint = Path(self.temp_dir) / "phys_opt_baseline.dcp"
-                        restore_result = await self.v(
-                            "open_checkpoint",
-                            {"dcp_path": str(baseline_checkpoint.resolve())},
-                        )
-                        self._raise_if_tool_reported_error(
-                            "vivado_open_checkpoint", restore_result
-                        )
-                    except Exception:
-                        fallback_restore_confirmed = False
-                        logger.exception(
-                            "Could not restore neutral PHYS_OPT fallback baseline"
-                        )
-                    fallback_failed_step = {
-                        "step": step,
-                        "strategy": "PHYS_OPT",
-                        "args": fallback_args,
-                        "wns": None,
-                        "error": str(exc),
-                        "elapsed_seconds": fallback_elapsed_time,
-                    }
-                    branch_history.append(fallback_failed_step)
-                    self.history.append(fallback_failed_step)
-                    used_action_signatures.add(
-                        self._action_signature("PHYS_OPT", fallback_args)
-                    )
-                    current_wns = fallback_previous_wns
-                    current_metrics = fallback_previous_metrics
-                    if not fallback_restore_confirmed:
-                        print(
-                            f"[SEARCH] Branch {branch_id} step {step}: neutral PHYS_OPT "
-                            "baseline restore was not confirmed; stopping branch."
-                        )
-                        return None
-                else:
-                    fallback_delta_vs_peak = (
-                        current_wns - peak_metrics["wns"]
-                        if current_wns is not None and peak_metrics.get("wns") is not None
-                        else None
-                    )
-                    fallback_step = {
-                        "step": step,
-                        "strategy": "PHYS_OPT",
-                        "args": fallback_args,
-                        "wns": current_wns,
-                        "tns": current_metrics.get("tns"),
-                        "failing_endpoints": current_metrics.get("failing_endpoints"),
-                        "delta_wns": (
-                            current_wns - fallback_previous_wns
-                            if current_wns is not None and fallback_previous_wns is not None
-                            else None
-                        ),
-                        "delta_vs_peak": fallback_delta_vs_peak,
-                        "elapsed_seconds": fallback_elapsed_time,
-                        "roi_accepted": self._is_step_roi_acceptable(
-                            fallback_delta_vs_peak, fallback_elapsed_time
-                        ),
-                        "previous_wns": fallback_previous_wns,
-                        "delta_tns": (
-                            current_metrics.get("tns") - fallback_previous_metrics["tns"]
-                            if current_metrics.get("tns") is not None
-                            and fallback_previous_metrics.get("tns") is not None
-                            else None
-                        ),
-                        "delta_failing_endpoints": (
-                            current_metrics.get("failing_endpoints")
-                            - fallback_previous_metrics["failing_endpoints"]
-                            if current_metrics.get("failing_endpoints") is not None
-                            and fallback_previous_metrics.get("failing_endpoints") is not None
-                            else None
-                        ),
-                        "delta_vs_parent": (
-                            current_wns - parent.wns
-                            if current_wns is not None and parent.wns is not None
-                            else None
-                        ),
-                    }
-                    branch_history.append(fallback_step)
-                    self.history.append(fallback_step)
-                    used_action_signatures.add(
-                        self._action_signature("PHYS_OPT", fallback_args)
-                    )
-                    strategy = "PHYS_OPT"
-                    args = fallback_args
-                    delta_vs_peak = fallback_delta_vs_peak
-                    step_elapsed_time += fallback_elapsed_time
-                    roi_accepted = fallback_step["roi_accepted"]
-
-            checkpoint_path = search_dir / f"{branch_id}_step{step:02d}.dcp"
-            saved = await self._save_vivado_checkpoint(checkpoint_path)
-            if not saved:
-                print(f"[SEARCH] Branch {branch_id} step {step}: checkpoint save failed; stopping branch.")
-                break
-
-            if self._is_metrics_improvement(current_metrics, peak_metrics):
-                peak_wns = current_wns
-                peak_metrics = current_metrics
-                if roi_accepted:
-                    steps_since_peak = 0
-                else:
-                    steps_since_peak += 1
-                    print(
-                        "[SEARCH] Improvement saved, but below configured WNS/runtime ROI; "
-                        "branch patience was not reset."
-                    )
-            else:
-                steps_since_peak += 1
-
-            latest_candidate = SearchCandidate(
-                candidate_id=f"{branch_id}_s{step:02d}",
-                dcp_path=checkpoint_path,
-                wns=current_wns,
-                tns=current_metrics.get("tns"),
-                failing_endpoints=current_metrics.get("failing_endpoints"),
-                peak_wns=peak_wns,
-                generation=generation,
-                parent_id=parent.candidate_id,
-                branch_index=branch_index,
-                steps_taken=step,
-                steps_since_peak=steps_since_peak,
-                summary=f"{strategy} {args}",
-                **self._candidate_score_metadata(current_wns),
-            )
-            self.search_candidates.append(latest_candidate)
-            self.candidate_histories[latest_candidate.candidate_id] = list(branch_history)
-
-            print(
-                f"[SEARCH] {latest_candidate.candidate_id}: current {self._format_wns(current_wns)}, "
-                f"peak {self._format_wns(peak_wns)}, steps since peak {steps_since_peak}"
-            )
-            print(f"[SEARCH] Step cost: {self._format_step_roi(delta_vs_peak, step_elapsed_time)}")
-
-            if self._is_candidate_improvement(latest_candidate, self.best_candidate):
-                self.best_candidate = latest_candidate
-                await self._publish_current_candidate(
-                    {
-                        "wns": latest_candidate.wns,
-                        "tns": latest_candidate.tns,
-                        "failing_endpoints": latest_candidate.failing_endpoints,
-                    }
-                )
-                print(f"[SEARCH] New global best inside branch: {latest_candidate.candidate_id}")
-
-            if cfg.stop_when_timing_met and current_wns is not None and current_wns >= 0:
-                break
-
-            if steps_since_peak >= cfg.max_steps_without_improvement:
-                print(
-                    f"[SEARCH] Stopping {branch_id}: no improvement over branch peak for "
-                    f"{steps_since_peak} step(s)."
-                )
-                break
-
-        return latest_candidate if latest_candidate is not parent else None
 
     def save_token_usage_report(self, output_path: Path):
         """Save detailed token usage report to JSON."""
@@ -3290,7 +2418,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 "path": str(self.system_prompt_path),
                 "sha256_16": self.system_prompt_hash,
             },
-            "design_signature": self.design_signature.to_dict() if self.design_signature else None,
+            "design_signature": self.best_candidate.evidence if self.best_candidate else None,
             "generation_search": {
                 "config": asdict(self.generation_config),
                 "best_candidate_id": self.best_candidate.candidate_id if self.best_candidate else None,
@@ -3315,6 +2443,13 @@ class DCPOptimizer(DCPOptimizerBase):
                     for candidate in self.search_candidates
                 ],
             },
+            "published_artifact": {
+                "path": str(self.output_dcp) if self.output_dcp else None,
+                "sha256": self.best_candidate.checkpoint_sha256 if self.best_candidate else None,
+                "constraint_sha256": self.best_candidate.constraint_sha256 if self.best_candidate else None,
+                "equivalence_proof": self.best_candidate.equivalence_proof if self.best_candidate else None,
+            },
+            "stop_reason": self._stop_reason,
             "summary": {
                 "total_runtime_seconds": total_runtime,
                 "total_llm_calls": self.llm_call_count,
@@ -3326,6 +2461,7 @@ class DCPOptimizer(DCPOptimizerBase):
                 "total_reasoning_tokens": total_reasoning,
                 "total_cost": self.total_cost,
                 "total_llm_cost": self.total_cost,
+                "llm_cost_verified": not self._llm_cost_unknown,
                 "target_clock": self.target_clock,
                 "clock_period_ns": self.clock_period,
                 "initial_wns": self.initial_wns,
@@ -3338,9 +2474,9 @@ class DCPOptimizer(DCPOptimizerBase):
                 "delta_fmax_mhz": fmax_improvement,
                 "score_runtime_hours": contest_score.runtime_hours if contest_score else None,
                 "score_penalty_multiplier": contest_score.penalty_multiplier if contest_score else None,
-                "projected_contest_score": contest_score.projected_score if contest_score else None,
-                "validated_contest_score": contest_score.validated_score if contest_score else None,
-                "score_status": contest_score.score_status if contest_score else None,
+                "projected_contest_score": contest_score.projected_score if contest_score and not self._llm_cost_unknown else None,
+                "validated_contest_score": contest_score.validated_score if contest_score and not self._llm_cost_unknown else None,
+                "score_status": "cost_unverified" if self._llm_cost_unknown else contest_score.score_status if contest_score else None,
                 "validation": validation_summary,
                 "total_tool_calls": len(self.tool_call_details),
                 "total_tool_time_seconds": total_tool_time,

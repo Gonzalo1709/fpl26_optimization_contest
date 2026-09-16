@@ -36,6 +36,10 @@ Rules for the controller interface:
 - HARD_BLOCK args: {"hard_block_types": subset of the provided eligible resource types}
 - CRITICAL_PIN args: {}
 - ROUTE_PRESERVE args: {"max_nets": int from 1 to 8, "min_net_delay_ns": float from 0.05 to 2.0}
+- GRANULAR_PHYS_OPT args: {"flag": one of the provided flags}
+- SCOPED_PHYS_OPT, PARTIAL_REPLACE, TARGETED_REPLICATION: use the controller's provided operand counts.
+- RETIME args: {"directive": one of the provided retiming directives}; never choose it if omitted.
+- Prefer feature-matched measured outcomes and the provided recipe order when available.
 - NO_OP args: {}
 - Return ONLY JSON.
 """.strip()

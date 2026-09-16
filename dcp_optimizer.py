@@ -7,6 +7,7 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -232,8 +233,19 @@ Examples:
     parser.add_argument(
         "--continue-after-timing-met",
         action="store_true",
-        help="Keep searching after WNS reaches 0 instead of stopping at timing closure",
+        help="Keep searching after WNS reaches 0 (now the default)",
     )
+    parser.add_argument("--stop-when-timing-met", action="store_true", help="Stop at timing closure instead of maximizing Fmax")
+    parser.add_argument("--no-score-aware-stopping", action="store_true", help="Ablate learned score-based stopping; use configured patience")
+    parser.add_argument("--deterministic-steps", type=int, default=3, help="Feature-selected recipe attempts before LLM planning (default: 3)")
+    parser.add_argument("--validation-reserve-seconds", type=float, default=600, help="Time reserved for admission and publication")
+    parser.add_argument("--outcome-memory", type=Path, default=Path("optimizer_outcomes.sqlite3"), help="Persistent recipe-outcome database")
+    parser.add_argument("--no-outcome-memory", action="store_true", help="Use only outcomes from this run")
+    parser.add_argument("--enable-retiming", action="store_true", help="Admit experimental retiming when a sequential equivalence checker is configured")
+    parser.add_argument("--equivalence-command", type=Path, help="JSON file containing the checker argv array; golden, revised, report paths are appended")
+    parser.add_argument("--equivalence-timeout-seconds", type=float, default=300, help="Maximum sequential-equivalence time per candidate")
+    parser.add_argument("--no-refresh-evidence", action="store_true", help="Ablation: clear physical evidence on changed checkpoints instead of refreshing")
+    parser.add_argument("--no-llm", action="store_true", help="Run the generic deterministic portfolio without an API key")
     parser.add_argument(
         "--wall-clock-limit-seconds",
         type=float,
@@ -253,7 +265,7 @@ Examples:
     )
     parser.add_argument(
         "--phys-opt-directive",
-        choices=["Default", "Explore", "AggressiveExplore"],
+        choices=["Default", "RuntimeOptimized", "Explore", "AggressiveExplore", "AddRetime", "AlternateFlowWithRetiming"],
         default="Default",
         help="When using --single-method PHYS_OPT or PHYS_OPT_REROUTE, use this phys_opt_design directive (default: Default)",
     )
@@ -295,6 +307,36 @@ Examples:
     )
 
     args = parser.parse_args()
+    if args.stop_when_timing_met and args.continue_after_timing_met:
+        parser.error("Choose only one timing-closure behavior")
+    import math
+    for field in ("validation_reserve_seconds", "equivalence_timeout_seconds", "wall_clock_limit_seconds",
+                  "max_runtime_minutes", "max_cost", "min_wns_delta", "min_wns_per_minute"):
+        value = getattr(args, field)
+        if value is not None and (not math.isfinite(value) or value < 0):
+            parser.error(f"--{field.replace('_', '-')} must be finite and nonnegative")
+    equivalence_command = ()
+    if args.equivalence_command:
+        try:
+            command = json.loads(args.equivalence_command.read_text(encoding="utf-8"))
+            if not isinstance(command, list) or not command or not all(isinstance(arg, str) and arg for arg in command):
+                raise ValueError("expected a nonempty JSON argv array")
+            equivalence_command = tuple(command)
+        except (OSError, ValueError) as exc:
+            parser.error(f"Invalid equivalence command: {exc}")
+    if args.enable_retiming and (not equivalence_command or args.equivalence_timeout_seconds <= 0):
+        parser.error("Retiming requires --equivalence-command and a positive equivalence timeout")
+    adaptive_config = dict(
+        stop_when_timing_met=args.stop_when_timing_met,
+        validation_reserve_seconds=args.validation_reserve_seconds,
+        score_aware_stopping=not args.no_score_aware_stopping,
+        deterministic_steps=max(0, args.deterministic_steps),
+        outcome_memory_path=None if args.no_outcome_memory else str(args.outcome_memory.resolve()),
+        enable_retiming=args.enable_retiming,
+        equivalence_command=equivalence_command,
+        equivalence_timeout_seconds=args.equivalence_timeout_seconds,
+        refresh_evidence=not args.no_refresh_evidence,
+    )
 
     if not args.input_dcp.exists():
         print(f"Error: Input file not found: {args.input_dcp}", file=sys.stderr)
@@ -349,9 +391,12 @@ Examples:
         generation_config = GenerationSearchConfig(
             enabled=False,
             wall_clock_limit_seconds=max(0.0, args.wall_clock_limit_seconds),
+            max_runtime_minutes=args.max_runtime_minutes,
+            max_cost=args.max_cost,
+            **adaptive_config,
         )
         optimizer = DCPOptimizer(
-            api_key=args.api_key or "",
+            api_key=args.api_key or "no-llm",
             model=args.model,
             debug=args.debug,
             run_dir=run_dir,
@@ -389,7 +434,7 @@ Examples:
         finally:
             await optimizer.cleanup()
 
-    if not args.api_key:
+    if not args.api_key and not args.no_llm:
         print("Error: OpenRouter API key required. Set OPENROUTER_API_KEY or use --api-key", file=sys.stderr)
         print("       Use --test flag to run in test mode without LLM", file=sys.stderr)
         sys.exit(1)
@@ -463,17 +508,17 @@ Examples:
         max_generations=max(1, generations),
         max_steps_per_branch=max(1, steps_per_branch),
         max_steps_without_improvement=max(1, steps_without_improvement),
-        max_llm_calls=max(1, max_llm_calls),
+        max_llm_calls=0 if args.no_llm else max(1, max_llm_calls),
         min_wns_delta=max(0.0, min_wns_delta),
         min_wns_per_minute=max(0.0, min_wns_per_minute),
-        max_runtime_minutes=args.max_runtime_minutes if args.max_runtime_minutes and args.max_runtime_minutes > 0 else None,
-        max_cost=args.max_cost if args.max_cost and args.max_cost > 0 else None,
-        stop_when_timing_met=not args.continue_after_timing_met,
+        max_runtime_minutes=args.max_runtime_minutes,
+        max_cost=args.max_cost,
         wall_clock_limit_seconds=max(0.0, args.wall_clock_limit_seconds),
+        **adaptive_config,
     )
 
     optimizer = DCPOptimizer(
-        api_key=args.api_key,
+        api_key=args.api_key or "no-llm",
         model=args.model,
         debug=args.debug,
         run_dir=run_dir,

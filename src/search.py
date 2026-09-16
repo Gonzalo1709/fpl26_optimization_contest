@@ -24,8 +24,16 @@ class GenerationSearchConfig:
     min_wns_per_minute: float = 0.0
     max_runtime_minutes: Optional[float] = None
     max_cost: Optional[float] = None
-    stop_when_timing_met: bool = True
+    stop_when_timing_met: bool = False
     wall_clock_limit_seconds: float = 3600.0
+    validation_reserve_seconds: float = 600.0
+    score_aware_stopping: bool = True
+    deterministic_steps: int = 3
+    outcome_memory_path: str | None = "optimizer_outcomes.sqlite3"
+    enable_retiming: bool = False
+    equivalence_command: tuple[str, ...] = ()
+    equivalence_timeout_seconds: float = 300.0
+    refresh_evidence: bool = True
 
 
 @dataclass
@@ -49,6 +57,10 @@ class SearchCandidate:
     projected_score: float = 0.0
     validation: ValidationStatus = field(default_factory=ValidationStatus)
     validated_score: Optional[float] = None
+    checkpoint_sha256: str | None = None
+    constraint_sha256: str | None = None
+    evidence: dict | None = None
+    equivalence_proof: dict | None = None
 
 
 def should_stop_fast_search(
@@ -56,9 +68,10 @@ def should_stop_fast_search(
     root: SearchCandidate,
     best: SearchCandidate,
 ) -> bool:
-    """Return whether a scored fast search has earned early termination."""
+    """Legacy fast-profile stop, disabled under the adaptive economic policy."""
     return (
-        config.budget_profile == "fast"
+        not config.score_aware_stopping
+        and config.budget_profile == "fast"
         and best.projected_score > 0
         and root.wns is not None
         and best.wns is not None

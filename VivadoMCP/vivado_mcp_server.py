@@ -290,7 +290,7 @@ def get_critical_high_fanout_nets(
     run_tcl_command("puts {fanout_analysis_start}", timeout=5)
     
     # Generate detailed timing report for multiple paths
-    cmd = f"report_timing -return_string -max_paths {num_paths} -delay_type max -sort_by slack"
+    cmd = f"set clk [get_clocks clk_fpl26contest]; if {{![llength $clk]}} {{error {{contest clock missing}}}}; report_timing -to $clk -return_string -max_paths {num_paths} -delay_type max -sort_by slack"
     
     try:
         timing_report = run_tcl_command(cmd, timeout=timeout)
@@ -497,7 +497,7 @@ def extract_critical_path_cells(
     pin_suffixes = ['/C', '/D', '/Q', '/O', '/CE', '/R', '/S', '/CLR', '/PRE',
                     '/I0', '/I1', '/I2', '/I3', '/I4', '/I5', '/I6']
     # Generate detailed timing report
-    cmd = f"report_timing -return_string -max_paths {num_paths} -delay_type max -sort_by slack -nworst 1"
+    cmd = f"set clk [get_clocks clk_fpl26contest]; if {{![llength $clk]}} {{error {{contest clock missing}}}}; report_timing -to $clk -return_string -max_paths {num_paths} -delay_type max -sort_by slack -nworst 1"
     
     try:
         timing_report = run_tcl_command(cmd, timeout=timeout)
@@ -585,7 +585,7 @@ def extract_critical_path_pins(
     import re
     import json
 
-    cmd = f"report_timing -return_string -max_paths {num_paths} -delay_type max -sort_by slack -nworst 1"
+    cmd = f"set clk [get_clocks clk_fpl26contest]; if {{![llength $clk]}} {{error {{contest clock missing}}}}; report_timing -to $clk -return_string -max_paths {num_paths} -delay_type max -sort_by slack -nworst 1"
 
     try:
         timing_report = run_tcl_command(cmd, timeout=timeout)

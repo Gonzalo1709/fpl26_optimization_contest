@@ -20,3 +20,4 @@ branching_sweep_logs/*
 .*
 
 run-*/
+optimizer_outcomes.sqlite3*

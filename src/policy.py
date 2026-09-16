@@ -6,6 +6,7 @@ from typing import Iterable
 
 from src.analysis import DesignSignature
 from src.scoring import ValidationStatus
+from src.recipes import GRANULAR_FLAGS
 
 
 MAX_ROUTE_PRESERVE_NETS = 8
@@ -69,22 +70,23 @@ def apply_action_cooldowns(
         failed = item.get("error") is not None or item.get("wns") is None
         delta = item.get("delta_wns")
         inert = isinstance(delta, (int, float)) and not isinstance(delta, bool) and delta <= 0.0
-        if failed or inert:
+        if failed or inert or item.get("attempted_from_state"):
             cooldowns.add(_action_key(str(strategy), item.get("args")))
 
     filtered = []
     for action in actions:
-        if action.allowed_args.get("directive"):
+        parameter = next((name for name in ("directive", "flag") if action.allowed_args.get(name)), None)
+        if parameter:
             directives = [
-                directive for directive in action.allowed_args["directive"]
-                if _action_key(action.strategy, {"directive": directive}) not in cooldowns
+                directive for directive in action.allowed_args[parameter]
+                if _action_key(action.strategy, {parameter: directive}) not in cooldowns
             ]
             if not directives:
                 continue
             default = action.default_args
-            if default.get("directive") not in directives:
-                default = {**default, "directive": directives[0]}
-            filtered.append(EligibleAction(action.strategy, default, {**action.allowed_args, "directive": directives}, action.reason))
+            if default.get(parameter) not in directives:
+                default = {**default, parameter: directives[0]}
+            filtered.append(EligibleAction(action.strategy, default, {**action.allowed_args, parameter: directives}, action.reason))
         elif _action_key(action.strategy, action.default_args) not in cooldowns:
             filtered.append(action)
     return tuple(filtered)
@@ -319,6 +321,9 @@ def gate_actions(
     budget: BudgetState | None = None,
     history: Iterable[dict] = (),
     validation: ValidationStatus | None = None,
+    *,
+    enable_retiming: bool = False,
+    equivalence_ready: bool = False,
 ) -> tuple[EligibleAction, ...]:
     """Return only recipes supported by current evidence and remaining budget."""
     budget = budget or BudgetState()
@@ -524,4 +529,34 @@ def gate_actions(
             )
         )
 
-    return apply_action_cooldowns(actions, history)
+    remaining = budget.remaining_runtime_seconds - budget.validation_reserve_seconds
+    implementation_clean = validation is not None and validation.implementation_passed
+    if implementation_clean and remaining >= 180:
+        actions.append(EligibleAction(
+            "GRANULAR_PHYS_OPT", {"flag": "critical_pin_opt"}, {"flag": list(GRANULAR_FLAGS)},
+            "isolated physical flags can improve the routed critical paths without a broad directive",
+        ))
+    if implementation_clean and signature.failing_endpoints is not None and 0 < signature.failing_endpoints <= 2000 and remaining >= 360:
+        actions.append(EligibleAction(
+            "SCOPED_PHYS_OPT", {"num_paths": min(100, max(1, signature.failing_endpoints))}, {},
+            "a bounded failing population supports endpoint-focused physical optimization",
+        ))
+    if implementation_clean and spread and spread.paths_analyzed >= 3 and spread.avg_distance >= 30 and remaining >= 900:
+        actions.append(EligibleAction(
+            "PARTIAL_REPLACE", {"num_paths": 50, "max_cells": 200}, {},
+            "spread critical paths justify re-placing a bounded fabric subset while retaining hard macros",
+        ))
+    if implementation_clean and signature.high_fanout_candidates and remaining >= 360:
+        actions.append(EligibleAction(
+            "TARGETED_REPLICATION", {"max_nets": min(3, len(signature.high_fanout_candidates))}, {},
+            "measured critical non-clock fanout nets support targeted Vivado replication",
+        ))
+    logic_pct = (signature.timing_anatomy or {}).get("avg_logic_delay_pct")
+    if (enable_retiming and equivalence_ready and implementation_clean and remaining >= 1200
+            and signature.wns_ns is not None and signature.wns_ns < 0
+            and logic_pct is not None and logic_pct >= 50):
+        actions.append(EligibleAction(
+            "RETIME", {"directive": "AddRetime"}, {"directive": ["AddRetime", "AlternateFlowWithRetiming"]},
+            "logic-heavy violations justify an isolated retiming experiment with sequential-equivalence admission",
+        ))
+    return apply_action_cooldowns(actions, history) or (EligibleAction("NO_OP", reason="all state-local actions exhausted"),)

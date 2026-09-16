@@ -1,6 +1,7 @@
 """Serializable, target-clock-specific design analysis records."""
 
 from dataclasses import asdict, dataclass
+import math
 
 from src.parsers import (
     parse_congestion_report,
@@ -15,7 +16,7 @@ from src.scoring import target_clock_fmax_mhz
 
 def require_target_clock_wns(wns_ns: float | None) -> float:
     """Reject analysis that cannot authoritatively measure the contest clock."""
-    if wns_ns is None:
+    if wns_ns is None or not math.isfinite(wns_ns):
         raise RuntimeError("Unable to measure WNS for required clock clk_fpl26contest")
     return wns_ns
 

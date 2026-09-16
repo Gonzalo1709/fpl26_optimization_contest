@@ -287,7 +287,7 @@ python3 dcp_optimizer.py input.dcp --budget-profile cost --max-runtime-minutes 4
 python3 dcp_optimizer.py input.dcp --search-mode linear
 ```
 
-By default, full agent mode uses a generation search controller. It saves checkpoints for several branches, allows a branch to keep going through temporary WNS regressions, prunes only after the branch fails to beat its own highest WNS for the configured patience, and copies the best checkpoint found to the output path.
+Full agent mode uses a shared adaptive controller for generation or linear search. It first runs feature-selected deterministic recipes, then explores admitted checkpoints with state-local action memory. Physical checks and unchanged timing constraints gate publication; the delivered artifact is selected independently of historical discovery cost. Default stopping uses measured incremental score forecasts, with generation, step, cost and wall-clock limits as hard bounds. See [Adaptive optimizer upgrades](docs/strategy/adaptive-optimizer-upgrades.md) for the new recipes, outcome memory, and opt-in retiming contract.
 
 ### Command Line Options
 
@@ -314,7 +314,13 @@ By default, full agent mode uses a generation search controller. It saves checkp
 | `--min-wns-per-minute` | Minimum WNS gain per recipe runtime minute needed to reset patience | Profile default |
 | `--max-runtime-minutes` | Stop starting new search steps after this wall-clock budget | None |
 | `--max-cost` | Stop starting new LLM-guided search steps after this OpenRouter cost in USD | None |
-| `--continue-after-timing-met` | Continue search after WNS reaches 0 | False |
+| `--continue-after-timing-met` | Continue search after WNS reaches 0 (now the default) | True |
+| `--stop-when-timing-met` | Explicitly stop at timing closure | False |
+| `--no-llm` | Run the generic deterministic portfolio without an API key | False |
+| `--deterministic-steps` | Feature-selected attempts before LLM planning | 3 |
+| `--outcome-memory` | Persistent feature-based recipe outcomes | optimizer_outcomes.sqlite3 |
+| `--enable-retiming` | Enable retiming with a configured sequential-equivalence checker | False |
+| `--equivalence-command` | JSON argv file for that checker | None |
 
 With `make run_optimizer`, pass generation controls through `OPT_ARGS`:
 

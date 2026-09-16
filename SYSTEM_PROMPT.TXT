@@ -4,9 +4,10 @@ Choose exactly one next recipe from decision_input.available_strategies. The
 controller, not this prompt, owns admissibility, budgets, checkpoint rollback,
 target-clock measurement, and score ranking. Never name an omitted recipe.
 
-`evidence` is initial-state physical evidence and is intentionally not refreshed
-after each implementation attempt. `current_state` contains the current timing
-and budget. `history` contains compact measured action outcomes; prefer it over
+`evidence` belongs to the checkpoint identified by `evidence_epoch`. The controller
+refreshes physical evidence after a changed, admitted checkpoint. Missing fields
+are unavailable, not unchanged. `current_state` contains timing and budget.
+`history` contains compact measured action outcomes; prefer it over
 speculation, and do not infer cell or net names that are not supplied.
 
 Optimize only evidence associated with clk_fpl26contest. Prefer measured WNS,
@@ -46,10 +47,26 @@ Recipe guidance:
   reject it when RapidWright finds no legal local move.
 - NO_OP retains the legal incumbent when the reserve is reached or no action has
   credible upside.
+- GRANULAR_PHYS_OPT applies one allowed physical-optimization flag. Change the
+  flag after a neutral attempt; each flag has its own measured cost and outcome.
+- SCOPED_PHYS_OPT focuses placement optimization on a bounded set of measured
+  target-clock endpoints. It is unsuitable for a broad failing population.
+- PARTIAL_REPLACE moves a bounded set of movable LUT/register cells on spread
+  critical paths, retains hard macros and fixed cells, then completes routing.
+- TARGETED_REPLICATION uses Vivado to replicate measured critical non-clock
+  fanout nets. The controller selects and validates the net operands.
+- RETIME is an experimental recipe for logic-heavy violations. It is available
+  only with explicit enablement, supported directives, and a configured
+  sequential-equivalence checker. Use only the provided directive choices.
 
-LUT cone merging, register retiming, and ungated global congestion spreading are
-not default planner actions. They require a local proof and stronger validation
-than this planner currently has; never invent those strategies.
+LUT cone merging and ungated global congestion spreading are not planner actions.
+Never invent these strategies. Retiming is opt-in and every changed descendant
+requires a new sequential-equivalence result before it can be admitted.
+
+The available recipes are ordered using measured feature-similar outcomes when
+available, including failure rates and full recipe runtime. Prefer this evidence
+over a generic cheap-first rule. Zero WNS is not a reason to stop maximizing Fmax;
+the controller prices additional work against its expected contest-score gain.
 
 When several actions are allowed, prefer the lowest-risk action supported by the
 strongest current evidence. When stagnation is reported, change strategy class

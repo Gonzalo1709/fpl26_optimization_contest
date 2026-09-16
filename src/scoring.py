@@ -15,6 +15,19 @@ class ValidationStatus:
     simulation_passed: bool | None = None
 
     @property
+    def implementation_passed(self) -> bool:
+        return all(value is True for value in (
+            self.par_routed, self.par_drc_clean, self.hold_passed, self.pulse_width_passed,
+        ))
+
+    @property
+    def failed(self) -> bool:
+        return any(value is False for value in (
+            self.par_routed, self.par_drc_clean, self.hold_passed,
+            self.pulse_width_passed, self.structural_passed, self.simulation_passed,
+        ))
+
+    @property
     def complete(self) -> bool:
         return all(
             value is not None
@@ -80,7 +93,7 @@ def classify_score_status(
     validation: ValidationStatus,
 ) -> str:
     """Explain whether a score is positive, clamped, pending, or invalid."""
-    if validation.complete and not validation.passed:
+    if validation.failed:
         return "validation_failed"
     if delta_fmax_mhz < 0:
         return "negative_gain_clamped"
@@ -104,7 +117,9 @@ def calculate_contest_score(score_input: ContestScoreInput) -> ContestScore:
         score_input.delta_fmax_mhz * penalty_multiplier,
     )
 
-    if score_input.validation.complete:
+    if score_input.validation.failed:
+        validated_score = 0.0
+    elif score_input.validation.complete:
         validated_score = projected_score if score_input.validation.passed else 0.0
     else:
         validated_score = None

@@ -1,6 +1,6 @@
 # Generic optimizer improvements
 
-This change set makes recipe selection depend on observable DCP evidence rather
+This earlier change set makes recipe selection depend on observable DCP evidence rather
 than benchmark names or hard-coded design identities.  It does not add retiming
 or other netlist-changing transforms: those require a separate equivalence and
 legality proof before they are safe as generic actions.
@@ -56,3 +56,5 @@ blocks are present but are unrelated to the timing issue.
 hard-block topology extraction, cost-aware reimplementation eligibility, and
 directive-specific cooldown behavior.  Existing implementation, checkpoint,
 route, hold, pulse-width, and DRC publish gates remain unchanged.
+
+The later [adaptive optimizer upgrades](strategy/adaptive-optimizer-upgrades.md) add checkpoint admission, persistent outcomes, new bounded recipes and opt-in retiming. That document describes the current search and stopping behavior.
