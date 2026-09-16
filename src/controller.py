@@ -62,7 +62,10 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
 """, "timeout": 30})
         match = re.findall(r"(?m)^FPL26_PORTS_HEX=([0-9a-fA-F]+)\s*$", result)
         if not match:
-            raise ValueError("Port names and directions are unavailable")
+            raise ValueError(
+                "Port names and directions are unavailable: expected "
+                f"FPL26_PORTS_HEX in Vivado response, received {result[:500]!r}"
+            )
         return match[-1].lower()
 
     async def _refresh_current_evidence(self, candidate: SearchCandidate):
@@ -395,7 +398,10 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                 await self._search_portfolio(analysis, generations=False)
         except Exception as exc:
             self._stop_reason = f"stopped: {exc}"
-            logger.exception("Optimizer stopped; retaining the admitted output")
+            if self.best_candidate is None:
+                logger.exception("Optimizer stopped before any output was admitted")
+            else:
+                logger.exception("Optimizer stopped; retaining the admitted output")
         return self._finish_search()
 
     def _finish_search(self) -> bool:

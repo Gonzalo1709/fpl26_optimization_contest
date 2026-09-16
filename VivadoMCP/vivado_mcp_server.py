@@ -18,6 +18,7 @@ import re
 import signal
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -222,10 +223,29 @@ def run_tcl_command(command: str, timeout: Optional[float] = None) -> str:
     cmd_log = command if len(command) < 200 else command[:200] + "..."
     logger.info(f"Executing Tcl command: {cmd_log}")
     
-    # Send command
-    proc.sendline(command)
-    
+    # One request must produce one interactive prompt. Sending a multiline
+    # script directly lets blank lines and complete intermediate statements
+    # produce prompts before the whole request has finished. Source a file
+    # instead; this also avoids terminal line-length limits for large recipes.
+    script_path = None
+    wire_command = command
+    if "\n" in command or "\r" in command:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".tcl", prefix="fpl26-command-",
+            delete=False,
+        ) as script:
+            script_path = Path(script.name)
+            script.write(command)
+        # Encode only the path so spaces, braces, backslashes and substitutions
+        # cannot change the source command. The script itself stays unchanged.
+        encoded_path = str(script_path.resolve()).encode("utf-8").hex()
+        wire_command = (
+            "source -encoding utf-8 "
+            f"[encoding convertfrom utf-8 [binary decode hex {{{encoded_path}}}]]"
+        )
+
     try:
+        proc.sendline(wire_command)
         # Wait for prompt and capture output
         proc.expect(VIVADO_PROMPT, timeout=effective_timeout)
         
@@ -234,7 +254,7 @@ def run_tcl_command(command: str, timeout: Optional[float] = None) -> str:
         
         # Remove the echoed command from output (first line)
         lines = output.split("\n")
-        if lines and command in lines[0]:
+        if lines and wire_command in lines[0]:
             output = "\n".join(lines[1:])
         
         logger.info(f"Command completed successfully")
@@ -243,8 +263,19 @@ def run_tcl_command(command: str, timeout: Optional[float] = None) -> str:
     except pexpect.TIMEOUT:
         # Mark that we have a pending command
         _command_pending = True
+        # Vivado may still need this file. Preserve it on timeout rather than
+        # deleting an input belonging to an in-flight command.
+        if script_path is not None:
+            logger.warning("Preserving pending Tcl script: %s", script_path)
+            script_path = None
         logger.error(f"Command timed out after {effective_timeout}s: {cmd_log}")
         raise
+    finally:
+        if script_path is not None:
+            try:
+                script_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove completed Tcl script: %s", script_path)
 
 
 def restart_vivado_process() -> str:
