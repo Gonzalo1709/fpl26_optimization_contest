@@ -245,6 +245,12 @@ Examples:
     parser.add_argument("--equivalence-command", type=Path, help="JSON file containing the checker argv array; golden, revised, report paths are appended")
     parser.add_argument("--equivalence-timeout-seconds", type=float, default=300, help="Maximum sequential-equivalence time per candidate")
     parser.add_argument("--no-refresh-evidence", action="store_true", help="Ablation: clear physical evidence on changed checkpoints instead of refreshing")
+    parser.add_argument("--no-final-validation", action="store_true", help="Diagnostic ablation: publish implementation-admitted outputs without the final functional gate")
+    parser.add_argument("--final-validation-timeout-seconds", type=float, default=480, help="Maximum final structural/simulation validation time")
+    parser.add_argument("--final-validation-vectors", type=int, default=1000, help="Random simulation vectors for final validation")
+    parser.add_argument("--no-physical-diversity", action="store_true", help="Ablation: retain timing-only beam selection")
+    parser.add_argument("--no-enabling-moves", action="store_true", help="Ablation: disable evidence-backed intermediate candidate pool")
+    parser.add_argument("--no-targeted-actions", action="store_true", help="Ablation: disable current-path targeted physical actions")
     parser.add_argument("--no-llm", action="store_true", help="Run the generic deterministic portfolio without an API key")
     parser.add_argument(
         "--wall-clock-limit-seconds",
@@ -307,9 +313,12 @@ Examples:
     )
 
     args = parser.parse_args()
+    import math
+    if (not math.isfinite(args.final_validation_timeout_seconds)
+            or args.final_validation_timeout_seconds <= 0 or args.final_validation_vectors <= 0):
+        parser.error("Final validation requires a finite positive timeout and positive vector count")
     if args.stop_when_timing_met and args.continue_after_timing_met:
         parser.error("Choose only one timing-closure behavior")
-    import math
     for field in ("validation_reserve_seconds", "equivalence_timeout_seconds", "wall_clock_limit_seconds",
                   "max_runtime_minutes", "max_cost", "min_wns_delta", "min_wns_per_minute"):
         value = getattr(args, field)
@@ -327,6 +336,12 @@ Examples:
     if args.enable_retiming and (not equivalence_command or args.equivalence_timeout_seconds <= 0):
         parser.error("Retiming requires --equivalence-command and a positive equivalence timeout")
     adaptive_config = dict(
+        strict_final_validation=not args.no_final_validation,
+        final_validation_timeout_seconds=args.final_validation_timeout_seconds,
+        final_validation_vectors=args.final_validation_vectors,
+        physical_diversity=not args.no_physical_diversity,
+        enabling_pool_size=0 if args.no_enabling_moves else 4,
+        targeted_actions=not args.no_targeted_actions,
         stop_when_timing_met=args.stop_when_timing_met,
         validation_reserve_seconds=args.validation_reserve_seconds,
         score_aware_stopping=not args.no_score_aware_stopping,

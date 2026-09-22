@@ -9,6 +9,8 @@ Contest website can be found here: https://xilinx.github.io/fpl26_optimization_c
 
 An example LLM-powered autonomous agent that optimizes FPGA designs for timing using RapidWright and Vivado optimizations and tools via MCP (Model Context Protocol) servers.
 
+The `test/pact` integration adds targeted physical actions, physically diverse search, bounded intermediate moves, and strict final structural/simulation validation. See [changes, justifications, controls, and verification limits](docs/strategy/pact-integrated-features.md). Optimized candidates are published only after final validation by default; failed validation restores the original input.
+
 ## Contents
 
 - [Overview](#overview)

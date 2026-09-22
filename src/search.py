@@ -34,6 +34,16 @@ class GenerationSearchConfig:
     equivalence_command: tuple[str, ...] = ()
     equivalence_timeout_seconds: float = 300.0
     refresh_evidence: bool = True
+    strict_final_validation: bool = True
+    final_validation_timeout_seconds: float = 480.0
+    final_validation_vectors: int = 1000
+    physical_diversity: bool = True
+    enabling_pool_size: int = 4
+    enabling_max_depth: int = 2
+    enabling_lifetime_seconds: float = 600.0
+    enabling_regression_ns: float = 0.010
+    enabling_budget_seconds: float = 600.0
+    targeted_actions: bool = True
 
 
 @dataclass

@@ -19,6 +19,8 @@ from src.equivalence import prove_sequential_equivalence
 from src.outcome_memory import OutcomeMemory, feature_vector, forecast
 from src.policy import EligibleAction, should_attempt_reimplementation
 from src.search import SearchCandidate
+from src.pact_search import EnablingPool, diverse_beam, physical_features
+from src.submission import validate_submission
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,14 @@ class AdaptiveController:
         self._stop_reason = None
         self._golden_dcp = None
         self._policy_decisions = []
+        cfg = self.generation_config
+        self._enabling = EnablingPool(cfg.enabling_pool_size, cfg.enabling_max_depth,
+                                     cfg.enabling_lifetime_seconds, cfg.enabling_regression_ns)
+        self._enabling_seconds = 0.0
+        self._action_evidence = None
+        self._final_evidence = None
+        self._delivered_candidate = None
+        self._final_validation_ok = True
         self._admission_dir = self.run_dir / "admission"
         self._admission_dir.mkdir(parents=True, exist_ok=True)
 
@@ -185,19 +195,31 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         output = self.output_dcp
         if output is None:
             raise ValueError("Output path is not configured")
+        if self.generation_config.strict_final_validation and candidate is not self._baseline_candidate:
+            # Search incumbents are speculative until the final two-phase check.
+            self.best_candidate = candidate
+            self.best_wns = self._published_wns = candidate.wns
+            self.validation_status = candidate.validation
+            logger.info("Admitted search incumbent %s; final validation pending", candidate.candidate_id)
+            return True
         output.parent.mkdir(parents=True, exist_ok=True)
+        source = candidate.dcp_path
+        digest = candidate.checkpoint_sha256
+        if self.generation_config.strict_final_validation and candidate is self._baseline_candidate:
+            source, digest = self._golden_dcp, self._input_sha256
         temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.wip")
         try:
-            shutil.copyfile(candidate.dcp_path, temporary)
+            shutil.copyfile(source, temporary)
             with temporary.open("rb") as handle:
                 os.fsync(handle.fileno())
-            if sha256_file(temporary) != candidate.checkpoint_sha256:
+            if sha256_file(temporary) != digest:
                 raise ValueError("Checkpoint copy checksum failed")
             temporary.replace(output)
         finally:
             temporary.unlink(missing_ok=True)
         # No state assignment occurs before the atomic replacement succeeds.
         self.best_candidate = candidate
+        self._delivered_candidate = replace(candidate, dcp_path=source, checkpoint_sha256=digest)
         self.best_wns = self._published_wns = candidate.wns
         self.validation_status = candidate.validation
         self._write_artifact_manifest()
@@ -207,7 +229,7 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
     def _write_artifact_manifest(self):
         if self.best_candidate is None:
             return
-        candidate = self.best_candidate
+        candidate = self._delivered_candidate or self.best_candidate
         payload = {
             "schema_version": 1, "run_id": self._run_id, "candidate_id": candidate.candidate_id,
             "output_path": str(self.output_dcp), "sha256": candidate.checkpoint_sha256,
@@ -220,6 +242,8 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             "llm_cost_usd": self.total_cost, "config": asdict(self.generation_config),
             "llm_cost_verified": not self._llm_cost_unknown,
             "stop_reason": self._stop_reason,
+            "final_validation": self._final_evidence,
+            "search_best_candidate_id": self.best_candidate.candidate_id,
         }
         target = self.run_dir / "published_artifact.json"
         temporary = target.with_suffix(".tmp")
@@ -232,6 +256,24 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         Ineligible measured variants are removed from the actual schema, so the
         planner cannot resurrect them by supplying a non-default argument.
         """
+        actions = list(actions)
+        cfg = self.generation_config
+        if (cfg.targeted_actions and self.design_signature and self.validation_status.implementation_passed
+                and not any(a.strategy == "REIMPLEMENTATION" for a in actions)):
+            available = self._current_budget_state().remaining_runtime_seconds - cfg.validation_reserve_seconds
+            if available >= 360 and (self.design_signature.timing_anatomy or {}).get("route_dominated"):
+                actions.append(EligibleAction("CRITICAL_NET_REROUTE", {"max_nets": 4}, {},
+                                              "current critical path terminal nets in a route-dominated design"))
+                actions.append(EligibleAction("CRITICAL_BRANCH_REROUTE", {"max_pins": 4}, {},
+                                              "bounded current critical sink branches, preserving other net branches"))
+            spread = self.design_signature.path_spread
+            if available >= 900 and spread and spread.paths_analyzed >= 3 and spread.avg_distance >= 30:
+                actions.append(EligibleAction("PATH_LOCAL_REPLACE", {"max_cells": 20}, {},
+                                              "movable terminal cells on spatially spread critical paths"))
+            from src.policy import apply_action_cooldowns
+            actions = list(apply_action_cooldowns(actions, self._planning_history))
+            if any(a.strategy != "NO_OP" for a in actions):
+                actions = [a for a in actions if a.strategy != "NO_OP"]
         signature = feature_vector(self.design_signature)
         budget = self._current_budget_state()
         elapsed = time.time() - self.start_time if self.start_time else 0
@@ -284,7 +326,19 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         return tuple(item[2] for item in ranked) or (EligibleAction("NO_OP", reason="no admissible action has credible remaining value"),)
 
     async def _attempt(self, parent: SearchCandidate, strategy: str, args: dict, *, llm_cost: float = 0) -> SearchCandidate:
+        await self._restore_candidate_state(parent)
+        permitted = next((a for a in self._eligible_actions() if a.strategy == strategy), None)
+        if (strategy == "REIMPLEMENTATION" and parent is self._baseline_candidate
+                and should_attempt_reimplementation(self.design_signature, self._current_budget_state())):
+            permitted = next((a for a in self._adaptive_actions((EligibleAction("REIMPLEMENTATION"),))
+                              if a.strategy == strategy), None)
+        if permitted is None:
+            raise ValueError(f"Action {strategy} is no longer eligible on this exact seed")
+        for key, values in permitted.allowed_args.items():
+            if key in args and isinstance(values, (tuple, list)) and args[key] not in values:
+                raise ValueError(f"Action parameter {key} is outside the current-seed contract")
         started = time.time()
+        self._action_evidence = None
         before_features = feature_vector(self.design_signature)
         record = {"run_id": self._run_id, "state_sha256": parent.checkpoint_sha256,
                   "attempted_from_state": True,
@@ -292,6 +346,10 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                   "tool_version": self._tool_version, "part": self._part,
                   "llm_cost_usd": llm_cost, "previous_wns": parent.wns,
                   "implementation_passed": False, "delta_fmax_mhz": None}
+        record["action_contract"] = {"seed_sha256": parent.checkpoint_sha256,
+                                     "strategy": strategy, "args": args,
+                                     "reason": permitted.reason,
+                                     "physical_before": physical_features(parent)}
         child = None
         try:
             self._loaded_sha256 = None
@@ -303,9 +361,12 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                           candidate_sha256=child.checkpoint_sha256, equivalence_proof=child.equivalence_proof)
             self._publish_admitted(child)
             neutral = abs(child.wns - parent.wns) <= self.generation_config.min_wns_delta
-            if ((not neutral or child is self.best_candidate)
-                    and self._current_budget_state().remaining_runtime_seconds > self.generation_config.validation_reserve_seconds):
+            if self._current_budget_state().remaining_runtime_seconds > self.generation_config.validation_reserve_seconds:
                 await self._refresh_current_evidence(child)
+            record["action_evidence"] = self._action_evidence
+            record["physical_after"] = physical_features(child)
+            if child.wns <= parent.wns + self.generation_config.min_wns_delta:
+                record["enabling_retained"] = self._enabling.retain(parent, child, strategy, time.time())
             if neutral:
                 # A no-op checkpoint has a different container hash after writing;
                 # preserve the same search state so it cannot evade cooldowns.
@@ -319,6 +380,7 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             child = None
             await self._restore_candidate_state(parent)
         finally:
+            record["action_evidence"] = self._action_evidence
             record["llm_cost_verified"] = not self._llm_cost_unknown
             record["elapsed_seconds"] = max(0.0, time.time() - started)
             self.history.append(record)
@@ -392,17 +454,70 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
     async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
         try:
             analysis = await self._initialize_search(input_dcp, output_dcp)
-            if self.generation_config.enabled:
-                await self._search_portfolio(analysis, generations=True)
-            else:
-                await self._search_portfolio(analysis, generations=False)
+            remaining = self._current_budget_state().remaining_runtime_seconds
+            search_seconds = remaining - self.generation_config.validation_reserve_seconds
+            if search_seconds > 0:
+                await asyncio.wait_for(self._search_portfolio(analysis, generations=self.generation_config.enabled),
+                                       search_seconds)
         except Exception as exc:
             self._stop_reason = f"stopped: {exc}"
             if self.best_candidate is None:
                 logger.exception("Optimizer stopped before any output was admitted")
             else:
                 logger.exception("Optimizer stopped; retaining the admitted output")
+        await self._finalize_submission()
         return self._finish_search()
+
+    async def _finalize_submission(self):
+        if not self.generation_config.strict_final_validation or self.best_candidate is None:
+            return
+        candidate = self.best_candidate
+        try:
+            if sha256_file(self._golden_dcp) != self._input_sha256:
+                raise ValueError("Golden checkpoint changed after initialization")
+            if candidate is self._baseline_candidate:
+                self._final_evidence = {"method": "unchanged_input_identity", "sha256": self._input_sha256}
+                source, digest = self._golden_dcp, self._input_sha256
+            else:
+                if sha256_file(candidate.dcp_path) != candidate.checkpoint_sha256:
+                    raise ValueError("Selected checkpoint changed after admission")
+                # Close search servers before spawning the validator's own tools.
+                # MCP's AsyncExitStack owns task-local AnyIO cancel scopes:
+                # close in the task that opened them, never via wait_for's task.
+                await self.cleanup()
+                timeout = min(self.generation_config.final_validation_timeout_seconds,
+                              self.generation_config.wall_clock_limit_seconds - (time.time()-self.start_time) - 15)
+                self._final_evidence = await validate_submission(
+                    self._golden_dcp, candidate.dcp_path, self.run_dir, timeout,
+                    self.generation_config.final_validation_vectors)
+                source, digest = candidate.dcp_path, candidate.checkpoint_sha256
+            candidate.validation = replace(candidate.validation, structural_passed=True, simulation_passed=True)
+        except Exception as exc:
+            logger.exception("Final candidate rejected; restoring original input")
+            self._final_validation_ok = False
+            self._stop_reason = f"final validation failed: {exc}"
+            self._final_evidence = {"passed": False, "error": str(exc), "fallback": "unchanged_input_identity",
+                                    "attempted_sha256": candidate.checkpoint_sha256,
+                                    "golden_sha256": self._input_sha256}
+            candidate = self._baseline_candidate
+            source, digest = self._golden_dcp, self._input_sha256
+            candidate.validation = replace(candidate.validation, structural_passed=True, simulation_passed=True)
+        if sha256_file(source) != digest:
+            raise ValueError("Final artifact changed before publication")
+        temporary = self.output_dcp.with_name(f".{self.output_dcp.name}.{uuid.uuid4().hex}.wip")
+        try:
+            shutil.copyfile(source, temporary)
+            if sha256_file(temporary) != digest:
+                raise ValueError("Final artifact copy changed bytes")
+            temporary.replace(self.output_dcp)
+        finally:
+            temporary.unlink(missing_ok=True)
+        # Baseline fallback is the original bytes, rather than a rewritten DCP.
+        if candidate is self._baseline_candidate:
+            candidate = replace(candidate, dcp_path=self._golden_dcp, checkpoint_sha256=digest)
+        self.best_candidate = self._delivered_candidate = candidate
+        for key, value in self._candidate_score_metadata(candidate.wns, validation=candidate.validation).items():
+            setattr(candidate, key, value)
 
     def _finish_search(self) -> bool:
         self.end_time = time.time()
@@ -416,8 +531,9 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             self._stop_reason = "output missing or changed since admission"
         self._write_artifact_manifest()
         (self.run_dir / "policy_decisions.json").write_text(json.dumps(self._policy_decisions, indent=2), encoding="utf-8")
+        (self.run_dir / "enabling_moves.json").write_text(json.dumps(self._enabling.events, indent=2), encoding="utf-8")
         self._print_optimization_summary()
-        return valid_output
+        return valid_output and self._final_validation_ok
 
     async def _search_portfolio(self, analysis: str, *, generations: bool):
         cfg = self.generation_config
@@ -512,8 +628,34 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                     results.append(current)
             if not results:
                 break
-            unique = {c.checkpoint_sha256: c for c in results}
-            roots = sorted(unique.values(), key=self._candidate_sort_key, reverse=True)[:cfg.beam_width if generations else 1]
+            unique = {c.checkpoint_sha256: c for c in [*results, self.best_candidate]}
+            roots = diverse_beam(unique.values(), cfg.beam_width if generations else 1,
+                                 self._candidate_sort_key, cfg.physical_diversity)
+            # One prescribed follow-up per retained state; consumes the ordinary
+            # wall-clock reserve and a separate total enabling-work allowance.
+            for move in self._enabling.take(time.time()):
+                if time.time() >= move.deadline:
+                    self._enabling.events.append({"state": move.candidate.checkpoint_sha256, "status": "expired_before_execution"})
+                    continue
+                if self._enabling_seconds >= cfg.enabling_budget_seconds or self._should_stop_for_budget():
+                    break
+                await self._restore_candidate_state(move.candidate)
+                action = next((a for a in self._eligible_actions() if a.strategy == move.followup), None)
+                if action is None:
+                    continue
+                if cfg.enabling_budget_seconds - self._enabling_seconds < 360:
+                    break
+                started = time.time()
+                self.iteration += 1
+                allowance = min(cfg.enabling_budget_seconds - self._enabling_seconds,
+                                self._current_budget_state().remaining_runtime_seconds - cfg.validation_reserve_seconds)
+                try:
+                    result = await asyncio.wait_for(
+                        self._attempt(move.candidate, action.strategy, dict(action.default_args)), allowance)
+                finally:
+                    self._enabling_seconds += time.time() - started
+                roots = diverse_beam([*roots, result], cfg.beam_width if generations else 1,
+                                     self._candidate_sort_key, cfg.physical_diversity)
             if all(not any(a.strategy != "NO_OP" for a in self._actions_for_candidate(c)) for c in roots):
                 self._stop_reason = "all surviving states exhausted admissible actions"
                 break
@@ -542,10 +684,15 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                 args["top_n_nets"] = min(10, max(1, top_n_nets))
             if method in {"PHYS_OPT", "PHYS_OPT_REROUTE", "RETIME"} and phys_opt_directive in action.allowed_args.get("directive", []):
                 args["directive"] = phys_opt_directive
-            await self._attempt(self._baseline_candidate, method, args)
+            allowance = self._current_budget_state().remaining_runtime_seconds - self.generation_config.validation_reserve_seconds
+            if allowance <= 0:
+                raise TimeoutError("No transform budget beyond validation reserve")
+            await asyncio.wait_for(self._attempt(self._baseline_candidate, method, args), allowance)
             self._stop_reason = "single method completed"
         except Exception as exc:
             self._stop_reason = f"single method stopped: {exc}"
+            await self._finalize_submission()
             self._finish_search()
             return False
+        await self._finalize_submission()
         return self._finish_search()

@@ -17,6 +17,7 @@ from src.analysis import DesignSignature, require_target_clock_wns
 from src.controller import AdaptiveController
 from src.admission import tagged_number, route_admission, pulse_admission
 from src.recipes import NEW_STRATEGIES, execute_recipe, normalize_recipe
+from src.pact_actions import PACT_STRATEGIES, execute_action, normalize_action
 from src.base import DCPOptimizerBase
 from src.parsers import parse_spread_analysis, parse_timing_summary_static, spread_recommends_pblock
 from src.policy import (
@@ -39,7 +40,7 @@ DEFAULT_MODEL = "openai/gpt-5.6-terra"
 SUPPORTED_SINGLE_METHODS = (
     "PBLOCK", "FANOUT", "CELL_RELOCATE", "PHYS_OPT", "HARD_BLOCK",
     "PHYS_OPT_REROUTE", "PLACEMENT_SHOT", "FULL_PLACE_ROUTE",
-    "CRITICAL_PIN", "ROUTE_PRESERVE", *NEW_STRATEGIES,
+    "CRITICAL_PIN", "ROUTE_PRESERVE", *NEW_STRATEGIES, *PACT_STRATEGIES,
 )
 PLANNER_MAX_TOKENS = 320
 PLANNER_RETRY_MAX_TOKENS = 512
@@ -907,6 +908,8 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         if not isinstance(args, dict):
             args = {}
 
+        if strategy in PACT_STRATEGIES:
+            return strategy, normalize_action(strategy, args)
         if strategy in NEW_STRATEGIES:
             return strategy, normalize_recipe(strategy, args)
 
@@ -1108,6 +1111,8 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         elif strategy == "GRANULAR_PHYS_OPT":
             if args["flag"] not in eligible[strategy].allowed_args.get("flag", []):
                 args = dict(eligible[strategy].default_args)
+        elif strategy in PACT_STRATEGIES:
+            args = normalize_action(strategy, eligible[strategy].default_args)
         elif strategy in NEW_STRATEGIES:
             # Operand counts are controller-costed defaults; the LLM must not
             # expand a bounded action beyond the forecast used to admit it.
@@ -1973,6 +1978,8 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         """Run a chosen recipe and return the timing report plus measured WNS."""
         if strategy == "REIMPLEMENTATION":
             result = await self.run_reimplementation_flow(self._baseline_candidate.dcp_path)
+        elif strategy in PACT_STRATEGIES:
+            result = await execute_action(self, strategy, args)
         elif strategy in NEW_STRATEGIES:
             result = await execute_recipe(self, strategy, args)
         elif strategy == "NO_OP":
@@ -2045,6 +2052,11 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         budget = self._current_budget_state()
         payload = {
             "context_version": 2,
+            "action_contracts": {
+                action.strategy: {"seed_sha256": self._state_candidate.checkpoint_sha256 if self._state_candidate else None,
+                                  "reason": action.reason, "bounded_args": action.default_args}
+                for action in eligible_actions
+            },
             "evidence_epoch": self._state_candidate.candidate_id if self._state_candidate else "initial",
             "evidence": self._planner_evidence(),
             "current_state": {

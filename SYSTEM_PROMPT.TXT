@@ -47,6 +47,10 @@ Recipe guidance:
   reject it when RapidWright finds no legal local move.
 - NO_OP retains the legal incumbent when the reserve is reached or no action has
   credible upside.
+- CRITICAL_NET_REROUTE reroutes a bounded set of unlocked current critical-path
+  terminal nets. CRITICAL_BRANCH_REROUTE changes only selected sink branches.
+- PATH_LOCAL_REPLACE re-places movable fabric cells at current critical-path
+  terminals while keeping other placed primitives fixed. Use provided counts.
 - GRANULAR_PHYS_OPT applies one allowed physical-optimization flag. Change the
   flag after a neutral attempt; each flag has its own measured cost and outcome.
 - SCOPED_PHYS_OPT focuses placement optimization on a bounded set of measured

@@ -41,6 +41,7 @@ Rules for the controller interface:
 - RETIME args: {"directive": one of the provided retiming directives}; never choose it if omitted.
 - Prefer feature-matched measured outcomes and the provided recipe order when available.
 - NO_OP args: {}
+- CRITICAL_NET_REROUTE, CRITICAL_BRANCH_REROUTE and PATH_LOCAL_REPLACE: use the provided counts; the controller selects current-checkpoint targets.
 - Return ONLY JSON.
 """.strip()
 
