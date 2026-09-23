@@ -79,7 +79,7 @@ class EnablingPool:
             if key in before and key in after and before[key] > 0 and after[key] <= before[key] * (1-fraction):
                 reason = f"{key} reduced from {before[key]:.3f} to {after[key]:.3f}"
                 break
-        if reason is None or strategy not in {"PATH_LOCAL_REPLACE", "PARTIAL_REPLACE", "TARGETED_REPLICATION", "CELL_RELOCATE", "PBLOCK"}:
+        if reason is None or strategy not in {"PATH_LOCAL_REPLACE", "PATH_CLUSTER_REPLACE", "PARTIAL_REPLACE", "TARGETED_REPLICATION", "CELL_RELOCATE", "PBLOCK"}:
             return False
         key = child.checkpoint_sha256
         if key in self.moves:

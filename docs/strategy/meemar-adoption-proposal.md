@@ -1,5 +1,7 @@
 # Meemar: proposed transfers and justifications
 
+Implementation update, 2026-09-23: the main transfers are now implemented on `test/meemar`. See [implemented changes, controls, and verification limits](meemar-integrated-features.md). The analysis below records the original proposal.
+
 Source review: 2026-09-22. Meemar revision: [`509a4c10ffa1586f5078fe63754e9fd3471db221`](https://github.com/randomuzbek/meemar-fpl26-optimizer/tree/509a4c10ffa1586f5078fe63754e9fd3471db221). Local comparison: `test/pact`, commit `ca2622038ceb52ee4eb47d87545648ea41bf9eba`, including the PACT integration. The downloaded optimizer's MD5 is `64475899a43e372f4dcf441a254eec9d`, matching the repository's reported scored artifact.
 
 **Status: proposal only.** No optimizer implementation was changed and no tests or FPGA workloads were run for this review. Recommendations below are engineering judgments based on source inspection, not demonstrated improvements to our model.

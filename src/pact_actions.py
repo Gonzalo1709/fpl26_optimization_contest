@@ -6,13 +6,14 @@ Operands are selected in Vivado immediately before mutation, never from LLM text
 import re
 
 
-PACT_STRATEGIES = ("CRITICAL_NET_REROUTE", "CRITICAL_BRANCH_REROUTE", "PATH_LOCAL_REPLACE")
+PACT_STRATEGIES = ("CRITICAL_NET_REROUTE", "CRITICAL_BRANCH_REROUTE", "PATH_LOCAL_REPLACE", "PATH_CLUSTER_REPLACE")
 
 
 def normalize_action(strategy, args):
     limits = {"CRITICAL_NET_REROUTE": ("max_nets", 4, 8),
               "CRITICAL_BRANCH_REROUTE": ("max_pins", 4, 8),
-              "PATH_LOCAL_REPLACE": ("max_cells", 20, 50)}
+              "PATH_LOCAL_REPLACE": ("max_cells", 20, 50),
+              "PATH_CLUSTER_REPLACE": ("max_cells", 80, 160)}
     key, default, maximum = limits[strategy]
     try:
         count = int(args.get(key, default))
@@ -105,6 +106,10 @@ if {$code} {return -options $options $result}
 route_design -directive Explore
 """.replace("LIMIT", str(args["max_cells"]-1))
         timeout = 900
+        if strategy == "PATH_CLUSTER_REPLACE":
+            # Vivado supports cell extraction directly from timing-path objects;
+            # keep the same LUT/FD exclusions and lock-restoration transaction.
+            body = body.replace("get_cells -quiet -of_objects $pins", "get_cells -quiet -of_objects $paths")
     marker = 'puts "PACT_TARGETS_HEX=[binary encode hex [join $selected \\n]]"'
     select_body, separator, mutation = body.partition(marker)
     if not separator:
@@ -116,7 +121,8 @@ route_design -directive Explore
     operands = bytes.fromhex(matches[-1]).decode("utf-8").splitlines()
     optimizer._action_evidence = {"seed_sha256": optimizer._state_candidate.checkpoint_sha256,
                                   "strategy": strategy, "args": args,
-                                  "selection": "current target-clock path terminals",
+                                  "selection": ("current target-clock datapath cells" if strategy == "PATH_CLUSTER_REPLACE"
+                                                else "current target-clock path terminals"),
                                   "targets": operands, "target_count": len(operands)}
     # Freeze exact operands, not patterns. Do not depend on persistent Tcl locals
     # across MCP calls, and record evidence before any mutation can fail.

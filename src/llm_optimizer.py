@@ -10,6 +10,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
+import uuid
 
 from openai import OpenAI
 
@@ -18,6 +19,7 @@ from src.controller import AdaptiveController
 from src.admission import tagged_number, route_admission, pulse_admission
 from src.recipes import NEW_STRATEGIES, execute_recipe, normalize_recipe
 from src.pact_actions import PACT_STRATEGIES, execute_action, normalize_action
+from src.meemar import DENSITIES, execute_density
 from src.base import DCPOptimizerBase
 from src.parsers import parse_spread_analysis, parse_timing_summary_static, spread_recommends_pblock
 from src.policy import (
@@ -40,7 +42,7 @@ DEFAULT_MODEL = "openai/gpt-5.6-terra"
 SUPPORTED_SINGLE_METHODS = (
     "PBLOCK", "FANOUT", "CELL_RELOCATE", "PHYS_OPT", "HARD_BLOCK",
     "PHYS_OPT_REROUTE", "PLACEMENT_SHOT", "FULL_PLACE_ROUTE",
-    "CRITICAL_PIN", "ROUTE_PRESERVE", *NEW_STRATEGIES, *PACT_STRATEGIES,
+    "CRITICAL_PIN", "ROUTE_PRESERVE", "DENSITY_REIMPLEMENTATION", *NEW_STRATEGIES, *PACT_STRATEGIES,
 )
 PLANNER_MAX_TOKENS = 320
 PLANNER_RETRY_MAX_TOKENS = 512
@@ -448,6 +450,11 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
 
         start_time = time.time()
         wns_measured = None
+        monotonic_start = time.monotonic()
+        telemetry = {"call_id": uuid.uuid4().hex, "started_unix": start_time,
+                     "tool_name": tool_name, "iteration": self.iteration,
+                     "requested_timeout_seconds": arguments.get("timeout"),
+                     "completion": "error", "attribution": "client_total_only"}
 
         try:
             logger.info("Calling %s with args: %s...", tool_name, json.dumps(arguments)[:200])
@@ -459,15 +466,17 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             else:
                 result = await session.call_tool(actual_name, arguments)
 
-            if getattr(result, "isError", False):
-                raise ToolExecutionError(f"{tool_name}: MCP reported an error")
             if result.content:
                 text_parts = [chunk.text for chunk in result.content if hasattr(chunk, "text")]
                 result_text = "\n".join(text_parts)
             else:
                 result_text = "(no output)"
 
+            if getattr(result, "isError", False):
+                raise ToolExecutionError(f"{tool_name}: MCP reported an error: {result_text[:1000]}")
+
             self._raise_if_tool_reported_error(tool_name, result_text)
+            telemetry["completion"] = "completed"
 
             if tool_name == "vivado_report_timing_summary":
                 if self.target_clock:
@@ -504,8 +513,10 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             )
             return result_text
         except ToolExecutionError as exc:
+            telemetry["completion"] = "tool_error"
             if "timed out" in str(exc).lower() or "timeout" in str(exc).lower():
                 self._tool_session_poisoned = True
+                telemetry["completion"] = "timeout_uncertain"
             elapsed_time = time.time() - start_time
             self.tool_call_details.append(
                 {
@@ -520,6 +531,7 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             logger.error("Tool call failed: %s", exc)
             raise
         except asyncio.TimeoutError as exc:
+            telemetry["completion"] = "timeout_uncertain"
             self._tool_session_poisoned = True
             elapsed_time = time.time() - start_time
             message = self._wall_clock_message(f"during {tool_name}")
@@ -535,8 +547,13 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             )
             logger.error("Tool call stopped by wall-clock limit: %s", message)
             raise WallClockLimitReached(message) from exc
+        except asyncio.CancelledError:
+            self._tool_session_poisoned = True
+            telemetry["completion"] = "cancelled_uncertain"
+            raise
         except Exception as exc:
             elapsed_time = time.time() - start_time
+            telemetry["completion"] = "error"
             self.tool_call_details.append(
                 {
                     "tool_name": tool_name,
@@ -549,6 +566,16 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             )
             logger.error("Tool call failed: %s", exc)
             raise ToolExecutionError(f"{tool_name} failed: {exc}") from exc
+        finally:
+            telemetry["observed_seconds"] = max(0.0, time.monotonic() - monotonic_start)
+            telemetry["session_uncertain"] = self._tool_session_poisoned
+            # Never infer execution time from a 300-second duration. Server-side
+            # FPL26_COMMAND_EVENT records provide the actual sync/execution split.
+            try:
+                with (self.run_dir / "tool_timeline.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(telemetry, allow_nan=False) + "\n")
+            except OSError as exc:
+                logger.warning("Could not persist tool telemetry: %s", exc)
 
     def _update_best_wns(self, current_wns: float, source: str = "timing_summary"):
         # Timing observations are speculative until checkpoint admission.
@@ -908,6 +935,9 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         if not isinstance(args, dict):
             args = {}
 
+        if strategy == "DENSITY_REIMPLEMENTATION":
+            density = args.get("density", .5)
+            return strategy, {"density": density if density in DENSITIES else .5}
         if strategy in PACT_STRATEGIES:
             return strategy, normalize_action(strategy, args)
         if strategy in NEW_STRATEGIES:
@@ -1110,6 +1140,9 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
                 args = dict(eligible[strategy].default_args)
         elif strategy == "GRANULAR_PHYS_OPT":
             if args["flag"] not in eligible[strategy].allowed_args.get("flag", []):
+                args = dict(eligible[strategy].default_args)
+        elif strategy == "DENSITY_REIMPLEMENTATION":
+            if args["density"] not in eligible[strategy].allowed_args.get("density", []):
                 args = dict(eligible[strategy].default_args)
         elif strategy in PACT_STRATEGIES:
             args = normalize_action(strategy, eligible[strategy].default_args)
@@ -1978,6 +2011,8 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         """Run a chosen recipe and return the timing report plus measured WNS."""
         if strategy == "REIMPLEMENTATION":
             result = await self.run_reimplementation_flow(self._baseline_candidate.dcp_path)
+        elif strategy == "DENSITY_REIMPLEMENTATION":
+            result = await execute_density(self, args)
         elif strategy in PACT_STRATEGIES:
             result = await execute_action(self, strategy, args)
         elif strategy in NEW_STRATEGIES:

@@ -75,7 +75,7 @@ def apply_action_cooldowns(
 
     filtered = []
     for action in actions:
-        parameter = next((name for name in ("directive", "flag") if action.allowed_args.get(name)), None)
+        parameter = next((name for name in ("directive", "flag", "density") if action.allowed_args.get(name)), None)
         if parameter:
             directives = [
                 directive for directive in action.allowed_args[parameter]

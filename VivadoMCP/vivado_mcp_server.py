@@ -13,6 +13,9 @@ Usage:
 import argparse
 import atexit
 import logging
+import json
+import time
+import uuid
 import os
 import re
 import signal
@@ -195,6 +198,29 @@ def sync_after_timeout(proc: pexpect.spawn) -> str:
 
 
 def run_tcl_command(command: str, timeout: Optional[float] = None) -> str:
+    """Record actual execution separately from inherited synchronization wait."""
+    started = time.monotonic()
+    event = {"command_id": uuid.uuid4().hex, "started_unix": time.time(),
+             "requested_timeout_seconds": timeout if timeout is not None else 300,
+             "command": command[:200], "sync_wait_seconds": 0.0,
+             "completion": "error", "execution_seconds": None}
+    try:
+        result = _run_tcl_command_impl(command, timeout, event)
+        event["completion"] = "completed"
+        return result
+    except pexpect.TIMEOUT:
+        event["completion"] = "timeout_pending"
+        raise
+    finally:
+        execution_start = event.pop("execution_start", None)
+        if execution_start is not None:
+            event["execution_seconds"] = time.monotonic() - execution_start
+        event["observed_seconds"] = time.monotonic() - started
+        event["command_pending"] = _command_pending
+        logger.info("FPL26_COMMAND_EVENT=%s", json.dumps(event, sort_keys=True))
+
+
+def _run_tcl_command_impl(command: str, timeout: Optional[float], event: dict) -> str:
     """
     Run a Tcl command in Vivado and return the output.
     
@@ -211,10 +237,11 @@ def run_tcl_command(command: str, timeout: Optional[float] = None) -> str:
     
     # If a previous command timed out, wait for it to complete first
     if _command_pending:
-        sync_output = sync_after_timeout(proc)
-        if sync_output:
-            # Previous command completed, we can continue
-            pass
+        sync_start = time.monotonic()
+        try:
+            sync_after_timeout(proc)
+        finally:
+            event["sync_wait_seconds"] = time.monotonic() - sync_start
     
     # Use provided timeout or default
     effective_timeout = timeout if timeout is not None else 300
@@ -245,6 +272,7 @@ def run_tcl_command(command: str, timeout: Optional[float] = None) -> str:
         )
 
     try:
+        event["execution_start"] = time.monotonic()
         proc.sendline(wire_command)
         # Wait for prompt and capture output
         proc.expect(VIVADO_PROMPT, timeout=effective_timeout)

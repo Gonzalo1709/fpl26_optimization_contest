@@ -22,6 +22,8 @@ Choose exactly one next optimization recipe and return only JSON:
 Rules for the controller interface:
 - You do not have direct access to Vivado or RapidWright tools in this call.
 - Choose only among the provided recipes.
+- DENSITY_REIMPLEMENTATION tries a resource-checked whole-fabric region from the baseline; use only its offered density values.
+- PATH_CLUSTER_REPLACE is a bounded broader-path rescue offered after neutral cheap optimization; use the provided max_cells.
 - Treat available_strategies as a strict allow-list; never name an omitted recipe.
 - Do not describe tool calls, command sequences, or chain-of-thought.
 - Use timing metrics holistically: WNS first, then TNS, then failing endpoints.

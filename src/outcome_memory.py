@@ -94,6 +94,9 @@ def forecast(records: list[dict], features: dict, strategy: str, args: dict,
              tool_version: str | None = None, part: str | None = None) -> dict | None:
     neighbors = []
     for row in records:
+        if row.get("tool_session_uncertain") is True:
+            # Interrupted recipes remain auditable but have censored runtimes.
+            continue
         if row.get("llm_cost_verified") is False:
             continue
         if row.get("strategy") != strategy or row.get("args") != args:

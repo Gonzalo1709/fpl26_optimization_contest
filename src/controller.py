@@ -17,10 +17,11 @@ from src.analysis import DesignSignature
 from src.economics import forecast_admission
 from src.equivalence import prove_sequential_equivalence
 from src.outcome_memory import OutcomeMemory, feature_vector, forecast
-from src.policy import EligibleAction, should_attempt_reimplementation
+from src.policy import EligibleAction, should_attempt_reimplementation, apply_action_cooldowns
 from src.search import SearchCandidate
 from src.pact_search import EnablingPool, diverse_beam, physical_features
 from src.submission import validate_submission
+from src.meemar import DENSITIES, needs_rescue
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,18 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         """
         actions = list(actions)
         cfg = self.generation_config
+        available = self._current_budget_state().remaining_runtime_seconds - cfg.validation_reserve_seconds
+        sig = self.design_signature
+        if (cfg.density_search and sig and self._state_candidate is self._baseline_candidate
+                and self.validation_status.implementation_passed
+                and sig.primitive_cell_count is not None
+                and 0 < sig.primitive_cell_count <= cfg.density_max_cells
+                and available >= max(cfg.density_min_seconds,
+                                     self.measured_recipe_seconds.get("DENSITY_REIMPLEMENTATION", 0) * 1.2)
+                and not any(a.strategy == "REIMPLEMENTATION" for a in actions)):
+            actions.append(EligibleAction("DENSITY_REIMPLEMENTATION", {"density": .5},
+                                          {"density": list(DENSITIES)},
+                                          "resource-checked central region, fresh baseline placement, full routing"))
         if (cfg.targeted_actions and self.design_signature and self.validation_status.implementation_passed
                 and not any(a.strategy == "REIMPLEMENTATION" for a in actions)):
             available = self._current_budget_state().remaining_runtime_seconds - cfg.validation_reserve_seconds
@@ -270,10 +283,12 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             if available >= 900 and spread and spread.paths_analyzed >= 3 and spread.avg_distance >= 30:
                 actions.append(EligibleAction("PATH_LOCAL_REPLACE", {"max_cells": 20}, {},
                                               "movable terminal cells on spatially spread critical paths"))
-            from src.policy import apply_action_cooldowns
-            actions = list(apply_action_cooldowns(actions, self._planning_history))
+                if cfg.meemar_rescue and needs_rescue(self._planning_history, cfg.min_wns_delta):
+                    actions.append(EligibleAction("PATH_CLUSTER_REPLACE", {"max_cells": 80}, {},
+                                                  "broader datapath rescue after neutral cheap physical optimization"))
             if any(a.strategy != "NO_OP" for a in actions):
                 actions = [a for a in actions if a.strategy != "NO_OP"]
+        actions = list(apply_action_cooldowns(actions, self._planning_history))
         signature = feature_vector(self.design_signature)
         budget = self._current_budget_state()
         elapsed = time.time() - self.start_time if self.start_time else 0
@@ -292,7 +307,7 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         for action in actions:
             if action.strategy == "NO_OP":
                 continue
-            key = next((k for k in ("directive", "flag") if action.allowed_args.get(k)), None)
+            key = next((k for k in ("directive", "flag", "density") if action.allowed_args.get(k)), None)
             variants = [{**action.default_args, key: value} for value in action.allowed_args[key]] if key else [action.default_args]
             retained = []
             for args in variants:
@@ -350,6 +365,8 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                                      "strategy": strategy, "args": args,
                                      "reason": permitted.reason,
                                      "physical_before": physical_features(parent)}
+        record["search_context"] = {"incumbent_wns": self.best_candidate.wns,
+                                    "seed_wns": parent.wns, "prior_attempts_on_seed": len(self._planning_history)}
         child = None
         try:
             self._loaded_sha256 = None
@@ -381,6 +398,8 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             await self._restore_candidate_state(parent)
         finally:
             record["action_evidence"] = self._action_evidence
+            record["runtime_attribution"] = "recipe_wall_total"
+            record["tool_session_uncertain"] = self._tool_session_poisoned
             record["llm_cost_verified"] = not self._llm_cost_unknown
             record["elapsed_seconds"] = max(0.0, time.time() - started)
             self.history.append(record)
@@ -542,7 +561,7 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         if cfg.stop_when_timing_met and self.best_candidate.wns >= 0:
             self._stop_reason = "explicit timing-closure stop"
             return
-        if (not self.force_strategy and self.design_signature is not None
+        if (not cfg.meemar_rescue and not self.force_strategy and self.design_signature is not None
                 and should_attempt_reimplementation(self.design_signature, self._current_budget_state())
                 and self._adaptive_actions((EligibleAction("REIMPLEMENTATION"),))[0].strategy != "NO_OP"):
             # Preserve the original independent RQS/Explore lane. Its parent is
@@ -574,6 +593,42 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                 return
         if all(self.best_candidate is not root for root in roots):
             roots.append(self.best_candidate)
+        # Independent density trials share the immutable baseline, not the
+        # preceding trial's pblock or placement. Fresh policy/ROI checks apply.
+        if cfg.density_search and not self.force_strategy:
+            for density in DENSITIES:
+                if self._should_stop_for_budget():
+                    break
+                await self._restore_candidate_state(self._baseline_candidate)
+                action = next((a for a in self._eligible_actions()
+                               if a.strategy == "DENSITY_REIMPLEMENTATION"), None)
+                if action is None or density not in action.allowed_args["density"]:
+                    continue
+                self.iteration += 1
+                result = await self._attempt(self._baseline_candidate, action.strategy, {"density": density})
+                roots.append(result)
+                if cfg.stop_when_timing_met and self.best_candidate.wns >= 0:
+                    return
+            roots = diverse_beam([*roots, self.best_candidate], cfg.beam_width if generations else 1,
+                                 self._candidate_sort_key, cfg.physical_diversity)
+        await self._restore_candidate_state(self._baseline_candidate)
+        if (cfg.meemar_rescue and not self.force_strategy
+                and self.best_candidate.wns <= self._baseline_candidate.wns + cfg.min_wns_delta
+                and self.design_signature is not None
+                and should_attempt_reimplementation(self.design_signature, self._current_budget_state())
+                and self._adaptive_actions((EligibleAction("REIMPLEMENTATION"),))[0].strategy != "NO_OP"):
+            # Preserve the original independent RQS/Explore lane. Its parent is
+            # always the pristine baseline, not a previously optimized placement.
+            self.iteration += 1
+            reimplemented = await self._attempt(self._baseline_candidate, "REIMPLEMENTATION", {})
+            if reimplemented is not current:
+                roots.append(reimplemented)
+            current = self.best_candidate
+            if cfg.stop_when_timing_met and self.best_candidate.wns >= 0:
+                self._stop_reason = "explicit timing-closure stop"
+                return
+        roots = diverse_beam([*roots, self.best_candidate], cfg.beam_width if generations else 1,
+                             self._candidate_sort_key, cfg.physical_diversity)
         if not generations:
             roots = [self.best_candidate]
         max_generations = cfg.max_generations if generations else max(cfg.max_llm_calls, cfg.max_generations * cfg.max_steps_per_branch)

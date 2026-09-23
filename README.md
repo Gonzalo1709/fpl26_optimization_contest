@@ -13,6 +13,8 @@ The `test/pact` integration adds targeted physical actions, physically diverse s
 
 ## Contents
 
+The `test/meemar` integration adds resource-aware density placement trials, automatic no-key deterministic execution, a startup input fallback, conditional rescue, and explicit timeout telemetry. See [implemented changes and justifications](docs/strategy/meemar-integrated-features.md).
+
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)

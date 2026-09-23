@@ -251,6 +251,9 @@ Examples:
     parser.add_argument("--no-physical-diversity", action="store_true", help="Ablation: retain timing-only beam selection")
     parser.add_argument("--no-enabling-moves", action="store_true", help="Ablation: disable evidence-backed intermediate candidate pool")
     parser.add_argument("--no-targeted-actions", action="store_true", help="Ablation: disable current-path targeted physical actions")
+    parser.add_argument("--no-density-search", action="store_true", help="Disable resource-aware whole-fabric density experiments")
+    parser.add_argument("--no-meemar-rescue", action="store_true", help="Disable broader path rescue and conditional reimplementation scheduling")
+    parser.add_argument("--require-llm", action="store_true", help="Fail on missing credentials instead of automatically using deterministic search")
     parser.add_argument("--no-llm", action="store_true", help="Run the generic deterministic portfolio without an API key")
     parser.add_argument(
         "--wall-clock-limit-seconds",
@@ -313,6 +316,8 @@ Examples:
     )
 
     args = parser.parse_args()
+    if args.require_llm and args.no_llm:
+        parser.error("--require-llm and --no-llm are mutually exclusive")
     import math
     if (not math.isfinite(args.final_validation_timeout_seconds)
             or args.final_validation_timeout_seconds <= 0 or args.final_validation_vectors <= 0):
@@ -342,6 +347,8 @@ Examples:
         physical_diversity=not args.no_physical_diversity,
         enabling_pool_size=0 if args.no_enabling_moves else 4,
         targeted_actions=not args.no_targeted_actions,
+        density_search=not args.no_density_search,
+        meemar_rescue=not args.no_meemar_rescue,
         stop_when_timing_met=args.stop_when_timing_met,
         validation_reserve_seconds=args.validation_reserve_seconds,
         score_aware_stopping=not args.no_score_aware_stopping,
@@ -365,6 +372,10 @@ Examples:
         logging.getLogger().setLevel(logging.DEBUG)
 
     args.output_dcp.parent.mkdir(parents=True, exist_ok=True)
+    # Preserve original bytes before any MCP startup or analysis can fail.
+    # This is an unvalidated fallback, not a claim that the input is legal.
+    from src.meemar import preseed_output
+    preseed_output(args.input_dcp, args.output_dcp)
 
     if args.test:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -450,9 +461,11 @@ Examples:
             await optimizer.cleanup()
 
     if not args.api_key and not args.no_llm:
-        print("Error: OpenRouter API key required. Set OPENROUTER_API_KEY or use --api-key", file=sys.stderr)
-        print("       Use --test flag to run in test mode without LLM", file=sys.stderr)
-        sys.exit(1)
+        if args.require_llm:
+            print("Error: --require-llm needs an API key; original input fallback preserved", file=sys.stderr)
+            sys.exit(1)
+        logging.warning("No API key: continuing with the deterministic portfolio; no LLM calls")
+        args.no_llm = True
 
     if OpenAI is None:
         print("Error: openai package not installed. Run: pip install openai", file=sys.stderr)

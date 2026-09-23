@@ -44,6 +44,10 @@ class GenerationSearchConfig:
     enabling_regression_ns: float = 0.010
     enabling_budget_seconds: float = 600.0
     targeted_actions: bool = True
+    density_search: bool = True
+    density_max_cells: int = 50_000
+    density_min_seconds: float = 1500.0
+    meemar_rescue: bool = True
 
 
 @dataclass
