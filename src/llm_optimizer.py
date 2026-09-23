@@ -2295,7 +2295,14 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         return dcp_path
 
     async def _save_vivado_checkpoint(self, dcp_path: Path) -> bool:
-        """Save the currently-open Vivado design as a branch checkpoint."""
+        """Save a checkpoint and readable netlist from the same Vivado design.
+
+        RapidWright otherwise launches another Vivado to extract readable EDIF,
+        doubling the Vivado memory footprint during checkpoint reads.
+        """
+        edif_path = dcp_path.with_suffix(".edf")
+        # A failed overwrite must not leave an older netlist beside a new DCP.
+        edif_path.unlink(missing_ok=True)
         result = await self.v(
             "write_checkpoint",
             {
@@ -2307,7 +2314,15 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         if "error" in result.lower() and "wrote checkpoint" not in result.lower():
             logger.warning("Failed to save branch checkpoint %s: %s", dcp_path, result[:500])
             return False
-        return dcp_path.exists()
+        if not dcp_path.is_file() or dcp_path.stat().st_size == 0:
+            return False
+        await self.v(
+            "write_edif",
+            {"edif_path": str(edif_path.resolve()), "force": True, "timeout": 120},
+        )
+        if not edif_path.is_file() or edif_path.stat().st_size == 0:
+            raise RuntimeError(f"Vivado did not write a readable EDIF sidecar: {edif_path}")
+        return True
 
     def _format_wns(self, wns: Optional[float]) -> str:
         """Format WNS for logs."""
@@ -2548,6 +2563,9 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         if self.start_time is not None:
             total_runtime = (self.end_time or time.time()) - self.start_time
             print(f"\nTOTAL RUNTIME: {total_runtime:.2f} seconds ({total_runtime / 60:.2f} minutes)")
+
+        if self._stop_reason:
+            print(f"\nSTOP REASON: {self._stop_reason}")
 
         best_wns = self.best_wns if self.best_wns > float("-inf") else None
         initial_fmax = self.calculate_fmax(self.initial_wns, self.clock_period)

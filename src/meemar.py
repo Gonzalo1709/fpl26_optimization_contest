@@ -70,15 +70,25 @@ def density_regions(report, density):
     if len(xs) > 32 or len(ys) > 64:
         raise ValueError("Device exceeds bounded region search")
 
+    def bram_width(kind):
+        # Vivado reports occupied modes as RAMB180/RAMB181/RAMB36 and
+        # compatible unused sites as RAMBFIFO18/RAMBFIFO36.
+        if kind.startswith(("RAMB", "FIFO")):
+            if "36" in kind:
+                return 2
+            if "18" in kind:
+                return 1
+        return 0
+
     def bram_units(counts, capacity=False):
-        small = sum(v for k, v in counts.items() if k.startswith(("RAMB18", "FIFO18")))
-        large = sum(v * 2 for k, v in counts.items() if k.startswith(("RAMB36", "FIFO36")))
-        # RAMB/FIFO aliases can share physical sites: never sum their capacities.
-        if capacity:
-            groups = [sum(v * (2 if "36" in k else 1) for k, v in counts.items()
-                          if k.startswith(prefix)) for prefix in ("RAMB18", "RAMB36", "FIFO18", "FIFO36")]
-            return max(groups, default=0)
-        return small + large
+        small = sum(v for k, v in counts.items() if bram_width(k) == 1)
+        large = sum(v * 2 for k, v in counts.items() if bram_width(k) == 2)
+        # The 18K halves and 36K site overlap physically. Their mode names
+        # are interchangeable, but these two capacity views must not be added.
+        return max(small, large) if capacity else small + large
+
+    def bram36_sites(counts):
+        return sum(v for k, v in counts.items() if bram_width(k) == 2)
 
     choices = []
     for width in range(1, len(xs) + 1):
@@ -97,9 +107,11 @@ def density_regions(report, density):
                             for kind, count in regions[x, y].items():
                                 capacity[kind] = capacity.get(kind, 0) + count
                     if any(capacity.get(k, 0) < math.ceil(v / (density if k.startswith("SLICE") else .8))
-                           for k, v in demand.items() if v):
+                           for k, v in demand.items() if v and not bram_width(k)):
                         continue
                     if bram_units(capacity, True) < math.ceil(bram_units(demand) / .8):
+                        continue
+                    if bram36_sites(capacity) < math.ceil(bram36_sites(demand) / .8):
                         continue
                     bounds = (xx[0], yy[0], xx[-1], yy[-1])
                     choices.append(((width*height, width/height, bounds), bounds, capacity))
@@ -132,8 +144,16 @@ foreach key [lsort [dict keys $counts]] {
 set targets [get_cells -quiet -of_objects $sites]
 if {![llength $targets]} {error {density search has no fabric targets}}
 foreach cell $targets {
-    if {[get_property IS_LOC_FIXED $cell] || [get_property IS_BEL_FIXED $cell] || [get_property DONT_TOUCH $cell]} {
-        error {density search cannot move protected fabric cells}
+    foreach property {IS_LOC_FIXED IS_BEL_FIXED DONT_TOUCH} {
+        set value [get_property $property $cell]
+        # Vivado returns an empty string for an unset optional property.
+        if {$value eq ""} {continue}
+        if {![string is boolean -strict $value]} {
+            error "invalid boolean property $property on $cell: $value"
+        }
+        if {$value} {
+            error {density search cannot move protected fabric cells}
+        }
     }
 }
 puts "MEEMAR_TARGETS_HEX=[binary encode hex [join $targets \n]]"

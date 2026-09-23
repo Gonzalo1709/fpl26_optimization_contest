@@ -162,14 +162,16 @@ class DCPOptimizerBase:
 
     async def cleanup(self):
         """Clean up resources."""
-        await self.exit_stack.aclose()
-
-        if self._rw_log_file:
-            self._rw_log_file.close()
-        if self._v_log_file:
-            self._v_log_file.close()
-
-        logger.info(f"Run directory preserved at: {self.run_dir}")
+        try:
+            # Close in the task that opened these AnyIO cancel scopes.
+            await self.exit_stack.aclose()
+        finally:
+            for handle in (self._rw_log_file, self._v_log_file):
+                if handle:
+                    handle.close()
+            self._rw_log_file = self._v_log_file = None
+            self.rapidwright_session = self.vivado_session = None
+            logger.info(f"Run directory preserved at: {self.run_dir}")
 
     def calculate_fmax(self, wns: Optional[float], clock_period: Optional[float]) -> Optional[float]:
         if clock_period is None or clock_period <= 0:

@@ -22,3 +22,22 @@ If teams will be using LLMs for their workflow (most will), they will be require
 
 Submissions must read from the environment variable `OPENROUTER_API_KEY` for the access key and use the OpenRouter API to access the models.  No other LLM service will be supported. 
 
+## Local checkpoint export and run status
+
+Search snapshots in the run's `admission/` directory include a readable `.edf`
+with the same basename as each `.dcp`. Both files are exported from the same
+Vivado session. Keep them together when reading a snapshot with RapidWright:
+otherwise RapidWright may start an additional Vivado process to regenerate
+EDIF, increasing memory use. A missing or empty EDIF export rejects the snapshot.
+
+`published_artifact.json` describes the DCP at the output path. Its
+`search_best_candidate` field separately records the best measured candidate's
+path, hash, WNS, and validation state as soon as it is admitted. An improvement
+is published only after final validation. `run_status` distinguishes a running
+search, final validation, completion, failure, and interruption. A retained
+fallback alone does not make a failed search successful.
+
+The search deadline preserves the final-validation reserve. Search MCP sessions
+are closed in their owning task before the validator starts fresh processes.
+An externally cancelled run records its last published output and recoverable
+search candidate without labeling pending validation as passed.

@@ -44,6 +44,9 @@ class AdaptiveController:
         self._retiming_directives = ()
         self._part = None
         self._stop_reason = None
+        self._run_status = "initializing"
+        self._search_failed = False
+        self._search_best_candidate = None
         self._golden_dcp = None
         self._policy_decisions = []
         cfg = self.generation_config
@@ -201,6 +204,8 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             self.best_candidate = candidate
             self.best_wns = self._published_wns = candidate.wns
             self.validation_status = candidate.validation
+            self._search_best_candidate = candidate
+            self._write_artifact_manifest()
             logger.info("Admitted search incumbent %s; final validation pending", candidate.candidate_id)
             return True
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -219,7 +224,7 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         finally:
             temporary.unlink(missing_ok=True)
         # No state assignment occurs before the atomic replacement succeeds.
-        self.best_candidate = candidate
+        self.best_candidate = self._search_best_candidate = candidate
         self._delivered_candidate = replace(candidate, dcp_path=source, checkpoint_sha256=digest)
         self.best_wns = self._published_wns = candidate.wns
         self.validation_status = candidate.validation
@@ -231,6 +236,7 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         if self.best_candidate is None:
             return
         candidate = self._delivered_candidate or self.best_candidate
+        search_best = self._search_best_candidate or self.best_candidate
         payload = {
             "schema_version": 1, "run_id": self._run_id, "candidate_id": candidate.candidate_id,
             "output_path": str(self.output_dcp), "sha256": candidate.checkpoint_sha256,
@@ -244,7 +250,16 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             "llm_cost_verified": not self._llm_cost_unknown,
             "stop_reason": self._stop_reason,
             "final_validation": self._final_evidence,
-            "search_best_candidate_id": self.best_candidate.candidate_id,
+            "run_status": self._run_status,
+            "search_failed": self._search_failed,
+            "search_best_candidate_id": search_best.candidate_id,
+            "search_best_candidate": {
+                "candidate_id": search_best.candidate_id,
+                "dcp_path": str(search_best.dcp_path),
+                "sha256": search_best.checkpoint_sha256,
+                "wns_ns": search_best.wns,
+                "validation": asdict(search_best.validation),
+            },
         }
         target = self.run_dir / "published_artifact.json"
         temporary = target.with_suffix(".tmp")
@@ -466,31 +481,55 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                                         fmax_mhz=self.calculate_fmax(baseline.wns, self.clock_period))
         self._candidate_evidence[baseline.candidate_id] = original_evidence
         baseline.evidence = original_evidence.to_dict() if original_evidence else None
+        self._run_status = "searching"
         self._publish_admitted(baseline)
         await self._restore_candidate_state(baseline)
         return analysis
 
+    def _record_interruption(self):
+        # This must remain synchronous: the task may already be cancelled.
+        self._run_status = "interrupted"
+        self._stop_reason = "run cancelled; published output retained; finalization incomplete"
+        self.end_time = time.time()
+        self._write_artifact_manifest()
+
     async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
+        initialized = False
         try:
-            analysis = await self._initialize_search(input_dcp, output_dcp)
-            remaining = self._current_budget_state().remaining_runtime_seconds
-            search_seconds = remaining - self.generation_config.validation_reserve_seconds
-            if search_seconds > 0:
-                await asyncio.wait_for(self._search_portfolio(analysis, generations=self.generation_config.enabled),
-                                       search_seconds)
-        except Exception as exc:
-            self._stop_reason = f"stopped: {exc}"
-            if self.best_candidate is None:
-                logger.exception("Optimizer stopped before any output was admitted")
-            else:
-                logger.exception("Optimizer stopped; retaining the admitted output")
-        await self._finalize_submission()
-        return self._finish_search()
+            try:
+                analysis = await self._initialize_search(input_dcp, output_dcp)
+                initialized = True
+                self._run_status = "searching"
+                remaining = self._current_budget_state().remaining_runtime_seconds
+                search_seconds = remaining - self.generation_config.validation_reserve_seconds
+                if search_seconds > 0:
+                    await asyncio.wait_for(self._search_portfolio(analysis, generations=self.generation_config.enabled),
+                                           search_seconds)
+                else:
+                    self._stop_reason = "search budget exhausted; preserving final-validation reserve"
+            except asyncio.TimeoutError:
+                # The outer search deadline deliberately reserves time to validate
+                # the best checkpoint using fresh tool processes.
+                self._search_failed = not initialized
+                self._stop_reason = ("search deadline reached; preserving final-validation reserve"
+                                     if initialized else "initial analysis timed out")
+                logger.info(self._stop_reason)
+            except Exception as exc:
+                self._search_failed = True
+                self._stop_reason = f"stopped: {exc}"
+                logger.exception("Optimizer stopped; preserving the last published output")
+            await self._finalize_submission()
+            return self._finish_search()
+        except asyncio.CancelledError:
+            self._record_interruption()
+            raise
 
     async def _finalize_submission(self):
         if not self.generation_config.strict_final_validation or self.best_candidate is None:
             return
         candidate = self.best_candidate
+        self._run_status = "validating"
+        self._write_artifact_manifest()
         try:
             if sha256_file(self._golden_dcp) != self._input_sha256:
                 raise ValueError("Golden checkpoint changed after initialization")
@@ -541,6 +580,7 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
     def _finish_search(self) -> bool:
         self.end_time = time.time()
         if self.best_candidate is None:
+            self._run_status = "failed"
             self.best_wns = float("-inf")
             return False
         self.best_wns = self._published_wns = self.best_candidate.wns
@@ -548,11 +588,13 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         valid_output = self.output_dcp.is_file() and sha256_file(self.output_dcp) == self.best_candidate.checkpoint_sha256
         if not valid_output:
             self._stop_reason = "output missing or changed since admission"
+        success = valid_output and self._final_validation_ok and not self._search_failed
+        self._run_status = "completed" if success else "failed"
         self._write_artifact_manifest()
         (self.run_dir / "policy_decisions.json").write_text(json.dumps(self._policy_decisions, indent=2), encoding="utf-8")
         (self.run_dir / "enabling_moves.json").write_text(json.dumps(self._enabling.events, indent=2), encoding="utf-8")
         self._print_optimization_summary()
-        return valid_output and self._final_validation_ok
+        return success
 
     async def _search_portfolio(self, analysis: str, *, generations: bool):
         cfg = self.generation_config
@@ -730,24 +772,29 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
     async def run_single_method(self, input_dcp: Path, output_dcp: Path, method: str,
                                 *, top_n_nets: int = 5, phys_opt_directive: str = "Default") -> bool:
         try:
-            await self._initialize_search(input_dcp, output_dcp)
-            action = next((a for a in self._eligible_actions() if a.strategy == method), None)
-            if action is None:
-                raise ValueError(f"Single method {method} is not eligible for this state and budget")
-            args = dict(action.default_args)
-            if method == "FANOUT":
-                args["top_n_nets"] = min(10, max(1, top_n_nets))
-            if method in {"PHYS_OPT", "PHYS_OPT_REROUTE", "RETIME"} and phys_opt_directive in action.allowed_args.get("directive", []):
-                args["directive"] = phys_opt_directive
-            allowance = self._current_budget_state().remaining_runtime_seconds - self.generation_config.validation_reserve_seconds
-            if allowance <= 0:
-                raise TimeoutError("No transform budget beyond validation reserve")
-            await asyncio.wait_for(self._attempt(self._baseline_candidate, method, args), allowance)
-            self._stop_reason = "single method completed"
-        except Exception as exc:
-            self._stop_reason = f"single method stopped: {exc}"
+            try:
+                await self._initialize_search(input_dcp, output_dcp)
+                action = next((a for a in self._eligible_actions() if a.strategy == method), None)
+                if action is None:
+                    raise ValueError(f"Single method {method} is not eligible for this state and budget")
+                args = dict(action.default_args)
+                if method == "FANOUT":
+                    args["top_n_nets"] = min(10, max(1, top_n_nets))
+                if method in {"PHYS_OPT", "PHYS_OPT_REROUTE", "RETIME"} and phys_opt_directive in action.allowed_args.get("directive", []):
+                    args["directive"] = phys_opt_directive
+                allowance = self._current_budget_state().remaining_runtime_seconds - self.generation_config.validation_reserve_seconds
+                if allowance <= 0:
+                    raise TimeoutError("No transform budget beyond validation reserve")
+                await asyncio.wait_for(self._attempt(self._baseline_candidate, method, args), allowance)
+                self._stop_reason = "single method completed"
+            except Exception as exc:
+                self._search_failed = True
+                self._stop_reason = f"single method stopped: {exc}"
+                await self._finalize_submission()
+                self._finish_search()
+                return False
             await self._finalize_submission()
-            self._finish_search()
-            return False
-        await self._finalize_submission()
-        return self._finish_search()
+            return self._finish_search()
+        except asyncio.CancelledError:
+            self._record_interruption()
+            raise
