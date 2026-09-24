@@ -7,6 +7,9 @@ Contest website can be found here: https://xilinx.github.io/fpl26_optimization_c
 
 # FPGA Design Optimization Agent
 
+Per-run event logs, evidence, CSV exports, and exploration-tree graphs are
+described in [docs/run-logging.md](docs/run-logging.md).
+
 An example LLM-powered autonomous agent that optimizes FPGA designs for timing using RapidWright and Vivado optimizations and tools via MCP (Model Context Protocol) servers.
 
 ## Contents

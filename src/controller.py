@@ -115,11 +115,17 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         self.high_fanout_nets = [(n.net_name, n.fanout, n.critical_path_count) for n in self.design_signature.high_fanout_candidates]
         candidate.evidence = self.design_signature.to_dict()
         self._candidate_evidence[candidate.candidate_id] = self.design_signature
+        self._trace("evidence_refreshed", candidate_id=candidate.candidate_id,
+                    checkpoint_sha256=candidate.checkpoint_sha256,
+                    evidence_ref=self._capture(candidate.evidence),
+                    unavailable=list(self.design_signature.unavailable),
+                    observed_seconds=time.time() - started)
 
     async def _restore_candidate_state(self, candidate: SearchCandidate):
         if not candidate.checkpoint_sha256 or sha256_file(candidate.dcp_path) != candidate.checkpoint_sha256:
             raise ValueError("Checkpoint hash differs from its admitted identity")
-        if self._loaded_sha256 != candidate.checkpoint_sha256:
+        reloaded = self._loaded_sha256 != candidate.checkpoint_sha256
+        if reloaded:
             await self.v("open_checkpoint", {"dcp_path": str(candidate.dcp_path.resolve()), "timeout": 120})
             # RapidWright is synchronized before every recipe that may inspect it.
             await self.rw("read_checkpoint", {"dcp_path": str(candidate.dcp_path.resolve())})
@@ -128,6 +134,9 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         self.validation_status = candidate.validation
         self.design_signature = self._candidate_evidence.get(candidate.candidate_id)
         self._planning_history = self._attempts_by_state.setdefault(candidate.checkpoint_sha256, [])
+        self._trace("candidate_restored", candidate_id=candidate.candidate_id,
+                    checkpoint_sha256=candidate.checkpoint_sha256, reloaded=reloaded,
+                    planning_history_count=len(self._planning_history))
 
     async def _snapshot_candidate(self, name: str, parent: SearchCandidate | None = None,
                                   *, retimed: bool = False) -> SearchCandidate:
@@ -171,14 +180,32 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             equivalence_proof=proof, **self._candidate_score_metadata(metrics["wns"], validation=status),
         )
         self.search_candidates.append(candidate)
+        self._trace("candidate_admitted", decision_id=self._active_decision_id,
+                    attempt_id=self._active_attempt_id,
+                    candidate_id=candidate.candidate_id, parent_id=candidate.parent_id,
+                    generation=candidate.generation, steps_taken=candidate.steps_taken,
+                    branch_index=candidate.branch_index, summary=candidate.summary,
+                    checkpoint_sha256=digest, constraint_sha256=constraints,
+                    metrics=metrics, validation=asdict(status),
+                    projected_score=candidate.projected_score,
+                    validated_score=candidate.validated_score,
+                    equivalence_proof_ref=self._capture(proof) if proof else None)
         return candidate
 
     def _publish_admitted(self, candidate: SearchCandidate) -> bool:
         if not candidate.validation.implementation_passed or candidate.validation.failed:
+            self._trace("publish_rejected", candidate_id=candidate.candidate_id,
+                        reason="implementation_or_validation_failed", validation=asdict(candidate.validation))
             return False
         if self.best_candidate and not self._is_candidate_improvement(candidate, self.best_candidate):
+            self._trace("publish_rejected", candidate_id=candidate.candidate_id,
+                        reason="not_better_than_incumbent", incumbent_id=self.best_candidate.candidate_id,
+                        candidate_score=candidate.projected_score,
+                        incumbent_score=self.best_candidate.projected_score)
             return False
         if candidate.constraint_sha256 != self._baseline_constraint_digest:
+            self._trace("publish_rejected", candidate_id=candidate.candidate_id,
+                        reason="constraint_hash_changed")
             return False
         if sha256_file(candidate.dcp_path) != candidate.checkpoint_sha256:
             raise ValueError("Refusing to publish an altered checkpoint")
@@ -189,7 +216,7 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.wip")
         try:
             shutil.copyfile(candidate.dcp_path, temporary)
-            with temporary.open("rb") as handle:
+            with temporary.open("rb+") as handle:
                 os.fsync(handle.fileno())
             if sha256_file(temporary) != candidate.checkpoint_sha256:
                 raise ValueError("Checkpoint copy checksum failed")
@@ -201,6 +228,10 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         self.best_wns = self._published_wns = candidate.wns
         self.validation_status = candidate.validation
         self._write_artifact_manifest()
+        self._trace("artifact_published", candidate_id=candidate.candidate_id,
+                    checkpoint_sha256=candidate.checkpoint_sha256,
+                    output_path=str(output), wns_ns=candidate.wns,
+                    validation=asdict(candidate.validation))
         logger.info("Published %s: WNS %.4f ns", candidate.candidate_id, candidate.wns)
         return True
 
@@ -266,6 +297,11 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                 self._policy_decisions.append({"state": self._state_candidate.candidate_id if self._state_candidate else None,
                                                "strategy": action.strategy, "args": args, "allowed": allowed,
                                                "reason": reason, "forecast": estimate})
+                self._trace("policy_variant", policy_eval_id=self._last_policy_eval_id,
+                            candidate_id=self._state_candidate.candidate_id if self._state_candidate else None,
+                            strategy=action.strategy, args=args, allowed=allowed,
+                            reason=reason, forecast=estimate, budget=asdict(budget),
+                            bank_gain_mhz=bank, incumbent_deficit_mhz=deficit, score_penalty=penalty)
                 if allowed:
                     value = max(0, estimate["expected_gain_mhz"] - deficit) / max(1, estimate["seconds"]) if estimate else 0.0
                     retained.append((value, args))
@@ -283,10 +319,42 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         ranked.sort(key=lambda item: item[:2], reverse=True)
         return tuple(item[2] for item in ranked) or (EligibleAction("NO_OP", reason="no admissible action has credible remaining value"),)
 
-    async def _attempt(self, parent: SearchCandidate, strategy: str, args: dict, *, llm_cost: float = 0) -> SearchCandidate:
+    async def _attempt(self, parent: SearchCandidate, strategy: str, args: dict, *,
+                       llm_cost: float = 0, decision_context: dict | None = None) -> SearchCandidate:
+        """Bind a selected action, tool calls, and outcome to one attempt ID."""
+        context = decision_context or {}
+        recorder = getattr(self, "run_recorder", None)
+        decision_id = context.get("decision_id") or (recorder.new_id("decision") if recorder else None)
+        attempt_id = recorder.new_id("attempt") if recorder else None
+        previous_decision = self._active_decision_id
+        previous_attempt = self._active_attempt_id
+        self._active_decision_id, self._active_attempt_id = decision_id, attempt_id
+        self._trace("action_selected", decision_id=decision_id, attempt_id=attempt_id,
+                    policy_eval_id=self._last_policy_eval_id, source=context.get("source", "controller"),
+                    generation=context.get("generation"), branch=context.get("branch"),
+                    step=context.get("step"), seed_candidate_id=parent.candidate_id,
+                    seed_sha256=parent.checkpoint_sha256, strategy=strategy, args=args,
+                    alternatives_ref=self._capture(context.get("alternatives"))
+                    if context.get("alternatives") is not None else None,
+                    budget=asdict(self._current_budget_state()))
+        try:
+            result = await self._attempt_impl(parent, strategy, args, llm_cost=llm_cost)
+            self._trace("attempt_returned", decision_id=decision_id, attempt_id=attempt_id,
+                        candidate_id=result.candidate_id, seed_retained=result is parent)
+            return result
+        except BaseException as exc:
+            self._trace("attempt_aborted", decision_id=decision_id, attempt_id=attempt_id,
+                        error_type=type(exc).__name__, error_ref=self._capture(str(exc), "text"))
+            raise
+        finally:
+            self._active_decision_id, self._active_attempt_id = previous_decision, previous_attempt
+
+    async def _attempt_impl(self, parent: SearchCandidate, strategy: str, args: dict, *,
+                            llm_cost: float = 0) -> SearchCandidate:
         started = time.time()
         before_features = feature_vector(self.design_signature)
-        record = {"run_id": self._run_id, "state_sha256": parent.checkpoint_sha256,
+        record = {"run_id": self._run_id, "decision_id": self._active_decision_id,
+                  "attempt_id": self._active_attempt_id, "state_sha256": parent.checkpoint_sha256,
                   "attempted_from_state": True,
                   "features": before_features, "strategy": strategy, "args": args,
                   "tool_version": self._tool_version, "part": self._part,
@@ -327,6 +395,17 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             self.measured_recipe_seconds[strategy] = record["elapsed_seconds"]
             with (self.run_dir / "recipe_outcomes.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, allow_nan=False) + "\n")
+            self._trace("recipe_attempt", decision_id=self._active_decision_id,
+                        attempt_id=self._active_attempt_id, iteration=self.iteration,
+                        strategy=strategy, parent_candidate_id=parent.candidate_id,
+                        candidate_id=child.candidate_id if child else None,
+                        status="error" if record.get("error") else "measured",
+                        outcome_ref=self._capture(record), wns_ns=record.get("wns"),
+                        delta_wns_ns=record.get("delta_wns"),
+                        delta_fmax_mhz=record.get("delta_fmax_mhz"),
+                        recipe_seconds=record["elapsed_seconds"],
+                        implementation_passed=record["implementation_passed"],
+                        validation=record.get("validation"))
             if self._memory:
                 try:
                     self._memory.append(record)
@@ -351,6 +430,10 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             except Exception as exc:
                 logger.warning("Starting with run-local memory: %s", exc)
         analysis = await self.perform_initial_analysis(input_dcp)
+        self._trace("baseline_measured", wns_ns=self.initial_wns,
+                    tns_ns=self.initial_tns,
+                    failing_endpoints=self.initial_failing_endpoints,
+                    clock_period_ns=self.clock_period, target_clock=self.target_clock)
         original_evidence = self.design_signature
         result = await self.v("run_tcl", {"command": 'puts "FPL26_VERSION=[version -short]"; puts "FPL26_PART=[get_property PART [current_design]]"'})
         version = re.search(r"(?m)^FPL26_VERSION=(.+)$", result)
@@ -385,6 +468,10 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                                         fmax_mhz=self.calculate_fmax(baseline.wns, self.clock_period))
         self._candidate_evidence[baseline.candidate_id] = original_evidence
         baseline.evidence = original_evidence.to_dict() if original_evidence else None
+        self._trace("evidence_refreshed", candidate_id=baseline.candidate_id,
+                    checkpoint_sha256=baseline.checkpoint_sha256,
+                    evidence_ref=self._capture(baseline.evidence),
+                    unavailable=list(original_evidence.unavailable) if original_evidence else [])
         self._publish_admitted(baseline)
         await self._restore_candidate_state(baseline)
         return analysis
@@ -398,6 +485,8 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                 await self._search_portfolio(analysis, generations=False)
         except Exception as exc:
             self._stop_reason = f"stopped: {exc}"
+            self._trace("search_error", error_type=type(exc).__name__,
+                        error_ref=self._capture(str(exc), "text"))
             if self.best_candidate is None:
                 logger.exception("Optimizer stopped before any output was admitted")
             else:
@@ -408,12 +497,19 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         self.end_time = time.time()
         if self.best_candidate is None:
             self.best_wns = float("-inf")
+            self._trace("search_finished", status="failed", stop_reason=self._stop_reason,
+                        reason="no_admitted_candidate")
             return False
         self.best_wns = self._published_wns = self.best_candidate.wns
         self.validation_status = self.best_candidate.validation
         valid_output = self.output_dcp.is_file() and sha256_file(self.output_dcp) == self.best_candidate.checkpoint_sha256
         if not valid_output:
             self._stop_reason = "output missing or changed since admission"
+        self._trace("search_finished", status="completed" if valid_output and not
+                    (self._stop_reason or "").startswith("stopped:") else "failed",
+                    stop_reason=self._stop_reason, output_matches_candidate=valid_output,
+                    best_candidate_id=self.best_candidate.candidate_id,
+                    best_wns_ns=self.best_wns)
         self._write_artifact_manifest()
         (self.run_dir / "policy_decisions.json").write_text(json.dumps(self._policy_decisions, indent=2), encoding="utf-8")
         self._print_optimization_summary()
@@ -432,7 +528,8 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             # Preserve the original independent RQS/Explore lane. Its parent is
             # always the pristine baseline, not a previously optimized placement.
             self.iteration += 1
-            reimplemented = await self._attempt(current, "REIMPLEMENTATION", {})
+            reimplemented = await self._attempt(current, "REIMPLEMENTATION", {},
+                                                decision_context={"source": "initial_reimplementation_gate"})
             if reimplemented is not current:
                 roots.append(reimplemented)
             current = self.best_candidate
@@ -448,11 +545,18 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             actions = self._eligible_actions()
             action = next((a for a in actions if a.strategy == self.force_strategy), None) if self.force_strategy else actions[0]
             if action is None:
+                self._trace("decision_skipped", candidate_id=current.candidate_id,
+                            policy_eval_id=self._last_policy_eval_id,
+                            reason="forced_strategy_ineligible")
                 break
             if action.strategy == "NO_OP":
+                self._trace("decision_skipped", candidate_id=current.candidate_id,
+                            policy_eval_id=self._last_policy_eval_id, reason=action.reason)
                 break
             self.iteration += 1
-            current = await self._attempt(current, action.strategy, dict(action.default_args))
+            current = await self._attempt(current, action.strategy, dict(action.default_args),
+                                          decision_context={"source": "deterministic_portfolio",
+                                                            "alternatives": [asdict(a) for a in actions]})
             if cfg.stop_when_timing_met and self.best_candidate.wns >= 0:
                 self._stop_reason = "explicit timing-closure stop"
                 return
@@ -460,6 +564,9 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
             roots.append(self.best_candidate)
         if not generations:
             roots = [self.best_candidate]
+        self._trace("beam_selected", stage="initial", generation=0,
+                    candidate_ids=[candidate.candidate_id for candidate in roots],
+                    beam_width=cfg.beam_width if generations else 1)
         max_generations = cfg.max_generations if generations else max(cfg.max_llm_calls, cfg.max_generations * cfg.max_steps_per_branch)
         for generation in range(max_generations):
             results = []
@@ -473,31 +580,54 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                         actions = self._eligible_actions()
                         if actions[0].strategy == "NO_OP":
                             self._stop_reason = actions[0].reason
+                            self._trace("decision_skipped", candidate_id=current.candidate_id,
+                                        policy_eval_id=self._last_policy_eval_id,
+                                        reason=actions[0].reason, generation=generation,
+                                        branch=branch, step=step)
                             break
                         choice = None
+                        recorder = getattr(self, "run_recorder", None)
+                        decision_id = recorder.new_id("decision") if recorder else None
+                        selection_source = "ranked_policy"
                         cost_before = self.total_cost
                         if self.force_strategy:
                             requested = next((a for a in actions if a.strategy == self.force_strategy), None)
                             if requested is None:
+                                self._trace("decision_skipped", decision_id=decision_id,
+                                            candidate_id=current.candidate_id,
+                                            reason="forced_strategy_ineligible",
+                                            requested_strategy=self.force_strategy)
                                 break
                             choice = (requested.strategy, requested.default_args)
+                            selection_source = "forced_cli"
                         elif generation == 0 and branch > 0:
                             action = actions[min(branch, len(actions) - 1)]
                             choice = (action.strategy, action.default_args)
+                            selection_source = "branch_diversity"
                         elif (not self._llm_cost_unknown and self.llm_call_count < cfg.max_llm_calls
                               and self._current_budget_state().remaining_cost_usd > 0):
                             payload = self._build_decision_input(analysis, current.steps_since_peak,
                                                                 self._planning_history[-5:])
-                            choice = self.sanitize_action(await self.choose_action_llm(payload))
+                            choice = self.sanitize_action(
+                                await self.choose_action_llm(payload, decision_id=decision_id),
+                                decision_id=decision_id)
+                            selection_source = "llm_planner"
                         else:
                             action = actions[0]
                             choice = (action.strategy, action.default_args)
                         strategy, args = choice
                         if strategy == "NO_OP":
+                            self._trace("decision_skipped", decision_id=decision_id,
+                                        candidate_id=current.candidate_id,
+                                        reason="selected_no_op", source=selection_source)
                             break
                         self.iteration += 1
                         previous = current
-                        current = await self._attempt(current, strategy, args, llm_cost=max(0, self.total_cost - cost_before))
+                        current = await self._attempt(
+                            current, strategy, args, llm_cost=max(0, self.total_cost - cost_before),
+                            decision_context={"decision_id": decision_id, "source": selection_source,
+                                              "generation": generation, "branch": branch, "step": step,
+                                              "alternatives": [asdict(a) for a in actions]})
                         if current is not previous:
                             current.steps_since_peak = 0 if current.wns > previous.peak_wns else previous.steps_since_peak + 1
                         # In economic mode, patience is diagnostic; only exhausted
@@ -514,6 +644,10 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                 break
             unique = {c.checkpoint_sha256: c for c in results}
             roots = sorted(unique.values(), key=self._candidate_sort_key, reverse=True)[:cfg.beam_width if generations else 1]
+            self._trace("beam_selected", stage="generation_end", generation=generation,
+                        considered_candidate_ids=[candidate.candidate_id for candidate in unique.values()],
+                        candidate_ids=[candidate.candidate_id for candidate in roots],
+                        beam_width=cfg.beam_width if generations else 1)
             if all(not any(a.strategy != "NO_OP" for a in self._actions_for_candidate(c)) for c in roots):
                 self._stop_reason = "all surviving states exhausted admissible actions"
                 break
@@ -542,7 +676,8 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                 args["top_n_nets"] = min(10, max(1, top_n_nets))
             if method in {"PHYS_OPT", "PHYS_OPT_REROUTE", "RETIME"} and phys_opt_directive in action.allowed_args.get("directive", []):
                 args["directive"] = phys_opt_directive
-            await self._attempt(self._baseline_candidate, method, args)
+            await self._attempt(self._baseline_candidate, method, args,
+                                decision_context={"source": "single_method_cli"})
             self._stop_reason = "single method completed"
         except Exception as exc:
             self._stop_reason = f"single method stopped: {exc}"

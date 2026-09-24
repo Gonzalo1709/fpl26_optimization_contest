@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +21,7 @@ class FPGAOptimizerTest(DCPOptimizerBase):
     def __init__(self, debug: bool = False, run_dir: Optional[Path] = None):
         super().__init__(debug=debug, run_dir=run_dir)
         self.final_wns = None
+        self.run_recorder = None
 
     async def start_servers(self, log_prefix: str = ""):
         await super().start_servers(log_prefix=log_prefix or "[TEST]")
@@ -27,7 +29,14 @@ class FPGAOptimizerTest(DCPOptimizerBase):
     async def call_vivado_tool(self, tool_name: str, arguments: dict, timeout: float = 300.0) -> str:
         logger.info(f"[VIVADO] Calling {tool_name} with args: {json.dumps(arguments)[:200]}...")
         print(f"[TEST] Calling vivado_{tool_name}...")
+        recorder = self.run_recorder
+        call_id = uuid.uuid4().hex
+        arguments_ref = recorder.capture(arguments) if recorder else None
         start_time = time.time()
+        result_ref = None
+        completion = "error"
+        error_type = None
+        elapsed = None
 
         try:
             result = await asyncio.wait_for(self.vivado_session.call_tool(tool_name, arguments), timeout=timeout)
@@ -36,23 +45,44 @@ class FPGAOptimizerTest(DCPOptimizerBase):
             print(f"[TEST] vivado_{tool_name} completed in {elapsed:.2f}s")
             if result.content:
                 text_parts = [c.text for c in result.content if hasattr(c, "text")]
-                return "\n".join(text_parts)
-            return "(no output)"
+                result_text = "\n".join(text_parts)
+            else:
+                result_text = "(no output)"
+            result_ref = recorder.capture(result_text, "text") if recorder else None
+            completion = "completed"
+            return result_text
         except asyncio.TimeoutError:
+            completion = "timeout"
+            error_type = "TimeoutError"
             elapsed = time.time() - start_time
             logger.error(f"[VIVADO] {tool_name} TIMED OUT after {elapsed:.2f}s")
             print(f"[TEST] ERROR: vivado_{tool_name} TIMED OUT after {elapsed:.2f}s")
             raise
         except Exception as e:
+            error_type = type(e).__name__
             elapsed = time.time() - start_time
             logger.error(f"[VIVADO] {tool_name} FAILED after {elapsed:.2f}s: {e}")
             print(f"[TEST] ERROR: vivado_{tool_name} failed after {elapsed:.2f}s: {e}")
             raise
+        finally:
+            if recorder:
+                recorder.record("tool_call_finished", call_id=call_id,
+                                tool_name=f"vivado_{tool_name}", completion=completion,
+                                error_type=error_type, arguments_ref=arguments_ref,
+                                result_ref=result_ref,
+                                observed_seconds=elapsed if elapsed is not None else time.time() - start_time)
 
     async def call_rapidwright_tool(self, tool_name: str, arguments: dict, timeout: float = 300.0) -> str:
         logger.info(f"[RAPIDWRIGHT] Calling {tool_name} with args: {json.dumps(arguments)[:200]}...")
         print(f"[TEST] Calling rapidwright_{tool_name}...")
+        recorder = self.run_recorder
+        call_id = uuid.uuid4().hex
+        arguments_ref = recorder.capture(arguments) if recorder else None
         start_time = time.time()
+        result_ref = None
+        completion = "error"
+        error_type = None
+        elapsed = None
 
         try:
             result = await asyncio.wait_for(self.rapidwright_session.call_tool(tool_name, arguments), timeout=timeout)
@@ -61,18 +91,32 @@ class FPGAOptimizerTest(DCPOptimizerBase):
             print(f"[TEST] rapidwright_{tool_name} completed in {elapsed:.2f}s")
             if result.content:
                 text_parts = [c.text for c in result.content if hasattr(c, "text")]
-                return "\n".join(text_parts)
-            return "(no output)"
+                result_text = "\n".join(text_parts)
+            else:
+                result_text = "(no output)"
+            result_ref = recorder.capture(result_text, "text") if recorder else None
+            completion = "completed"
+            return result_text
         except asyncio.TimeoutError:
+            completion = "timeout"
+            error_type = "TimeoutError"
             elapsed = time.time() - start_time
             logger.error(f"[RAPIDWRIGHT] {tool_name} TIMED OUT after {elapsed:.2f}s")
             print(f"[TEST] ERROR: rapidwright_{tool_name} TIMED OUT after {elapsed:.2f}s")
             raise
         except Exception as e:
+            error_type = type(e).__name__
             elapsed = time.time() - start_time
             logger.error(f"[RAPIDWRIGHT] {tool_name} FAILED after {elapsed:.2f}s: {e}")
             print(f"[TEST] ERROR: rapidwright_{tool_name} failed after {elapsed:.2f}s: {e}")
             raise
+        finally:
+            if recorder:
+                recorder.record("tool_call_finished", call_id=call_id,
+                                tool_name=f"rapidwright_{tool_name}", completion=completion,
+                                error_type=error_type, arguments_ref=arguments_ref,
+                                result_ref=result_ref,
+                                observed_seconds=elapsed if elapsed is not None else time.time() - start_time)
 
     def parse_wns_from_timing_report(self, timing_report: str) -> Optional[float]:
         return parse_timing_summary_static(timing_report)["wns"]
@@ -693,7 +737,8 @@ class FPGAOptimizerTest(DCPOptimizerBase):
         print(f"[TEST] Run directory preserved at: {self.run_dir}")
 
 
-async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, max_nets: int = 5, run_dir: Optional[Path] = None):
+async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, max_nets: int = 5,
+                        run_dir: Optional[Path] = None, recorder=None):
     dcp_name = input_dcp.name.lower()
 
     if "logicnets" in dcp_name:
@@ -713,9 +758,16 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
         print(f"[TEST]   - hard-block-heavy benchmarks such as finn_radioml_2025.1.dcp")
         print(f"[TEST]")
         print(f"[TEST] For custom DCPs, run without --test to use the LLM-guided optimizer.")
+        if recorder:
+            recorder.finish("failed", error_type="UnsupportedDesign")
         return 1
 
     tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
+    tester.run_recorder = recorder
+    if recorder:
+        recorder.record("test_strategy_selected", design_type=design_type, max_nets=max_nets)
+    status = "failed"
+    error_type = None
 
     try:
         await tester.start_servers()
@@ -728,6 +780,7 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
             success = await tester.run_test_hard_blocks(input_dcp, output_dcp)
 
         if success:
+            status = "completed"
             print("\n[TEST] Test completed successfully")
             print(f"\n[TEST] Output files:")
             print(f"[TEST]   Optimized DCP: {output_dcp}")
@@ -738,13 +791,20 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
             print(f"[TEST] Run directory: {tester.run_dir}")
             return 1
     except KeyboardInterrupt:
+        status = "interrupted"
         print("\n[TEST] Interrupted by user")
         print(f"[TEST] Run directory: {tester.run_dir}")
         return 130
     except Exception as e:
+        error_type = type(e).__name__
         logger.exception(f"Test mode fatal error: {e}")
         print(f"\n[TEST] Fatal error: {e}")
         print(f"[TEST] Run directory: {tester.run_dir}")
         return 1
     finally:
+        if recorder:
+            recorder.record("test_metrics", initial_wns_ns=tester.initial_wns,
+                            final_wns_ns=tester.final_wns,
+                            clock_period_ns=tester.clock_period)
+            recorder.finish(status, tester, error_type)
         await tester.cleanup()

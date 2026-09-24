@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from openai import OpenAI
@@ -19,6 +20,7 @@ from openai import OpenAI
 from src.llm_optimizer import DCPOptimizer, DEFAULT_MODEL, SUPPORTED_SINGLE_METHODS
 from src.search import GenerationSearchConfig
 from src.test_modes import run_test_mode
+from src.run_logging import RunRecorder, new_run_dir
 
 SEARCH_PROFILE_DEFAULTS = {
     "fast": {
@@ -352,8 +354,7 @@ Examples:
     args.output_dcp.parent.mkdir(parents=True, exist_ok=True)
 
     if args.test:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+        run_dir = new_run_dir()
 
         print("FPGA Design Optimization - TEST MODE")
         print("=====================================")
@@ -369,12 +370,13 @@ Examples:
             debug=args.debug,
             max_nets=args.max_nets,
             run_dir=run_dir,
+            recorder=RunRecorder(run_dir, "test", args.input_dcp, args.output_dcp,
+                                 {"max_nets": args.max_nets}),
         )
         sys.exit(exit_code)
 
     if args.single_method:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+        run_dir = new_run_dir()
 
         print("FPGA Design Optimization - SINGLE METHOD MODE")
         print("==============================================")
@@ -402,6 +404,15 @@ Examples:
             run_dir=run_dir,
             generation_config=generation_config,
         )
+        recorder = RunRecorder(run_dir, "single_method", args.input_dcp, args.output_dcp,
+                               {"model": args.model, "method": args.single_method,
+                                "top_n_nets": args.top_n_nets,
+                                "phys_opt_directive": args.phys_opt_directive,
+                                "generation_config": asdict(generation_config)},
+                               optimizer._run_id, secret_values=(args.api_key,))
+        optimizer.run_recorder = recorder
+        run_status = "failed"
+        error_type = None
 
         try:
             await optimizer.start_servers()
@@ -414,6 +425,7 @@ Examples:
             )
 
             if success:
+                run_status = "completed"
                 print("\n✓ Single-method optimization completed successfully")
                 print("\nOutput files:")
                 print(f"  Optimized DCP: {args.output_dcp.name}")
@@ -423,15 +435,18 @@ Examples:
             print(f"\nRun directory preserved at: {run_dir}")
             sys.exit(1)
         except KeyboardInterrupt:
+            run_status = "interrupted"
             print("\n\nInterrupted by user")
             print(f"Run directory preserved at: {run_dir}")
             sys.exit(130)
         except Exception as exc:
+            error_type = type(exc).__name__
             logging.exception("Fatal error")
             print(f"\n✗ Fatal error: {exc}")
             print(f"Run directory preserved at: {run_dir}")
             sys.exit(1)
         finally:
+            recorder.finish(run_status, optimizer, error_type)
             await optimizer.cleanup()
 
     if not args.api_key and not args.no_llm:
@@ -459,8 +474,7 @@ Examples:
     elif args.force_hard_block:
         force_strategy = "HARD_BLOCK"
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+    run_dir = new_run_dir()
     profile_defaults = SEARCH_PROFILE_DEFAULTS[args.budget_profile]
     branches = resolve_profile_value(args, profile_defaults, "branches")
     beam_width = resolve_profile_value(args, profile_defaults, "beam_width")
@@ -526,12 +540,22 @@ Examples:
         system_prompt_path=args.system_prompt,
         force_strategy=force_strategy,
     )
+    recorder = RunRecorder(run_dir, args.search_mode, args.input_dcp, args.output_dcp,
+                           {"model": args.model, "budget_profile": args.budget_profile,
+                            "no_llm": args.no_llm, "force_strategy": force_strategy,
+                            "generation_config": asdict(generation_config),
+                            "prompt_sha256_16": optimizer.system_prompt_hash},
+                           optimizer._run_id, secret_values=(args.api_key,))
+    optimizer.run_recorder = recorder
+    run_status = "failed"
+    error_type = None
 
     try:
         await optimizer.start_servers()
         success = await optimizer.optimize(args.input_dcp, args.output_dcp)
 
         if success:
+            run_status = "failed" if (optimizer._stop_reason or "").startswith("stopped:") else "completed"
             print("\n✓ Optimization completed successfully")
             print("\nOutput files:")
             print(f"  Optimized DCP: {args.output_dcp.name}")
@@ -541,15 +565,18 @@ Examples:
         print(f"\nRun directory preserved at: {run_dir}")
         sys.exit(1)
     except KeyboardInterrupt:
+        run_status = "interrupted"
         print("\n\nInterrupted by user")
         print(f"Run directory preserved at: {run_dir}")
         sys.exit(130)
     except Exception as exc:
+        error_type = type(exc).__name__
         logging.exception("Fatal error")
         print(f"\n✗ Fatal error: {exc}")
         print(f"Run directory preserved at: {run_dir}")
         sys.exit(1)
     finally:
+        recorder.finish(run_status, optimizer, error_type)
         await optimizer.cleanup()
 
 

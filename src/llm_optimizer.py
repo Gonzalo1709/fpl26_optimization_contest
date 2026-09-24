@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -128,7 +129,28 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         self._search_seed_metrics: Optional[dict] = None
         self.critical_paths_report: Optional[str] = None
         self._tool_session_poisoned = False
+        self.run_recorder = None
+        self._active_decision_id = None
+        self._active_attempt_id = None
+        self._last_policy_eval_id = None
         self._init_controller()
+
+    def _trace(self, event: str, **fields):
+        recorder = getattr(self, "run_recorder", None)
+        if recorder:
+            try:
+                recorder.record(event, **fields)
+            except (OSError, TypeError, ValueError) as exc:
+                logger.warning("Could not persist %s event: %s", event, exc)
+
+    def _capture(self, value, kind="json"):
+        recorder = getattr(self, "run_recorder", None)
+        if recorder:
+            try:
+                return recorder.capture(value, kind)
+            except (OSError, TypeError, ValueError) as exc:
+                logger.warning("Could not persist %s evidence: %s", kind, exc)
+        return None
 
     def _extract_llm_text(self, response) -> str:
         """Best-effort extraction of text content from a chat completion response."""
@@ -435,6 +457,8 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Execute a tool call on the appropriate MCP server."""
         if self._tool_session_poisoned:
+            self._trace("tool_call_blocked", tool_name=tool_name,
+                        reason="session_state_uncertain", arguments_ref=self._capture(arguments))
             raise WallClockLimitReached("Tool session timed out; no further commands may use its uncertain state")
         if tool_name.startswith("rapidwright_"):
             session = self.rapidwright_session
@@ -443,10 +467,18 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             session = self.vivado_session
             actual_name = tool_name[len("vivado_"):]
         else:
+            self._trace("tool_call_blocked", tool_name=tool_name,
+                        reason="unknown_tool_prefix", arguments_ref=self._capture(arguments))
             raise ToolExecutionError(f"Unknown tool prefix in: {tool_name}")
 
+        call_id = uuid.uuid4().hex
+        arguments_ref = self._capture(arguments)
         start_time = time.time()
+        monotonic_start = time.monotonic()
         wns_measured = None
+        result_text = None
+        completion = "error"
+        error_type = None
 
         try:
             logger.info("Calling %s with args: %s...", tool_name, json.dumps(arguments)[:200])
@@ -458,14 +490,14 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             else:
                 result = await session.call_tool(actual_name, arguments)
 
-            if getattr(result, "isError", False):
-                raise ToolExecutionError(f"{tool_name}: MCP reported an error")
             if result.content:
                 text_parts = [chunk.text for chunk in result.content if hasattr(chunk, "text")]
                 result_text = "\n".join(text_parts)
             else:
                 result_text = "(no output)"
 
+            if getattr(result, "isError", False):
+                raise ToolExecutionError(f"{tool_name}: MCP reported an error: {result_text[:1000]}")
             self._raise_if_tool_reported_error(tool_name, result_text)
 
             if tool_name == "vivado_report_timing_summary":
@@ -501,10 +533,14 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
                     "error": False,
                 }
             )
+            completion = "completed"
             return result_text
         except ToolExecutionError as exc:
+            completion = "tool_error"
+            error_type = type(exc).__name__
             if "timed out" in str(exc).lower() or "timeout" in str(exc).lower():
                 self._tool_session_poisoned = True
+                completion = "timeout_uncertain"
             elapsed_time = time.time() - start_time
             self.tool_call_details.append(
                 {
@@ -520,6 +556,8 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             raise
         except asyncio.TimeoutError as exc:
             self._tool_session_poisoned = True
+            completion = "timeout_uncertain"
+            error_type = type(exc).__name__
             elapsed_time = time.time() - start_time
             message = self._wall_clock_message(f"during {tool_name}")
             self.tool_call_details.append(
@@ -535,6 +573,8 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             logger.error("Tool call stopped by wall-clock limit: %s", message)
             raise WallClockLimitReached(message) from exc
         except Exception as exc:
+            completion = "error"
+            error_type = type(exc).__name__
             elapsed_time = time.time() - start_time
             self.tool_call_details.append(
                 {
@@ -548,6 +588,19 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             )
             logger.error("Tool call failed: %s", exc)
             raise ToolExecutionError(f"{tool_name} failed: {exc}") from exc
+        finally:
+            observed_seconds = max(0.0, time.monotonic() - monotonic_start)
+            self._trace("tool_call_finished", call_id=call_id,
+                        decision_id=self._active_decision_id,
+                        attempt_id=self._active_attempt_id,
+                        candidate_id=getattr(self._state_candidate, "candidate_id", None),
+                        tool_name=tool_name, iteration=self.iteration,
+                        requested_timeout_seconds=arguments.get("timeout"),
+                        completion=completion, error_type=error_type,
+                        arguments_ref=arguments_ref,
+                        result_ref=self._capture(result_text, "text") if result_text is not None else None,
+                        observed_seconds=observed_seconds, measured_wns_ns=wns_measured,
+                        session_uncertain=self._tool_session_poisoned)
 
     def _update_best_wns(self, current_wns: float, source: str = "timing_summary"):
         # Timing observations are speculative until checkpoint admission.
@@ -761,11 +814,16 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         print()
         return summary_text
 
-    async def choose_action_llm(self, decision_input: dict) -> dict:
+    async def choose_action_llm(self, decision_input: dict, decision_id: str | None = None) -> dict:
         """Choose a recipe and its arguments using a single LLM call."""
         attempt_max_tokens = [PLANNER_MAX_TOKENS, PLANNER_RETRY_MAX_TOKENS]
         last_content = ""
         last_finish_reason = None
+        decision_id = decision_id or self._active_decision_id
+        self._trace("planner_requested", decision_id=decision_id,
+                    decision_input_ref=self._capture(decision_input),
+                    system_prompt_ref=self._capture(self.planner_system_prompt, "text"),
+                    model=self.model)
 
         for attempt_index, max_tokens in enumerate(attempt_max_tokens, start=1):
             budget = self._current_budget_state()
@@ -773,15 +831,25 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
                     or budget.remaining_cost_usd <= 0
                     or budget.remaining_runtime_seconds <= budget.validation_reserve_seconds):
                 fallback = self._eligible_actions()[0]
+                self._trace("planner_skipped", decision_id=decision_id,
+                            reason="budget_or_unverified_cost", budget=asdict(budget),
+                            fallback={"strategy": fallback.strategy, "args": fallback.default_args})
                 return {"strategy": fallback.strategy, "args": fallback.default_args}
             timeout = min(60.0, budget.remaining_runtime_seconds - budget.validation_reserve_seconds)
             self.llm_call_count += 1
+            call_id = uuid.uuid4().hex
+            user_message = self._planner_user_message(decision_input, retry=attempt_index > 1)
+            self._trace("llm_call_started", decision_id=decision_id, call_id=call_id,
+                        call_number=self.llm_call_count, attempt=attempt_index,
+                        timeout_seconds=timeout, max_completion_tokens=max_tokens,
+                        request_ref=self._capture({"system": self.planner_system_prompt,
+                                                   "user": user_message}))
             try:
                 response = await asyncio.wait_for(asyncio.to_thread(self.openai.chat.completions.create,
                     model=self.model,
                     messages=[
                         {"role": "system", "content": self.planner_system_prompt},
-                        {"role": "user", "content": self._planner_user_message(decision_input, retry=attempt_index > 1)},
+                        {"role": "user", "content": user_message},
                     ],
                     max_tokens=max_tokens,
                     temperature=0,
@@ -794,6 +862,9 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
                 self._llm_cost_unknown = True
                 self.api_call_details.append({"call_number": self.llm_call_count, "error": str(exc), "cost": None})
                 fallback = self._eligible_actions()[0]
+                self._trace("llm_call_finished", decision_id=decision_id, call_id=call_id,
+                            status="error", error_type=type(exc).__name__,
+                            error_ref=self._capture(str(exc), "text"), cost_verified=False)
                 return {"strategy": fallback.strategy, "args": fallback.default_args}
 
             usage = getattr(response, "usage", None)
@@ -856,17 +927,30 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             finish_reason = self._get_finish_reason(response)
             last_content = content
             last_finish_reason = finish_reason
+            parsed_action = None
+            parse_mode = None
 
             if content:
                 try:
-                    return json.loads(content)
+                    parsed_action = json.loads(content)
+                    parse_mode = "direct_json"
                 except Exception:
                     json_text = self._extract_first_json_object(content)
                     if json_text:
                         try:
-                            return json.loads(json_text)
+                            parsed_action = json.loads(json_text)
+                            parse_mode = "extracted_json"
                         except Exception:
                             pass
+
+                if parsed_action is not None:
+                    self._trace("llm_call_finished", decision_id=decision_id, call_id=call_id,
+                                status="parsed", response_ref=self._capture(content, "text"),
+                                parsed_action=parsed_action, parse_mode=parse_mode,
+                                finish_reason=finish_reason,
+                                usage=self.api_call_details[-1] if usage else None,
+                                cost_verified=not self._llm_cost_unknown)
+                    return parsed_action
 
                 logger.warning(
                     "Could not parse planner JSON on attempt %s (finish_reason=%s). Raw content: %s",
@@ -880,6 +964,12 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
                     attempt_index,
                     finish_reason,
                 )
+
+            self._trace("llm_call_finished", decision_id=decision_id, call_id=call_id,
+                        status="unparseable", response_ref=self._capture(content, "text"),
+                        finish_reason=finish_reason,
+                        usage=self.api_call_details[-1] if usage else None,
+                        cost_verified=not self._llm_cost_unknown)
 
             if finish_reason != "length" and attempt_index == 1:
                 break
@@ -896,6 +986,9 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             last_finish_reason,
             last_content,
         )
+        self._trace("planner_fallback", decision_id=decision_id,
+                    reason="unparseable_response", finish_reason=last_finish_reason,
+                    strategy="PHYS_OPT", args={"directive": "Default"})
         return {"strategy": "PHYS_OPT", "args": {"directive": "Default"}}
 
     def _sanitize_action_shape(self, action: dict) -> tuple[str, dict]:
@@ -1042,15 +1135,27 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
 
     def _eligible_actions(self) -> tuple[EligibleAction, ...]:
         """Return the single authoritative allow-list for the current state."""
+        recorder = getattr(self, "run_recorder", None)
+        policy_eval_id = recorder.new_id("policy") if recorder else None
+        self._last_policy_eval_id = policy_eval_id
+        state = self._state_candidate
         if self._llm_cost_unknown:
-            return (EligibleAction("NO_OP", reason="provider cost is unverified; retain the admitted artifact"),)
+            actions = (EligibleAction("NO_OP", reason="provider cost is unverified; retain the admitted artifact"),)
+            self._trace("policy_evaluated", policy_eval_id=policy_eval_id,
+                        candidate_id=getattr(state, "candidate_id", None),
+                        budget=asdict(self._current_budget_state()), actions=[asdict(a) for a in actions])
+            return actions
         if self.design_signature is None:
-            return (
+            actions = (
                 EligibleAction(
                     strategy="NO_OP",
                     reason="this checkpoint has no current design evidence",
                 ),
             )
+            self._trace("policy_evaluated", policy_eval_id=policy_eval_id,
+                        candidate_id=getattr(state, "candidate_id", None),
+                        budget=asdict(self._current_budget_state()), actions=[asdict(a) for a in actions])
+            return actions
         actions = gate_actions(
             self.design_signature,
             budget=self._current_budget_state(),
@@ -1079,11 +1184,21 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             }
             if not available_fanout_names:
                 actions = tuple(action for action in actions if action.strategy not in {"FANOUT", "TARGETED_REPLICATION"})
-        return self._adaptive_actions(actions)
+        selected = self._adaptive_actions(actions)
+        self._trace("policy_evaluated", policy_eval_id=policy_eval_id,
+                    candidate_id=getattr(state, "candidate_id", None),
+                    checkpoint_sha256=getattr(state, "checkpoint_sha256", None),
+                    budget=asdict(self._current_budget_state()),
+                    evidence_ref=self._capture(self.design_signature.to_dict()),
+                    gate_actions_ref=self._capture([asdict(a) for a in actions]),
+                    actions=[asdict(a) for a in selected])
+        return selected
 
-    def sanitize_action(self, action: dict) -> tuple[str, dict]:
+    def sanitize_action(self, action: dict, decision_id: str | None = None) -> tuple[str, dict]:
         """Normalize a proposed action and enforce deterministic eligibility gates."""
+        requested_ref = self._capture(action)
         strategy, args = self._sanitize_action_shape(action)
+        normalized_strategy, normalized_args = strategy, dict(args)
         eligible = {item.strategy: item for item in self._eligible_actions()}
         if strategy not in eligible:
             fallback = next(iter(eligible.values()))
@@ -1093,9 +1208,16 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
                 fallback.strategy,
                 fallback.reason,
             )
-            return self._sanitize_action_shape(
+            selected = self._sanitize_action_shape(
                 {"strategy": fallback.strategy, "args": fallback.default_args}
             )
+            self._trace("action_sanitized", decision_id=decision_id,
+                        policy_eval_id=self._last_policy_eval_id,
+                        requested_ref=requested_ref,
+                        normalized={"strategy": normalized_strategy, "args": normalized_args},
+                        selected={"strategy": selected[0], "args": selected[1]},
+                        reason="ineligible_fallback", fallback_reason=fallback.reason)
+            return selected
 
         if strategy == "HARD_BLOCK":
             allowed_types = set(eligible[strategy].default_args.get("hard_block_types", []))
@@ -1112,6 +1234,12 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             # Operand counts are controller-costed defaults; the LLM must not
             # expand a bounded action beyond the forecast used to admit it.
             args = dict(eligible[strategy].default_args)
+        self._trace("action_sanitized", decision_id=decision_id,
+                    policy_eval_id=self._last_policy_eval_id,
+                    requested_ref=requested_ref,
+                    normalized={"strategy": normalized_strategy, "args": normalized_args},
+                    selected={"strategy": strategy, "args": args},
+                    reason="bounded_or_defaulted" if args != normalized_args else "accepted")
         return strategy, args
 
     def _canonicalize_action_args(self, strategy: str, args: dict) -> dict:
@@ -2354,6 +2482,9 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         if reason:
             self._stop_reason = reason
             print(f"{prefix} {reason}; stopping before starting another search step.")
+            self._trace("budget_stop", reason=reason, budget=asdict(self._current_budget_state()),
+                        candidate_id=getattr(self._state_candidate, "candidate_id", None),
+                        iteration=self.iteration)
             return True
         return False
 
