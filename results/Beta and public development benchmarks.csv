@@ -1,0 +1,17 @@
+Benchmark set,Benchmark,Alpha / Fmax improvement (MHz),Runtime (minutes),Gamma / Runtime (hours),Score
+Beta round,amd_mini-isp,102.04,20.0,0.333,98.604
+Beta round,boom_soc_v2,16.84,32.9,0.548,15.916
+Beta round,fir_systolic_transposed,22.01,13.3,0.222,21.511
+Beta round,rosetta_optical-flow,34.18,25.6,0.426,32.712
+Beta round,vtr_mcml_v2,4.40,42.5,0.708,4.089
+Public development,logicnets_jscl,118.64,31.4,0.523,112.43
+Public development,vexriscv_re-place,179.54,33.8,0.563,169.43
+Public development,vexriscv_re-place_v2,41.72,35.1,0.585,39.28
+Public development,rosetta_spam-filter,29.19,34.7,0.578,27.50
+Public development,rosetta_3d-rendering,29.46,27.7,0.462,28.10
+Public development,rosetta_digit-recognition,54.44,44.0,0.733,50.45
+Public development,finn_radioml,66.72,36.6,0.610,62.65
+Public development,corescore_500_mod,97.66,35.4,0.590,91.90
+Public development,vtr_mcml,16.64,45.1,0.752,15.39
+Public development,ispd16_example2,107.97,46.6,0.777,99.58
+Public development,boom_soc,27.91,33.6,0.560,26.35

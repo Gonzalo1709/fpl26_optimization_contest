@@ -13,9 +13,23 @@ import json
 from pathlib import Path
 
 
-def load_events(run_dir: Path) -> list[dict]:
+def load_events(run_dir: Path, *, live: bool = False) -> list[dict]:
     path = run_dir / "events.jsonl"
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    contents = path.read_text(encoding="utf-8")
+    lines = contents.splitlines()
+    events = []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            # Only an unfinished trailing write may be ignored. Earlier corruption
+            # must remain visible, including in the dashboard.
+            if live and index == len(lines) - 1 and not contents.endswith("\n"):
+                break
+            raise
+    return events
 
 
 def evidence_refs(value):

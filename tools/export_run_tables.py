@@ -35,7 +35,7 @@ def flatten(value: dict, prefix: str = "") -> dict:
     return row
 
 
-def build_tables(run_dirs: list[Path]) -> dict[str, list[dict]]:
+def build_tables(run_dirs: list[Path], *, live: bool = False) -> dict[str, list[dict]]:
     tables = {name: [] for name in ("runs", "events", *EVENT_TABLES,
                                     "tree_nodes", "tree_edges", "beam_memberships")}
     for run_dir in run_dirs:
@@ -47,7 +47,7 @@ def build_tables(run_dirs: list[Path]) -> dict[str, list[dict]]:
         events_path = run_dir / "events.jsonl"
         if not events_path.exists():
             continue
-        events = load_events(run_dir)
+        events = load_events(run_dir, live=live)
         decisions = {event["attempt_id"]: event for event in events
                      if event["event"] == "action_selected" and event.get("attempt_id")}
         outcomes = {event["attempt_id"]: event for event in events
