@@ -107,6 +107,7 @@ Examples:
         """,
     )
     parser.add_argument("input_dcp", type=Path, help="Input design checkpoint (.dcp)")
+    parser.add_argument("--run-dir", type=Path, help="Explicit empty run directory for framework-managed jobs")
     parser.add_argument(
         "--output",
         "-o",
@@ -309,6 +310,11 @@ Examples:
     )
 
     args = parser.parse_args()
+    if args.run_dir:
+        args.run_dir = args.run_dir.expanduser().resolve()
+        if args.run_dir.exists() and (not args.run_dir.is_dir() or any(args.run_dir.iterdir())):
+            parser.error("--run-dir must be an empty directory or a new path")
+        args.run_dir.mkdir(parents=True, exist_ok=True)
     if args.stop_when_timing_met and args.continue_after_timing_met:
         parser.error("Choose only one timing-closure behavior")
     import math
@@ -354,7 +360,7 @@ Examples:
     args.output_dcp.parent.mkdir(parents=True, exist_ok=True)
 
     if args.test:
-        run_dir = new_run_dir()
+        run_dir = args.run_dir or new_run_dir()
 
         print("FPGA Design Optimization - TEST MODE")
         print("=====================================")
@@ -376,7 +382,7 @@ Examples:
         sys.exit(exit_code)
 
     if args.single_method:
-        run_dir = new_run_dir()
+        run_dir = args.run_dir or new_run_dir()
 
         print("FPGA Design Optimization - SINGLE METHOD MODE")
         print("==============================================")
@@ -474,7 +480,7 @@ Examples:
     elif args.force_hard_block:
         force_strategy = "HARD_BLOCK"
 
-    run_dir = new_run_dir()
+    run_dir = args.run_dir or new_run_dir()
     profile_defaults = SEARCH_PROFILE_DEFAULTS[args.budget_profile]
     branches = resolve_profile_value(args, profile_defaults, "branches")
     beam_width = resolve_profile_value(args, profile_defaults, "beam_width")

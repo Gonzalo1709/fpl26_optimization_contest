@@ -1,0 +1,2 @@
+# Worker process identity and portable descendant cleanup.
+psutil>=6,<8

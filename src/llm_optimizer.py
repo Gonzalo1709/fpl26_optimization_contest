@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
 import uuid
@@ -2460,6 +2461,9 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
 
     def _budget_stop_reason(self) -> Optional[str]:
         """Return a human-readable stop reason when configured budgets are exhausted."""
+        cancel_file = os.environ.get("OPTIMIZER_CANCEL_FILE")
+        if cancel_file and Path(cancel_file).is_file():
+            return "cancellation requested"
         if self._llm_cost_unknown:
             return "provider cost is unverified"
         cfg = self.generation_config

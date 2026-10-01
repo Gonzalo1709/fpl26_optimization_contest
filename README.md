@@ -10,8 +10,9 @@ Contest website can be found here: https://xilinx.github.io/fpl26_optimization_c
 Per-run event logs, evidence, CSV exports, and exploration-tree graphs are
 described in [docs/run-logging.md](docs/run-logging.md).
 
-A local Streamlit GUI for inspecting runs, timing trends, candidate ancestry,
-and decision evidence is described in [docs/gui.md](docs/gui.md).
+A local experiment framework and Streamlit GUI for launching jobs, monitoring
+searches, comparing runs, and running benchmark sweeps is described in
+[docs/gui.md](docs/gui.md). The framework also provides a Python API and CLI.
 
 An example LLM-powered autonomous agent that optimizes FPGA designs for timing using RapidWright and Vivado optimizations and tools via MCP (Model Context Protocol) servers.
 
