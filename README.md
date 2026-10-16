@@ -186,6 +186,11 @@ RapidWright (used for netlist manipulation) may need `JAVA_HOME` to locate the J
 
 ## Running the Optimizer
 
+DRC checks are skipped during optimizer admission, including the initial baseline
+and hard-block candidates. DRC findings do not block search or candidate
+publication. Validation metadata records `drc_ignored: true` and
+`par_drc_clean: null`; skipping DRC does not certify a DRC-clean output.
+
 ### Using the Makefile (Recommended)
 
 The Makefile provides convenient targets for running the optimizer:

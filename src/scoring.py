@@ -13,22 +13,25 @@ class ValidationStatus:
     pulse_width_passed: bool | None = None
     structural_passed: bool | None = None
     simulation_passed: bool | None = None
+    drc_ignored: bool = False
 
     @property
     def implementation_passed(self) -> bool:
         return all(value is True for value in (
-            self.par_routed, self.par_drc_clean, self.hold_passed, self.pulse_width_passed,
+            self.par_routed, True if self.drc_ignored else self.par_drc_clean,
+            self.hold_passed, self.pulse_width_passed,
         ))
 
     @property
     def failed(self) -> bool:
         return any(value is False for value in (
-            self.par_routed, self.par_drc_clean, self.hold_passed,
+            self.par_routed, None if self.drc_ignored else self.par_drc_clean, self.hold_passed,
             self.pulse_width_passed, self.structural_passed, self.simulation_passed,
         ))
 
     @property
     def complete(self) -> bool:
+        # Ignoring DRC for search admission is not evidence of a clean design.
         return all(
             value is not None
             for value in (

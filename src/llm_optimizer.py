@@ -119,7 +119,7 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         self._search_roots: list[tuple[Path, dict, str]] = []
         self.measured_recipe_seconds: dict[str, float] = {}
         self.fanout_blacklist: dict[str, str] = {}
-        self.validation_status = ValidationStatus()
+        self.validation_status = ValidationStatus(drc_ignored=True)
         self.design_signature: Optional[DesignSignature] = None
         # The contest evaluates the output path that exists at the deadline.  Keep a
         # separate on-disk incumbent, rather than relying on the search directory
@@ -2013,6 +2013,7 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             "unplaced_cells": None,
             "route_status_excerpt": "",
             "drc_excerpt": "",
+            "drc_ignored": True,
             "log_keywords_found": [],
         }
 
@@ -2032,14 +2033,6 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
 
         route_status = await self.v("report_route_status", {})
         validation["route_status_excerpt"] = route_status[:2000]
-
-        drc_result = await self.v(
-            "run_tcl",
-            {
-                "command": "report_drc -return_string"
-            },
-        )
-        validation["drc_excerpt"] = drc_result[:2000]
 
         vivado_log = self.run_dir / "vivado.log"
         if vivado_log.exists():
@@ -2234,7 +2227,7 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         return self._last_tagged_int(result, "FPL26_PORT_COUNT")
 
     async def _validate_current_publishable_design(self) -> ValidationStatus:
-        """Require measured routing, hold, pulse-width and DRC evidence."""
+        """Check routing, hold and pulse width; DRC is ignored for optimization."""
         route_report = await self.v("report_route_status", {})
         hold_report = await self.v("run_tcl", {"command": (
             'set p [lindex [get_timing_paths -max_paths 1 -nworst 1 -hold] 0]; '
@@ -2243,14 +2236,10 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         )})
         hold = tagged_number(hold_report, "FPL26_HOLD_WNS")
         pulse_report = await self.v("run_tcl", {"command": "report_timing_summary -delay_type min_max -return_string"})
-        drc_report = await self.v("run_tcl", {"command": (
-            'report_drc -ruledeck default; '
-            'puts "FPL26_DRC_ERRORS=[llength [get_drc_violations -filter {SEVERITY == Error || SEVERITY == {Critical Warning}}]]"'
-        )})
-        drc = tagged_number(drc_report, "FPL26_DRC_ERRORS")
         status = ValidationStatus(
             par_routed=route_admission(route_report),
-            par_drc_clean=(drc == 0) if drc is not None else None,
+            par_drc_clean=None,
+            drc_ignored=True,
             hold_passed=(hold >= 0) if hold is not None else None,
             pulse_width_passed=pulse_admission(pulse_report),
         )

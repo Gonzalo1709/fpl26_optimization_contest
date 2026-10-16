@@ -154,6 +154,7 @@ class ContestScoringTests(unittest.TestCase):
                 {
                     "par_routed": None,
                     "par_drc_clean": None,
+                    "drc_ignored": True,
                     "hold_passed": None,
                     "pulse_width_passed": None,
                     "structural_passed": None,

@@ -24,6 +24,13 @@ The default workspace is `.optimizer-framework/`, ignored by Git. It contains
 
 ## Workflows
 
+Use **Select folder** to open the desktop folder dialog for run, workspace,
+checkpoint, and benchmark folders. On Linux this uses Zenity and requires a
+desktop display. If unavailable, the dashboard opens its in-app folder browser.
+For remote sessions, choose **Browse in app**, open subfolders or go up a level,
+then click **Use this folder**. Both pickers access the machine running the
+dashboard; selections persist across refreshes in the current session.
+
 | Panel | Features |
 | --- | --- |
 | Configure | DCP picker/path, Python, mode/model, profiles, runtime/cost caps, advanced settings, command preview, environment probe, saved/imported settings, enqueue |
