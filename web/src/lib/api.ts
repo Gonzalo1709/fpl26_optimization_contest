@@ -31,6 +31,7 @@ export type RunEntry = {
   name: string
   path: string
   job_id: string | null
+  source: "imported" | "managed" | "folder"
 }
 export type Configuration = {
   input_dcp: string
@@ -60,6 +61,11 @@ export type Snapshot = {
   status: string
   sequence: number
   demo: boolean
+  imported: {
+    source_archive: string
+    imported_at_utc: string
+    snapshot: boolean
+  } | null
   job: Job | null
   summary: Fields
   artifact: Fields
@@ -116,6 +122,28 @@ export async function api<T>(
         : JSON.stringify(data.detail)
     )
   return data as T
+}
+
+export async function uploadBundle(
+  file: File
+): Promise<{ id: string; count: number }> {
+  const response = await fetch("/api/runs/import", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/zip",
+      "X-Optimizer-Client": "web",
+      "X-Optimizer-Filename": encodeURIComponent(file.name),
+    },
+    body: file,
+  })
+  const data = await response.json()
+  if (!response.ok)
+    throw new Error(
+      typeof data.detail === "string"
+        ? data.detail
+        : "Cannot import this analysis ZIP"
+    )
+  return data
 }
 
 export const number = (value: unknown, digits = 3) =>

@@ -7,8 +7,10 @@ import asyncio
 import hashlib
 import json
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -19,6 +21,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from framework import JobManager, RunConfig, RunService
 from framework.config import METHODS, PROFILES, check_environment
 from framework.jobs import ACTIVE, TERMINAL
+from framework.runs import read_json
+from tools.run_bundle import MAX_ARCHIVE_BYTES, export_bundle, import_bundle
 
 
 class OpenRun(BaseModel):
@@ -48,6 +52,9 @@ def run_key(path: Path) -> str:
 def present_snapshot(service, run, job=None):
     """Project existing evidence into UI state without changing recorded facts."""
     snapshot = service.snapshot(run)
+    imported = read_json(run / ".imported.json") or None
+    if (run / "manifest.json").is_file():
+        snapshot["manifest"] = read_json(run / "manifest.json")
     events, summary = snapshot["events"], snapshot["summary"]
     status = job["status"] if job else summary.get("status", "unknown")
     beams = snapshot["tables"]["beams"]
@@ -88,7 +95,8 @@ def present_snapshot(service, run, job=None):
             "manifest": snapshot["manifest"], "monitor": service.monitor(snapshot),
             "events": events, "nodes": nodes, "edges": snapshot["tables"]["tree_edges"],
             "activity": activity, "sequence": events[-1]["sequence"] if events else 0,
-            "demo": summary.get("config", {}).get("demo", False)}
+            "imported": imported,
+            "demo": summary.get("config", {}).get("demo", events[0].get("config", {}).get("demo", False) if events else False)}
 
 
 def create_app(workspace=None, run_roots=None, repository=None, static_dir=None):
@@ -96,6 +104,7 @@ def create_app(workspace=None, run_roots=None, repository=None, static_dir=None)
     manager = JobManager(Path(workspace or repository / ".optimizer-framework"), repository)
     service = RunService()
     roots = [Path(p).expanduser().resolve() for p in (run_roots or [repository])]
+    imports_root = manager.root / "imports"
     registered = {}
     app = FastAPI(title="FPGA Optimizer Workspace", docs_url=None, redoc_url=None)
     app.state.manager = manager
@@ -123,12 +132,13 @@ def create_app(workspace=None, run_roots=None, repository=None, static_dir=None)
 
     @app.exception_handler(OSError)
     @app.exception_handler(EOFError)
+    @app.exception_handler(zipfile.BadZipFile)
     def unreadable(request, exc):
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
     def discover():
         found = set(registered.values())
-        for root in [*roots, manager.root]:
+        for root in [*roots, manager.root, *(p for p in imports_root.glob("*") if p.is_dir() and not p.name.startswith("."))]:
             if root.is_dir():
                 found.update(service.discover(root))
         registered.update({run_key(path): path for path in found})
@@ -157,11 +167,14 @@ def create_app(workspace=None, run_roots=None, repository=None, static_dir=None)
     def runs():
         jobs = {(Path(j["directory"]) / "run").resolve(): j for j in manager.list()}
         return [{"id": run_key(path), "name": path.name, "path": str(path),
+                 "source": "imported" if (path / ".imported.json").is_file() else "managed" if path in jobs else "folder",
                  "job_id": jobs[path]["id"] if path in jobs else None} for path in sorted(discover(), key=str, reverse=True)]
 
     @app.post("/api/runs/open")
     def open_run(body: OpenRun):
         path = Path(body.path).expanduser().resolve()
+        if path.name == "events.jsonl" and path.is_file():
+            path = path.parent
         found = service.discover(path)
         if not found:
             raise ValueError("No events.jsonl found in that run folder or its immediate run subfolders")
@@ -169,6 +182,34 @@ def create_app(workspace=None, run_roots=None, repository=None, static_dir=None)
             roots.append(path)
         registered.update({run_key(run): run for run in found})
         return {"id": run_key(found[-1]), "count": len(found)}
+
+    @app.post("/api/runs/import", status_code=201)
+    async def upload(request: Request):
+        if request.headers.get("content-type", "").split(";", 1)[0] != "application/zip":
+            raise HTTPException(415, "Upload an analysis ZIP generated with tools.run_bundle export")
+        filename = unquote(request.headers.get("x-optimizer-filename", "analysis.zip"))
+        filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+        # Raw ZIP request body avoids multipart dependencies and caps bytes while receiving.
+        with tempfile.TemporaryDirectory(dir=manager.root) as incoming:
+            archive_path = Path(incoming) / "upload.zip"
+            with archive_path.open("wb") as temporary:
+                size = 0
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > MAX_ARCHIVE_BYTES:
+                        raise HTTPException(413, "ZIP exceeds the 64 MiB upload limit")
+                    temporary.write(chunk)
+            paths = await asyncio.to_thread(import_bundle, archive_path, imports_root, filename)
+        registered.update({run_key(run): run for run in paths})
+        return {"id": run_key(paths[0]), "count": len(paths), "runs": [{"id": run_key(p), "name": p.name} for p in paths]}
+
+    @app.get("/api/runs/{key}/bundle")
+    def download_bundle(key: str):
+        with tempfile.TemporaryDirectory(dir=manager.root) as temporary:
+            output = Path(temporary) / "analysis.zip"
+            export_bundle([resolve_run(key)], output)
+            return Response(output.read_bytes(), media_type="application/zip",
+                            headers={"Content-Disposition": 'attachment; filename="run-analysis.zip"'})
 
     @app.get("/api/runs/{key}")
     def run_snapshot(key: str):
@@ -184,7 +225,10 @@ def create_app(workspace=None, run_roots=None, repository=None, static_dir=None)
 
     @app.get("/api/runs/{key}/configuration")
     def configuration(key: str):
-        data = service.snapshot(resolve_run(key))
+        run = resolve_run(key)
+        if (run / ".imported.json").is_file():
+            raise ValueError("Imported snapshots are for analysis; create a new experiment with a local input checkpoint")
+        data = service.snapshot(run)
         if data["summary"].get("config", {}).get("demo"):
             raise ValueError("Synthetic demo configurations cannot launch real experiments")
         return service.configuration(data).to_dict()

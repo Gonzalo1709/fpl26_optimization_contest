@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react"
+import { useCallback, useEffect, useState } from "react"
 import {
   Activity,
   ArrowDownToLine,
-  ArrowLeft,
   ArrowUpRight,
   ChevronRight,
   Clock3,
@@ -27,18 +26,12 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
+import { Dialog } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { SearchGraph } from "@/components/search-graph"
 import { RunForm } from "@/components/run-form"
+import { ImportRuns } from "@/components/import-runs"
 import {
   activeStatuses,
   api,
@@ -329,8 +322,10 @@ function useRun(id: string, live: boolean) {
         if (controller.signal.aborted) return
         setSnapshot(data)
         setError("")
-        setConnection(live ? "connecting" : "paused")
-        if (!live) return
+        setConnection(
+          data.imported ? "Imported snapshot" : live ? "connecting" : "paused"
+        )
+        if (!live || data.imported) return
         source = new EventSource(`/api/runs/${id}/stream`)
         source.addEventListener("snapshot", (e) => {
           if (controller.signal.aborted) return
@@ -431,18 +426,28 @@ function RunWorkspace({
           </div>
         </div>
         <div className="flex shrink-0 flex-wrap gap-2">
-          <Button variant="outline" onClick={() => setLive((v) => !v)}>
-            <Activity />
-            {live ? "Pause updates" : "Follow live"}
-          </Button>
+          {!snapshot.imported && (
+            <Button variant="outline" onClick={() => setLive((v) => !v)}>
+              <Activity />
+              {live ? "Pause updates" : "Follow live"}
+            </Button>
+          )}
           <Button
             variant="outline"
-            disabled={snapshot.demo || busy}
+            disabled={snapshot.demo || !!snapshot.imported || busy}
             onClick={() => void reuse()}
           >
             <Plus />
             Reuse configuration
           </Button>
+          <a
+            href={`/api/runs/${id}/bundle`}
+            className="inline-flex h-8 items-center gap-1.5 border px-2.5 text-xs font-medium hover:bg-muted"
+            download
+          >
+            <ArrowDownToLine className="size-4" />
+            Analysis ZIP
+          </a>
           <a
             href={`/api/runs/${id}/report`}
             className="inline-flex h-8 items-center gap-1.5 border px-2.5 text-xs font-medium hover:bg-muted"
@@ -472,6 +477,15 @@ function RunWorkspace({
         <p className="demo-banner">
           SYNTHETIC DEMONSTRATION · No FPGA tools were run. These measurements
           are for interface exploration.
+        </p>
+      )}
+      {snapshot.imported && (
+        <p className="demo-banner">
+          IMPORTED SNAPSHOT · {snapshot.imported.source_archive} · Imported{" "}
+          {new Date(snapshot.imported.imported_at_utc).toLocaleString()}
+          <br />
+          Saved analysis only. This copy does not receive cloud updates or
+          control the original job. Input checkpoints are not included.
         </p>
       )}
       <div className="metric-grid">
@@ -702,9 +716,6 @@ export default function Workspace() {
   const [newRun, setNewRun] = useState(false)
   const [draft, setDraft] = useState<Configuration>()
   const [openFolder, setOpenFolder] = useState(false)
-  const [folder, setFolder] = useState("")
-  const [folderError, setFolderError] = useState("")
-  const [opening, setOpening] = useState(false)
   const refresh = useCallback(async () => {
     try {
       const [r, j, s] = await Promise.all([
@@ -730,22 +741,6 @@ export default function Workspace() {
       clearInterval(timer)
     }
   }, [refresh])
-  async function importFolder(e: FormEvent) {
-    e.preventDefault()
-    setOpening(true)
-    setFolderError("")
-    try {
-      const result = await api<{ id: string }>("/runs/open", { path: folder })
-      await refresh()
-      setSelected(result.id)
-      setOpenFolder(false)
-      setFolderError("")
-    } catch (e) {
-      setFolderError((e as Error).message)
-    } finally {
-      setOpening(false)
-    }
-  }
   async function cancel(id: string) {
     try {
       await api(`/jobs/${id}/cancel`, {})
@@ -794,7 +789,7 @@ export default function Workspace() {
             onClick={() => setOpenFolder(true)}
           >
             <FolderOpen />
-            Open run folder
+            Import / open runs
           </Button>
         </div>
         <div className="px-4">
@@ -842,7 +837,13 @@ export default function Workspace() {
               <GitBranch className="size-4 shrink-0" />
               <div className="min-w-0">
                 <strong title={r.path}>{r.name}</strong>
-                <span>{r.job_id ? "Managed experiment" : "Recorded run"}</span>
+                <span>
+                  {r.source === "imported"
+                    ? "Imported snapshot"
+                    : r.job_id
+                      ? "Managed experiment"
+                      : "Folder on UI host"}
+                </span>
               </div>
               <ChevronRight className="ml-auto size-3 shrink-0" />
             </button>
@@ -933,7 +934,7 @@ export default function Workspace() {
               </Button>
               <Button variant="outline" onClick={() => setOpenFolder(true)}>
                 <FolderOpen />
-                Open run folder
+                Import / open runs
               </Button>
             </div>
             <div className="mt-10 flex flex-wrap justify-center gap-5 text-xs text-muted-foreground">
@@ -955,9 +956,8 @@ export default function Workspace() {
         )}
       </main>
       <Dialog open={newRun} onOpenChange={setNewRun}>
-        {settings && (
+        {settings && newRun && (
           <RunForm
-            key={JSON.stringify(draft || null) + String(newRun)}
             settings={settings}
             initial={draft}
             onQueued={(id) => {
@@ -969,48 +969,15 @@ export default function Workspace() {
         )}
       </Dialog>
       <Dialog open={openFolder} onOpenChange={setOpenFolder}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Open run folder</DialogTitle>
-            <DialogDescription>
-              Enter a run folder containing events.jsonl, or its parent folder,
-              on the execution host.
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={importFolder} className="space-y-4">
-            <Label htmlFor="run-folder">Folder path</Label>
-            <Input
-              id="run-folder"
-              value={folder}
-              onChange={(e) => setFolder(e.target.value)}
-              placeholder="Absolute path to your run folder"
-              required
-            />
-            {folderError && (
-              <p className="error-banner" role="alert">
-                {folderError}
-              </p>
-            )}
-            <div className="flex items-center justify-between">
-              <Button
-                variant="ghost"
-                type="button"
-                onClick={() => setOpenFolder(false)}
-              >
-                <ArrowLeft />
-                Back
-              </Button>
-              <Button type="submit" disabled={opening}>
-                {opening ? (
-                  <LoaderCircle className="animate-spin" />
-                ) : (
-                  <FolderOpen />
-                )}
-                Open folder
-              </Button>
-            </div>
-          </form>
-        </DialogContent>
+        {openFolder && (
+          <ImportRuns
+            onImported={(id) => {
+              setSelected(id)
+              setOpenFolder(false)
+              void refresh()
+            }}
+          />
+        )}
       </Dialog>
     </div>
   )

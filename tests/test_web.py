@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from src.run_logging import RunRecorder
 from tools.create_gui_demo import create_demo
+from tools.run_bundle import export_bundle
 
 WEB_AVAILABLE = all(importlib.util.find_spec(name) for name in ("fastapi", "httpx"))
 if WEB_AVAILABLE:
@@ -79,6 +80,38 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/runs", headers={"Origin": "https://untrusted.example"}).status_code, 403)
         self.assertEqual(self.client.get("/api/runs", headers={"Host": "untrusted.example"}).status_code, 400)
         self.assertEqual(self.client.get("/api/runs", headers={"Origin": "http://testserver"}).status_code, 200)
+
+    def test_upload_cloud_archive_and_restart_local_workspace(self):
+        archive = self.root / "cloud.zip"
+        export_bundle([self.run, self.demo / "demo-run-2"], archive)
+        headers = HEADERS | {"Content-Type": "application/zip", "X-Optimizer-Filename": "cloud.zip"}
+        self.assertEqual(self.client.post("/api/runs/import", content=b"not a zip", headers=headers).status_code, 400)
+        self.assertEqual(self.client.post("/api/runs/import", json={}, headers=HEADERS).status_code, 415)
+        with patch("framework.web.MAX_ARCHIVE_BYTES", 2):
+            self.assertEqual(self.client.post("/api/runs/import", content=b"large", headers=headers).status_code, 413)
+        response = self.client.post("/api/runs/import", content=archive.read_bytes(), headers=headers)
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["count"], 2)
+        key = response.json()["id"]
+        data = self.client.get(f"/api/runs/{key}").json()
+        self.assertEqual(data["imported"]["source_archive"], "cloud.zip")
+        self.assertEqual(len(data["nodes"]), 4)
+        event = next(e for e in data["events"] if "alternatives_ref" in e)
+        self.assertEqual(self.client.get(f"/api/runs/{key}/events/{event['sequence']}/evidence").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/runs/{key}/configuration").status_code, 400)
+        self.assertEqual(self.manager.list(), [])
+        with TestClient(create_app(self.manager.root, [])) as restarted:
+            entries = restarted.get("/api/runs").json()
+            self.assertEqual(len([entry for entry in entries if entry["source"] == "imported"]), 2)
+            self.assertEqual(restarted.get(f"/api/runs/{key}").status_code, 200)
+
+    def test_analysis_zip_download_and_events_path_open(self):
+        response = self.client.get(f"/api/runs/{self.key}/bundle")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/zip")
+        self.assertIn("attachment", response.headers["content-disposition"])
+        opened = self.client.post("/api/runs/open", json={"path": str(self.run / "events.jsonl")}, headers=HEADERS)
+        self.assertEqual(opened.json()["id"], self.key)
 
     def test_open_folder_and_partial_live_write(self):
         root = self.root / "external"

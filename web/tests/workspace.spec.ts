@@ -89,17 +89,20 @@ test("history, decisions, evidence, live reconnect, queue and cancellation", asy
   expect(readFileSync(log, "utf8")).toContain("browser_live_marker")
 
   await page
-    .getByRole("button", { name: "Open run folder", exact: true })
+    .getByRole("button", { name: "Import / open runs", exact: true })
     .first()
     .click()
+  await page.getByRole("tab", { name: "Open host folder" }).click()
   await page
-    .getByLabel("Folder path")
+    .getByLabel("Folder or events.jsonl path on the UI host")
     .fill(path.join(run.path, "missing-folder"))
   await page.getByRole("button", { name: "Open folder", exact: true }).click()
   await expect(page.getByRole("dialog").getByRole("alert")).toContainText(
     "does not exist"
   )
-  await page.getByLabel("Folder path").fill(run.path)
+  await page
+    .getByLabel("Folder or events.jsonl path on the UI host")
+    .fill(run.path)
   await page.getByRole("button", { name: "Open folder", exact: true }).click()
   await expect(page.getByRole("dialog")).toHaveCount(0)
   await expect(page.getByRole("heading", { name: "demo-run-2" })).toBeVisible()
@@ -145,4 +148,79 @@ test("history, decisions, evidence, live reconnect, queue and cancellation", asy
     )
   ).toBeTruthy()
   expect(errors).toEqual([])
+})
+
+test("upload cloud analysis ZIP and retain imported evidence after refresh", async ({
+  page,
+  request,
+}) => {
+  const runs = await (await request.get("/api/runs")).json()
+  const source = runs.find(
+    (r: { name: string; source: string }) =>
+      r.name === "demo-run-1" && r.source === "folder"
+  )
+  const beforeJobs = (await (await request.get("/api/jobs")).json()).jobs.length
+  const download = await request.get(`/api/runs/${source.id}/bundle`)
+  expect(download.ok()).toBeTruthy()
+  const bundle = await download.body()
+  await page.goto("/")
+  await page
+    .getByRole("button", { name: "Import / open runs", exact: true })
+    .first()
+    .click()
+  await page.getByRole("tab", { name: "How to export" }).click()
+  await expect(
+    page.getByText("python -m tools.run_bundle export", { exact: false })
+  ).toBeVisible()
+  await page.getByRole("tab", { name: "Upload cloud ZIP" }).click()
+  await page.getByLabel("Analysis ZIP file").setInputFiles({
+    name: "invalid.zip",
+    mimeType: "application/zip",
+    buffer: Buffer.from("invalid"),
+  })
+  await page.getByRole("button", { name: "Import ZIP", exact: true }).click()
+  await expect(page.getByRole("dialog").getByRole("alert")).toContainText(
+    "not a zip"
+  )
+  await page.getByLabel("Analysis ZIP file").setInputFiles({
+    name: "cloud-experiment.zip",
+    mimeType: "application/zip",
+    buffer: bundle,
+  })
+  await page.screenshot({
+    path: "test-results/import-cloud-dialog.png",
+    fullPage: true,
+  })
+  await page.getByRole("button", { name: "Import ZIP", exact: true }).click()
+  await expect(
+    page.locator(".demo-banner").filter({ hasText: "IMPORTED SNAPSHOT" })
+  ).toContainText("cloud-experiment.zip")
+  await expect(page.getByRole("button", { name: "Pause updates" })).toHaveCount(
+    0
+  )
+  await expect(
+    page.getByRole("button", { name: "Reuse configuration" })
+  ).toBeDisabled()
+  await page.locator(".react-flow__node").filter({ hasText: "c1" }).click()
+  await page
+    .locator(".inspector")
+    .getByRole("button", { name: "#3 action selected", exact: true })
+    .click()
+  await page.getByRole("button", { name: "Expand evidence" }).click()
+  await expect(page.locator(".inspector .json-block").last()).toContainText(
+    "Synthetic policy evidence"
+  )
+  await page.reload()
+  const imported = page
+    .getByRole("navigation", { name: "Experiments" })
+    .getByRole("button")
+    .filter({ hasText: "Imported snapshot" })
+  await expect(imported).toHaveCount(1)
+  await imported.click()
+  await expect(
+    page.locator(".demo-banner").filter({ hasText: "IMPORTED SNAPSHOT" })
+  ).toBeVisible()
+  expect((await (await request.get("/api/jobs")).json()).jobs.length).toBe(
+    beforeJobs
+  )
 })
