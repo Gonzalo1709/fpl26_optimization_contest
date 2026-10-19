@@ -18,6 +18,14 @@ batch_logs/
 branching_sweep_logs/*
 
 .*
+!web/.gitignore
+!web/.prettierrc
+!web/.prettierignore
+
+node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
 
 run-*/
 optimizer_outcomes.sqlite3*
