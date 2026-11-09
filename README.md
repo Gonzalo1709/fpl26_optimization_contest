@@ -12,7 +12,7 @@ described in [docs/run-logging.md](docs/run-logging.md).
 
 A React web workspace for launching experiments, live search graphs, and decision
 inspection is described in [docs/web-workspace.md](docs/web-workspace.md).
-The existing [Streamlit dashboard](docs/gui.md), Python API, and CLI remain available.
+The React web workspace is the graphical interface; the Python API and CLI also remain available.
 
 An example LLM-powered autonomous agent that optimizes FPGA designs for timing using RapidWright and Vivado optimizations and tools via MCP (Model Context Protocol) servers.
 

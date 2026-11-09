@@ -1,4 +1,4 @@
-"""Detached queue scheduler and per-job supervisors. No Streamlit imports."""
+"""Detached queue scheduler and per-job supervisors, independent of the web interface."""
 
 import json
 import os

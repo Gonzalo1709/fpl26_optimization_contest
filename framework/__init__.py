@@ -1,4 +1,4 @@
-"""Public optimizer services, usable without Streamlit or FPGA dependencies."""
+"""Public optimizer services, usable without a graphical interface or FPGA dependencies."""
 
 from framework.config import RunConfig
 from framework.jobs import JobManager

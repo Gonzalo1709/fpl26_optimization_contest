@@ -3,7 +3,7 @@
 The React/Vite interface uses shadcn preset `b3RqiTiFM` (Base Lyra, zinc,
 indigo, Inter, pointer controls). FastAPI serves its production build and wraps
 the existing `JobManager` and `RunService`; it does not own optimizer processes.
-The Streamlit dashboard and CLI remain available.
+This is the project's graphical interface. The Python API and CLI also remain available.
 
 ## Build and run
 
@@ -153,7 +153,7 @@ hosting, multi-user authorization, or remote workers.
 
 ```sh
 python -m pip install httpx
-python -m unittest tests.test_run_bundle tests.test_web tests.test_gui tests.test_run_logging
+python -m unittest tests.test_run_bundle tests.test_web tests.test_live_log_ingestion tests.test_run_logging
 cd web
 npm run lint
 npm run build
