@@ -1,12 +1,29 @@
 """Project managed manual runs onto their source tree without altering run logs."""
 
 from pathlib import Path
+import math
+
+
+def rank_observed(root):
+    """Best in the displayed tree is the highest admitted, measured Fmax."""
+    measured = [n for n in root["nodes"] if n["node_type"] == "candidate"
+                and type(n.get("fmax_mhz")) in (int, float) and math.isfinite(n["fmax_mhz"]) and n["fmax_mhz"] > 0]
+    best = max(measured, key=lambda n: n["fmax_mhz"]) if measured else None
+    root["best_node_id"] = best["node_id"] if best else None
+    root["monitor"]["best_fmax_mhz"] = best["fmax_mhz"] if best else None
+    root["monitor"]["initial_fmax_mhz"] = next((n["fmax_mhz"] - n["fmax_improvement_mhz"]
+        for n in root["nodes"] if n.get("fmax_mhz") is not None and n.get("fmax_improvement_mhz") is not None), None)
+    for node in root["nodes"]:
+        node["is_best"] = best is not None and node["node_id"] == best["node_id"]
+    if best:
+        root["monitor"]["best_wns_ns"] = best.get("wns_ns")
+    return root
 
 
 def manual_tree(root, jobs, present):
     root["sources"] = {}
     if root["imported"] or root["demo"]:
-        return root
+        return rank_observed(root)
     # Identity is scoped by source run path AND admitted checkpoint checksum.
     identities = {(str(Path(root["path"]).resolve()), n["node_id"]):
                   (n["node_id"], n.get("checkpoint_sha256"))
@@ -75,7 +92,7 @@ def manual_tree(root, jobs, present):
         if not changed:
             break
         pending = remaining
-    return root
+    return rank_observed(root)
 
 
 def watched_files(run, database, jobs):

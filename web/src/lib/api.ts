@@ -30,6 +30,7 @@ export type SearchNode = Fields & {
   job_error?: string | null
   delta_wns_ns?: number | null
   search_generation?: number
+  generation?: number
   search_branch?: number
   selection_source?: string
   state: string
@@ -70,6 +71,7 @@ export type Snapshot = {
   path: string
   status: string
   sequence: number
+  best_node_id?: string | null
   demo: boolean
   imported: {
     source_archive: string
@@ -83,6 +85,8 @@ export type Snapshot = {
   monitor: {
     initial_wns_ns: number | null
     best_wns_ns: number | null
+    best_fmax_mhz?: number | null
+    initial_fmax_mhz?: number | null
     final_fmax_mhz: number | null
     elapsed_seconds: number | null
     cost_usd: number | null

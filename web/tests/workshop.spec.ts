@@ -5,6 +5,7 @@ test("node selection drives Workshop beside the tree without losing the recipe d
   page,
   request,
 }) => {
+  test.setTimeout(60_000)
   await page.goto("/")
   await page
     .getByRole("navigation", { name: "Experiments" })
@@ -15,6 +16,10 @@ test("node selection drives Workshop beside the tree without losing the recipe d
   const candidate = page.locator(".react-flow__node").filter({ hasText: "c1" })
   await expect(candidate).toContainText("357.1")
   await expect(candidate).toContainText("7.1% higher")
+  await expect(candidate).toContainText("than parent")
+  const frequencyBox = await candidate.locator(".text-xl").boundingBox()
+  const labelBox = await candidate.locator(".node-label").boundingBox()
+  expect(Math.abs(frequencyBox!.x - labelBox!.x)).toBeLessThan(1)
   await expect(candidate).toContainText("WNS")
   await expect(
     page.getByRole("tab", { name: /Playground|Workshop/ })
@@ -112,6 +117,11 @@ test("node selection drives Workshop beside the tree without losing the recipe d
     animations: "disabled",
   })
   await page.setViewportSize({ width: 390, height: 844 })
+  const tabHeader = page.locator(".run-tab-header")
+  await expect(tabHeader).toHaveCSS("overflow-y", "hidden")
+  expect(
+    await tabHeader.evaluate((el) => el.scrollHeight - el.clientHeight)
+  ).toBeLessThanOrEqual(0)
   await expect
     .poll(() => page.evaluate(() => document.documentElement.scrollWidth))
     .toBe(390)
@@ -174,6 +184,99 @@ test("node selection drives Workshop beside the tree without losing the recipe d
     `.react-flow__node[data-id="manual:${id}:attempt-2"]`
   )
   await expect(secondResult).toBeVisible()
+  await expect(page.locator(".react-flow__minimap-node")).toHaveCount(5)
+  await expect(secondResult).toContainText("416.7")
+  await expect(secondResult).toContainText("Best · Manual")
+  await expect(secondResult.locator(".is-best")).toHaveCount(1)
+  await expect(
+    page.locator(".metric-card").filter({ hasText: "Best Fmax" })
+  ).toContainText("416.7")
+  const automatic = page.locator(
+    '.react-flow__node[data-id="automatic-result"]'
+  )
+  await expect(automatic.locator(".is-best")).toHaveCount(0)
+  const compare = page.getByRole("combobox", { name: "Compare Fmax" })
+  await expect(automatic).toContainText("29.6% higher than parent")
+  await compare.selectOption("initial")
+  await expect(secondResult).toContainText("25.0% higher than initial")
+  await compare.selectOption("alternative")
+  await expect(automatic).toContainText("9.3% higher than alternative")
+  await expect(secondResult).toContainText("Alternative unavailable")
+  await compare.selectOption("best")
+  await expect(secondResult).toContainText("Current best")
+  await expect(automatic).toContainText("11.1% lower than best")
+  await compare.selectOption("parent")
+  await expect(secondResult).toContainText("22.9% higher than parent")
+  await page.getByRole("combobox", { name: "Order nodes" }).selectOption("fmax")
+  // Sorting keeps ancestry intact and puts the best node first in its column.
+  await expect
+    .poll(async () => {
+      const measured = await page
+        .locator(".react-flow__node")
+        .evaluateAll((elements) =>
+          elements.map((e) => ({
+            id: e.getAttribute("data-id"),
+            x: (e as HTMLElement).style.transform,
+            top: e.getBoundingClientRect().top,
+            left: e.getBoundingClientRect().left,
+          }))
+        )
+      const best = measured.find((e) => e.id === `manual:${id}:attempt-2`)!
+      return measured
+        .filter((e) => Math.abs(e.left - best.left) < 1)
+        .every((e) => best.top <= e.top)
+    })
+    .toBe(true)
+  await page.getByRole("button", { name: "Node list", exact: true }).click()
+  const nodeList = page.getByRole("region", { name: "Exploration nodes" })
+  await expect(nodeList).toBeVisible()
+  await expect(
+    nodeList.getByRole("rowgroup", { name: "Generation 1", exact: true })
+  ).toContainText("middle")
+  await expect(
+    nodeList.getByRole("rowgroup", {
+      name: "Manual · Generation 2",
+      exact: true,
+    })
+  ).toContainText("416.7")
+  await page
+    .getByRole("combobox", { name: "Group nodes" })
+    .selectOption("decision")
+  await expect(
+    nodeList.getByRole("rowgroup", { name: "FANOUT", exact: true })
+  ).toContainText("manual-result-2")
+  await page
+    .getByRole("combobox", { name: "Group nodes" })
+    .selectOption("depth")
+  await expect(
+    nodeList.getByRole("rowgroup", { name: "Depth 3", exact: true })
+  ).toContainText("manual-result-2")
+  await nodeList
+    .getByRole("button", { name: "Select manual-result-2", exact: true })
+    .click()
+  await expect(workshop.getByTestId("workshop-source")).toHaveText(
+    "manual-result-2"
+  )
+  await expect(list.getByRole("listitem")).toHaveCount(2)
+  await page.getByRole("button", { name: "Trace path", exact: true }).click()
+  await expect(automatic).toHaveCSS("opacity", "0.35")
+  await expect(middle).toHaveCSS("opacity", "1")
+  await expect(secondResult).toHaveCSS("opacity", "1")
+  await expect(automatic).toBeVisible()
+  await page.getByRole("button", { name: "Trace path", exact: true }).click()
+  await expect(automatic).toHaveCSS("opacity", "1")
+  await page
+    .getByRole("combobox", { name: "Order nodes" })
+    .selectOption("change")
+  await expect(graph).toBeVisible()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth))
+    .toBe(390)
+  await expect(nodeList).toBeVisible()
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await page.getByRole("button", { name: "Node list", exact: true }).click()
+  await expect(nodeList).toBeHidden()
   const manualEdge = page.locator(
     `.react-flow__edge[data-id="middle-manual:${id}"] path.react-flow__edge-path`
   )
@@ -206,6 +309,9 @@ test("node selection drives Workshop beside the tree without losing the recipe d
     "Manual branch fixture evidence"
   )
   await workshop.getByText("Node details", { exact: true }).click()
+  await page.emulateMedia({ colorScheme: "dark" })
+  await expect(page.locator("html")).toHaveClass(/dark/)
+  await page.getByRole("button", { name: "Node list", exact: true }).click()
   await page.screenshot({
     path: "test-results/workshop-manual-branch.png",
     fullPage: true,

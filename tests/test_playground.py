@@ -237,6 +237,46 @@ class PlaygroundApiTests(unittest.TestCase):
         self.assertTrue(node["can_run_from"])
         self.assertEqual(node["job_status"], "cancelled")
 
+    def test_best_recalculates_on_admission_including_running_manual_sequences(self):
+        # Projection ranks measured checkpoints, independently of publication/job completion.
+        summary = self.run / "run_summary.json"
+        summary.write_text(json.dumps({"best_candidate_id": "baseline", "metrics": {"final_fmax_mhz": 333}}))
+        before = {path: path.read_bytes() for path in [self.run / "events.jsonl", summary]}
+        data = self.client.get(f"/api/runs/{self.key}").json()
+        self.assertEqual(data["best_node_id"], "better")
+        self.assertEqual(data["monitor"]["best_fmax_mhz"], 400)
+        job_id = self.manual_job()
+        self.manager.update(job_id, status="running")
+        child = self.materialize_manual(job_id)
+        # Equal result retains the existing best; a pending next step cannot compete.
+        self.assertEqual(self.client.get(f"/api/runs/{self.key}").json()["best_node_id"], "better")
+        events = [json.loads(line) for line in (child / "events.jsonl").read_text().splitlines()]
+        events[-1]["metrics"]["wns"] = -.25
+        (child / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+        data = self.client.get(f"/api/runs/{self.key}").json()
+        self.assertEqual(data["best_node_id"], f"manual:{job_id}")
+        self.assertEqual(sum(n["is_best"] for n in data["nodes"]), 1)
+        self.assertAlmostEqual(data["monitor"]["best_fmax_mhz"], 1000 / 2.25)
+        self.assertAlmostEqual(data["monitor"]["initial_fmax_mhz"], 1000 / 3)
+        self.assertEqual(data["monitor"]["final_fmax_mhz"], 333)
+        self.assertEqual(self.manager.get(job_id)["status"], "running")
+        restarted = create_app(self.root / "jobs", [self.run])
+        with TestClient(restarted) as client:
+            self.assertEqual(client.get(f"/api/runs/{self.key}").json()["best_node_id"], f"manual:{job_id}")
+        for path, contents in before.items():
+            self.assertEqual(path.read_bytes(), contents)
+
+    def test_best_excludes_pending_and_invalid_measurements(self):
+        from framework.manual_tree import rank_observed
+        data = {"monitor": {}, "nodes": [
+            {"node_id": "pending", "node_type": "manual_execution", "fmax_mhz": 1000, "is_best": True},
+            *[{"node_id": str(value), "node_type": "candidate", "fmax_mhz": value, "is_best": True}
+              for value in [None, 0, -1, float("inf"), float("nan")]],
+        ]}
+        rank_observed(data)
+        self.assertIsNone(data["best_node_id"])
+        self.assertFalse(any(n["is_best"] for n in data["nodes"]))
+
     def test_branching_again_from_manual_result_and_restart_preserve_ancestry(self):
         first = self.manual_job()
         child = self.materialize_manual(first)
@@ -287,6 +327,7 @@ class PlaygroundApiTests(unittest.TestCase):
         import asyncio
         job_id = self.manual_job()
         child = self.materialize_manual(job_id)
+        self.manager.update(job_id, status="running")
         class Connected:
             async def is_disconnected(self):
                 return False
@@ -300,6 +341,8 @@ class PlaygroundApiTests(unittest.TestCase):
             chunk = await asyncio.wait_for(anext(stream), 4)
             data = json.loads(chunk.split("data: ", 1)[1])
             pending = next(n for n in data["nodes"] if n.get("local_node_id") == "pending-step")
+            self.assertEqual(data["best_node_id"], "better")
+            self.assertFalse(pending["is_best"])
             checkpoint = child / "admission" / "second-result.dcp"
             checkpoint.write_bytes(b"second admitted result")
             event = {"event": "candidate_admitted", "schema_version": 1, "run_id": job_id, "sequence": 6,
@@ -314,6 +357,10 @@ class PlaygroundApiTests(unittest.TestCase):
             result = next(n for n in data["nodes"] if n.get("local_node_id") == "second-result")
             self.assertEqual(result["node_id"], pending["node_id"])
             self.assertTrue(result["can_run_from"])
+            self.assertTrue(result["is_best"])
+            self.assertEqual(data["best_node_id"], result["node_id"])
+            self.assertEqual(sum(n["is_best"] for n in data["nodes"]), 1)
+            self.assertEqual(self.manager.get(job_id)["status"], "running")
         asyncio.run(exercise())
 
 

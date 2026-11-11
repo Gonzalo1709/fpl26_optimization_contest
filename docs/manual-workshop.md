@@ -13,10 +13,26 @@ the panel, while **Node details** exposes evidence on demand. Attempts without a
 saved candidate, missing DCPs and imported analysis snapshots cannot start runs.
 
 The main tree-node value is theoretical Fmax in MHz: `1000 / (period - node WNS)`.
-Its secondary label reports the percentage higher or lower than the initial Fmax.
+Its secondary label reports the percentage higher or lower than its parent by default.
 The WNS remains visible in smaller muted text. Regressions are labelled as lower
 frequency instead of a negative improvement; unavailable timing remains unavailable.
 This is an estimate from target-clock timing, independent of final validation.
+
+**Compare** switches between the parent, original baseline, best measured sibling
+(Alternative), and best checkpoint in the displayed tree. Missing measurements or
+siblings remain unavailable. **Order** ranks nodes vertically within each tree
+column by Fmax or the chosen comparison; parent-child connections remain intact.
+**Trace path** highlights the ancestry of the selected node while keeping the
+other routes visible. **Node list** opens a selectable table grouped by recorded
+generation, decision recipe, or ancestry depth. Generations from manual sequences
+are labelled separately; missing generation data is not inferred from depth.
+
+**Best** is recalculated whenever an admitted measurement arrives, including an
+intermediate result of a manual sequence that is still running. Exactly one
+checkpoint carries the badge; equal measurements retain the existing first result.
+Queued work and attempts without admitted measurements do not compete. The header
+shows the best observed Fmax separately from the original run's recorded output;
+these comparisons do not republish or rewrite that output.
 
 ## Saved checkpoints
 
@@ -61,8 +77,8 @@ The tree projection resolves provenance using the source run path, local
 candidate identity and recorded checkpoint hash. Independent runs use distinct
 graph IDs; their original logs, evidence and outputs remain independent. Node
 inspection and recipe execution resolve back to the selected node's real run.
-Manual frequencies are compared against the original displayed tree baseline,
-so gains across automatic and manual branches use the same reference. Local
+Initial comparisons across automatic and manual branches use the original
+displayed tree baseline. Parent comparisons use each node's actual ancestry. Local
 managed-job manifests restore the branches after restart. Cancelling an experiment
 keeps its already admitted checkpoints available. Analysis-only imports remain
 read-only; the live manual projection uses the local managed-job workspace.
@@ -156,7 +172,18 @@ Verified locally on 2026-11-11:
   reference the removed `_run_generation_branch` method and one expects the old
   planner schema. The same five errors were independently reproduced from a clean
   archive of `07e5a96`; those tests and the unrelated legacy behavior are unchanged.
+- Exploration analysis passed build, lint, 38 affected backend tests and nine
+  Playwright checks. Coverage includes live best promotion before job completion,
+  restart, all comparison references, alternative exclusion, ordering, grouping,
+  path highlighting, list selection, left alignment and mobile overflow. Zoom,
+  zoom-out and fit-view work in both themes; rendered icon contrast exceeds 4.5:1.
+  Controls and minimap use the workspace theme, including hover and mask colors.
+  Explicit initial card dimensions keep minimap nodes visible in the controlled
+  graph; minimap rendering and navigation use the same 110 by 70 pixel geometry.
+  The tab underline stays inside its header, preventing a spurious vertical
+  scrollbar beside Workshop. Native controls and scrollbars follow the theme.
 
 The sandbox blocks Windows asyncio's local socket pair. Backend/browser checks
 therefore ran with the approved local-process permission. Test supervisors and
-browser servers are disposable; no persistent application server was started.
+browser servers are disposable. The user-requested Chrome demo is a separate
+synthetic fixture with optimizer scheduling disabled.

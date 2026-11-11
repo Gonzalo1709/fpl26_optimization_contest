@@ -506,16 +506,16 @@ function RunWorkspace({
       <div className="metric-grid">
         {[
           [
-            "Best observed WNS",
-            number(monitor.best_wns_ns),
-            "ns",
-            `Initial ${number(monitor.initial_wns_ns)} ns`,
+            "Best Fmax",
+            number(monitor.best_fmax_mhz, 1),
+            "MHz",
+            `Initial ${number(monitor.initial_fmax_mhz, 1)} MHz`,
           ],
           [
-            "Final Fmax",
+            "Run output Fmax",
             number(monitor.final_fmax_mhz, 1),
             "MHz",
-            "From recorded final timing",
+            "From this run's recorded output",
           ],
           [
             "Recorded elapsed",
@@ -558,7 +558,7 @@ function RunWorkspace({
         </span>
       </div>
       <Tabs value={tab} onValueChange={setTab} className="run-tabs">
-        <div className="flex items-center justify-between overflow-x-auto border-b px-6">
+        <div className="run-tab-header flex items-center justify-between overflow-x-auto overflow-y-hidden border-b px-6">
           <TabsList variant="line" className="shrink-0">
             <TabsTrigger value="search">
               <GitBranch />
