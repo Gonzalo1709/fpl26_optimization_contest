@@ -4,7 +4,13 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
-import { api, number, type SearchNode, type Snapshot } from "@/lib/api"
+import {
+  activeStatuses,
+  api,
+  number,
+  type SearchNode,
+  type Snapshot,
+} from "@/lib/api"
 
 type Step = {
   strategy: string
@@ -24,11 +30,11 @@ type Catalog = {
 export function Workshop({
   snapshot,
   node,
-  onOpenRun,
+  onShowBranch,
 }: {
   snapshot: Snapshot
   node: SearchNode | undefined
-  onOpenRun: (id: string) => void
+  onShowBranch: (id: string) => void
 }) {
   const saved = snapshot.manifest.config as
     | {
@@ -97,9 +103,10 @@ export function Workshop({
     setError("")
     try {
       const result = await api<{ job_id: string }>(
-        `/runs/${snapshot.id}/playground`,
+        `/runs/${node?.source_run_key || snapshot.id}/playground`,
         {
-          candidate_id: node?.node_id,
+          candidate_id:
+            node?.candidate_id || node?.local_node_id || node?.node_id,
           steps: steps.map(({ strategy, args }) => ({ strategy, args })),
           max_runtime_minutes: runtime,
           ...(python.trim() ? { python: python.trim() } : {}),
@@ -128,14 +135,39 @@ export function Workshop({
         <p
           className="truncate font-mono text-[10px] text-muted-foreground"
           data-testid="workshop-source"
-          title={node?.node_id}
+          title={node?.local_node_id || node?.node_id}
         >
-          {node?.node_id || "No node selected"}
+          {node?.node_type === "manual_execution"
+            ? "Manual experiment"
+            : node?.local_node_id || node?.node_id || "No node selected"}
         </p>
         {!node?.can_run_from && (
           <p className="text-xs text-muted-foreground">
             {node?.checkpoint_unavailable_reason ||
               "This node has no saved checkpoint"}
+          </p>
+        )}
+        {node?.manual && (
+          <div className="flex items-center justify-between text-xs text-sky-700 dark:text-sky-300">
+            <span>Manual · {node.job_status?.replaceAll("_", " ")}</span>
+            {node.job_id && activeStatuses.has(node.job_status || "") && (
+              <Button
+                variant="ghost"
+                size="xs"
+                onClick={() =>
+                  void api(`/jobs/${node.job_id}/cancel`, {}).catch(
+                    (e: Error) => setError(e.message)
+                  )
+                }
+              >
+                Cancel experiment
+              </Button>
+            )}
+          </div>
+        )}
+        {node?.job_error && (
+          <p role="alert" className="text-xs text-destructive">
+            {node.job_error}
           </p>
         )}
       </div>
@@ -338,8 +370,8 @@ export function Workshop({
           className="flex items-center justify-between text-xs text-muted-foreground"
         >
           <span>Run created</span>
-          <Button variant="link" onClick={() => onOpenRun(createdRun)}>
-            Open run
+          <Button variant="link" onClick={() => onShowBranch(createdRun)}>
+            Show branch
           </Button>
         </div>
       )}

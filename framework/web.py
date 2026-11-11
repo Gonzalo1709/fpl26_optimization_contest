@@ -23,6 +23,7 @@ from framework.config import METHODS, PROFILES, check_environment
 from framework.jobs import ACTIVE, TERMINAL
 from framework.runs import read_json
 from framework.checkpoints import checkpoint_options, checkpoint_path, node_frequencies, resolve_checkpoint
+from framework.manual_tree import manual_tree, watched_files
 from src.recipe_catalog import load_catalog, validate_plan
 from tools.run_bundle import MAX_ARCHIVE_BYTES, export_bundle, import_bundle
 
@@ -177,7 +178,10 @@ def create_app(workspace=None, run_roots=None, repository=None, static_dir=None)
 
     def snapshot(key):
         run = resolve_run(key)
-        return present_snapshot(service, run, job_for(run))
+        jobs = manager.list()
+        job = next((j for j in jobs if (Path(j["directory"]) / "run").resolve() == run.resolve()), None)
+        return manual_tree(present_snapshot(service, run, job), jobs,
+                           lambda path, record: present_snapshot(service, path, record))
 
     @app.get("/api/settings")
     def settings():
@@ -297,8 +301,7 @@ def create_app(workspace=None, run_roots=None, repository=None, static_dir=None)
             try:
                 run = resolve_run(key)
                 signature = tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else None
-                                  for p in [run / "events.jsonl", run / "run_summary.json",
-                                            run / "published_artifact.json", manager.db])
+                                  for p in watched_files(run, manager.db, manager.list()))
                 if signature != previous:
                     data = await asyncio.to_thread(snapshot, key)
                     yield f"id: {data['sequence']}\nevent: snapshot\ndata: {json.dumps(data, allow_nan=False)}\n\n"

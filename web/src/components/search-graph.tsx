@@ -11,6 +11,8 @@ import {
   ReactFlow,
   useReactFlow,
   useStore,
+  getNodesBounds,
+  getViewportForBounds,
   type Node,
   type NodeProps,
 } from "@xyflow/react"
@@ -33,7 +35,7 @@ function Candidate({ data, selected }: NodeProps<CandidateNode>) {
       : null
   return (
     <div
-      className={`candidate-card ${selected ? "is-selected" : ""} ${n.is_best ? "is-best" : ""} ${n.state === "failed" ? "is-failed" : ""}`}
+      className={`candidate-card ${selected ? "is-selected" : ""} ${n.is_best ? "is-best" : ""} ${n.state === "failed" ? "is-failed" : ""} ${n.manual ? "is-manual" : ""}`}
     >
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <div className="flex items-center justify-between gap-2">
@@ -77,19 +79,23 @@ function Candidate({ data, selected }: NodeProps<CandidateNode>) {
       <div className="mt-2 flex items-center justify-between gap-2">
         <span
           className="truncate font-mono text-[10px] text-muted-foreground"
-          title={n.node_id}
+          title={n.local_node_id || n.node_id}
         >
-          {n.node_id.slice(0, 14)}
+          {n.node_type === "manual_execution"
+            ? "Experiment"
+            : (n.local_node_id || n.node_id).slice(0, 14)}
         </span>
         <Badge
           variant="outline"
           className={n.in_beam ? "border-primary/50 text-primary" : ""}
         >
-          {n.is_best
-            ? "Best"
-            : n.in_beam
-              ? "Beam"
-              : n.state.replaceAll("_", " ")}
+          {n.manual
+            ? `Manual · ${(n.job_status || n.state).replaceAll("_", " ")}`
+            : n.is_best
+              ? "Best"
+              : n.in_beam
+                ? "Beam"
+                : n.state.replaceAll("_", " ")}
         </Badge>
       </div>
       <Handle type="source" position={Position.Right} isConnectable={false} />
@@ -98,13 +104,37 @@ function Candidate({ data, selected }: NodeProps<CandidateNode>) {
 }
 const nodeTypes = { candidate: Candidate }
 
-function FitOnResize() {
+function FitOnResize({
+  bounds,
+}: {
+  bounds: { x: number; y: number; width: number; height: number }
+}) {
+  const { x, y, width: boundsWidth, height: boundsHeight } = bounds
   const width = useStore((state) => state.width)
   const height = useStore((state) => state.height)
-  const { fitView } = useReactFlow()
+  const { setViewport, viewportInitialized } = useReactFlow()
   useEffect(() => {
-    if (width && height) void fitView({ padding: 0.22, maxZoom: 1 })
-  }, [width, height, fitView])
+    if (width && height && viewportInitialized)
+      void setViewport(
+        getViewportForBounds(
+          { x, y, width: boundsWidth, height: boundsHeight },
+          width,
+          height,
+          0.15,
+          1,
+          0.22
+        )
+      )
+  }, [
+    width,
+    height,
+    x,
+    y,
+    boundsWidth,
+    boundsHeight,
+    setViewport,
+    viewportInitialized,
+  ])
   return null
 }
 
@@ -163,7 +193,11 @@ export function SearchGraph({
     ),
     label: e.strategy?.replaceAll("_", " "),
     markerEnd: { type: MarkerType.ArrowClosed },
-    style: { stroke: "var(--muted-foreground)", strokeWidth: 1.2 },
+    style: {
+      stroke: e.manual ? "#0ea5e9" : "var(--muted-foreground)",
+      strokeWidth: e.manual ? 1.8 : 1.2,
+      strokeDasharray: e.manual ? "6 4" : undefined,
+    },
     labelStyle: { fontSize: 10, fill: "var(--muted-foreground)" },
     labelBgStyle: { fill: "var(--background)" },
   }))
@@ -201,7 +235,11 @@ export function SearchGraph({
             onSelect(selection.id)
         }}
       >
-        <FitOnResize />
+        <FitOnResize
+          bounds={getNodesBounds(
+            nodes.map((node) => ({ ...node, width: 208, height: 118 }))
+          )}
+        />
         <Background gap={20} size={1} color="var(--border)" />
         <Controls showInteractive={false} />
         <MiniMap<CandidateNode>
@@ -212,6 +250,11 @@ export function SearchGraph({
         <Panel position="top-left">
           <div className="graph-caption">
             CHECKPOINT ANCESTRY <span>Parent → explored branch</span>
+            {snapshot.nodes.some((n) => n.manual) && (
+              <span className="text-sky-700 dark:text-sky-300">
+                Dashed blue · Manual
+              </span>
+            )}
           </div>
         </Panel>
       </ReactFlow>

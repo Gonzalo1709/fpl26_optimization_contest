@@ -47,11 +47,25 @@ matching files leave the run unavailable. Imported analysis ZIPs intentionally
 exclude DCPs and remain analysis-only. Run Workshop on the host containing
 the saved checkpoints.
 
-Queuing a sequence preserves the source tree and the editor. **Run created**
-provides an **Open run** action; the operator chooses when to switch to the
-new execution. Desktop uses the existing side column; narrow screens retain
+Queuing a sequence preserves the source tree and the editor. A blue dashed
+branch labelled **Manual** appears directly under its source node. Before a
+checkpoint is admitted, it shows the actual queued/running/failed/cancelled job
+state. Admitted checkpoints replace that placeholder and extend the manual path;
+the repeated initialization baseline is folded into the source node. **Show branch**
+selects this path without leaving the tree. Selecting any admitted manual result
+makes it the source for another manual experiment. Desktop uses the existing side column; narrow screens retain
 the tree above the editor. Graph resizing fits the tree to the available canvas
 without changing the viewport on ordinary metric updates.
+
+The tree projection resolves provenance using the source run path, local
+candidate identity and recorded checkpoint hash. Independent runs use distinct
+graph IDs; their original logs, evidence and outputs remain independent. Node
+inspection and recipe execution resolve back to the selected node's real run.
+Manual frequencies are compared against the original displayed tree baseline,
+so gains across automatic and manual branches use the same reference. Local
+managed-job manifests restore the branches after restart. Cancelling an experiment
+keeps its already admitted checkpoints available. Analysis-only imports remain
+read-only; the live manual projection uses the local managed-job workspace.
 
 ## Recipe files
 
@@ -125,8 +139,19 @@ Verified locally on 2026-11-11:
 - The Workshop sidebar passed build, lint and the three browser workflows.
   Coverage includes direct node selection, implicit source identity, persistence
   across closing/reopening and tab changes, visible tree while editing and
-  queuing, an explicit switch to the created run, frequency/gain/loss labels,
+  queuing, frequency/gain/loss labels,
   desktop geometry and mobile tree fitting. Backend contracts are unchanged.
+- Manual-tree validation covers queued/running/results, cancellation and failure,
+  source checksum isolation, child-log SSE updates, restart persistence, nested
+  manual forks, the original root baseline reference and unchanged source logs.
+  Browser coverage verifies blue dashed edges, scoped evidence and continuing
+  from an admitted manual result without leaving the original tree.
+  The synthetic **Workshop example** starts with a three-checkpoint automatic
+  chain; branching manually from **middle** preserves the original continuation
+  and shows the alternative route next to it. This fixture never launches FPGA
+  tools or LLM calls.
+  The affected backend gate passed 36 tests and all three browser workflows
+  passed, including the three-node chain with two continuations from its middle.
 - The broader `test_phys_opt_portfolio` suite has five pre-existing errors: four
   reference the removed `_run_generation_branch` method and one expects the old
   planner schema. The same five errors were independently reproduced from a clean

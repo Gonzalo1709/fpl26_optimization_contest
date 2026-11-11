@@ -22,6 +22,12 @@ export type SearchNode = Fields & {
   fmax_improvement_mhz?: number | null
   can_run_from?: boolean
   checkpoint_unavailable_reason?: string | null
+  manual?: boolean
+  local_node_id?: string
+  source_run_key?: string
+  job_id?: string
+  job_status?: string
+  job_error?: string | null
   delta_wns_ns?: number | null
   search_generation?: number
   search_branch?: number
@@ -92,9 +98,15 @@ export type Snapshot = {
     }[]
   }
   nodes: SearchNode[]
-  edges: { source_id: string; target_id: string; strategy?: string }[]
+  edges: {
+    source_id: string
+    target_id: string
+    strategy?: string
+    manual?: boolean
+  }[]
   events: RunEvent[]
   activity: RunEvent[]
+  sources?: Record<string, Snapshot>
 }
 export type Settings = {
   workspace: string

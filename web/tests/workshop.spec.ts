@@ -1,10 +1,16 @@
 import { expect, test } from "@playwright/test"
+import path from "node:path"
 
 test("node selection drives Workshop beside the tree without losing the recipe draft", async ({
   page,
   request,
 }) => {
   await page.goto("/")
+  await page
+    .getByRole("navigation", { name: "Experiments" })
+    .getByRole("button")
+    .filter({ hasText: "demo-run-2" })
+    .click()
   await expect(page.getByRole("heading", { name: "demo-run-2" })).toBeVisible()
   const candidate = page.locator(".react-flow__node").filter({ hasText: "c1" })
   await expect(candidate).toContainText("357.1")
@@ -34,21 +40,19 @@ test("node selection drives Workshop beside the tree without losing the recipe d
   await page
     .getByRole("navigation", { name: "Experiments" })
     .getByRole("button")
-    .filter({ hasText: "a-playground-fixture" })
+    .filter({ hasText: "Workshop example" })
     .click()
   const baseline = page
     .locator(".react-flow__node")
     .filter({ hasText: "baseline" })
-  const alternate = page
-    .locator(".react-flow__node")
-    .filter({ hasText: "alternate" })
+  const middle = page.locator(".react-flow__node").filter({ hasText: "middle" })
   await expect(baseline).toContainText("333.3")
-  await expect(alternate).toContainText("285.7")
-  await expect(alternate).toContainText("14.3% lower")
-  await expect(alternate.locator(".text-xl")).not.toContainText("-")
-  await alternate.click()
+  await expect(middle).toContainText("285.7")
+  await expect(middle).toContainText("14.3% lower")
+  await expect(middle.locator(".text-xl")).not.toContainText("-")
+  await middle.click()
   await expect(workshop).toBeVisible()
-  await expect(workshop.getByTestId("workshop-source")).toHaveText("alternate")
+  await expect(workshop.getByTestId("workshop-source")).toHaveText("middle")
   await expect(graph).toBeVisible()
   const graphBox = await graph.boundingBox()
   const panelBox = await workshop.boundingBox()
@@ -85,14 +89,14 @@ test("node selection drives Workshop beside the tree without losing the recipe d
   await baseline.click()
   await expect(workshop.getByTestId("workshop-source")).toHaveText("baseline")
   await expect(list.getByRole("listitem")).toHaveCount(2)
-  await alternate.click()
-  await expect(workshop.getByTestId("workshop-source")).toHaveText("alternate")
+  await middle.click()
+  await expect(workshop.getByTestId("workshop-source")).toHaveText("middle")
   await page
     .getByRole("button", { name: "Close Workshop", exact: true })
     .click()
   await expect(workshop).toBeHidden()
   await expect(graph).toBeVisible()
-  await alternate.click()
+  await middle.click()
   await expect(workshop).toBeVisible()
   await expect(list.getByRole("listitem")).toHaveCount(2)
   await expect(workshop.getByLabel("directive", { exact: true })).toHaveValue(
@@ -115,7 +119,7 @@ test("node selection drives Workshop beside the tree without losing the recipe d
   await expect(workshop).toBeVisible()
   await expect
     .poll(async () => {
-      const box = await alternate.boundingBox()
+      const box = await middle.boundingBox()
       return !!box && box.x >= 0 && box.x + box.width <= 391
     })
     .toBe(true)
@@ -142,13 +146,95 @@ test("node selection drives Workshop beside the tree without losing the recipe d
   const jobs = (await (await request.get("/api/jobs")).json()).jobs
   const job = jobs.find((j: { id: string }) => j.id === id)
   expect(job.config.mode).toBe("manual")
-  expect(job.config.parent_checkpoint.candidate_id).toBe("alternate")
+  expect(job.config.parent_checkpoint.candidate_id).toBe("middle")
   expect(job.config.manual_plan).toEqual([
     { strategy: "PHYS_OPT", args: { directive: "Explore" } },
     { strategy: "FANOUT", args: { top_n_nets: 2 } },
   ])
   await expect(graph).toBeVisible()
   await expect(workshop.getByRole("status")).toContainText("Run created")
-  await workshop.getByRole("button", { name: "Open run", exact: true }).click()
-  await expect(page.getByRole("button", { name: "Cancel job" })).toBeVisible()
+  const manualHead = page.locator(`.react-flow__node[data-id="manual:${id}"]`)
+  await expect(manualHead).toBeVisible()
+  await expect(manualHead).toContainText("Manual · queued")
+  await workshop
+    .getByRole("button", { name: "Show branch", exact: true })
+    .click()
+  await expect(workshop.getByTestId("workshop-source")).toHaveText(
+    "Manual experiment"
+  )
+  await expect(
+    workshop.getByRole("button", { name: "Run sequence", exact: true })
+  ).toBeDisabled()
+  const headers = { "X-Optimizer-Client": "web" }
+  await request.post(`/__test__/manual/${id}/running`, { headers, data: {} })
+  await expect(manualHead).toContainText("Manual · running")
+  await request.post(`/__test__/manual/${id}/completed`, { headers, data: {} })
+  await expect(manualHead).toContainText("Manual · completed")
+  const secondResult = page.locator(
+    `.react-flow__node[data-id="manual:${id}:attempt-2"]`
+  )
+  await expect(secondResult).toBeVisible()
+  const manualEdge = page.locator(
+    `.react-flow__edge[data-id="middle-manual:${id}"] path.react-flow__edge-path`
+  )
+  await expect(manualEdge).toHaveCSS("stroke", "rgb(14, 165, 233)")
+  await expect(manualEdge).toHaveCSS("stroke-dasharray", "6px, 4px")
+  await expect(
+    page.locator('.react-flow__node[data-id="automatic-result"]')
+  ).toBeVisible()
+  await expect(
+    page.locator('.react-flow__edge[data-id^="middle-"]')
+  ).toHaveCount(2)
+  await expect(
+    page.locator(
+      '.react-flow__edge[data-id="middle-automatic-result"] path.react-flow__edge-path'
+    )
+  ).toHaveCSS("stroke-dasharray", "none")
+  await secondResult.click()
+  await expect(workshop.getByTestId("workshop-source")).toHaveText(
+    "manual-result-2"
+  )
+  await expect(
+    workshop.getByRole("button", { name: "Run sequence", exact: true })
+  ).toBeEnabled()
+  await workshop.getByText("Node details", { exact: true }).click()
+  await workshop.getByRole("button", { name: /action selected/ }).click()
+  await workshop
+    .getByRole("button", { name: "Expand evidence", exact: true })
+    .click()
+  await expect(workshop.locator(".inspector .json-block").last()).toContainText(
+    "Manual branch fixture evidence"
+  )
+  await workshop.getByText("Node details", { exact: true }).click()
+  await page.screenshot({
+    path: "test-results/workshop-manual-branch.png",
+    fullPage: true,
+    animations: "disabled",
+  })
+
+  // Reuse an admitted manual result: the next branch belongs to this result.
+  const forked = page.waitForResponse(
+    (r) => r.url().endsWith("/playground") && r.request().method() === "POST"
+  )
+  await workshop
+    .getByRole("button", { name: "Run sequence", exact: true })
+    .click()
+  const forkResponse = await forked
+  expect(forkResponse.status()).toBe(201)
+  const { job_id: forkId } = await forkResponse.json()
+  const forkJobs = (await (await request.get("/api/jobs")).json()).jobs
+  const forkJob = forkJobs.find((j: { id: string }) => j.id === forkId)
+  expect(forkJob.config.parent_checkpoint.candidate_id).toBe("manual-result-2")
+  expect(forkJob.config.parent_checkpoint.run_path).toBe(
+    path.join(job.directory, "run")
+  )
+  await workshop
+    .getByRole("button", { name: "Show branch", exact: true })
+    .click()
+  await workshop
+    .getByRole("button", { name: "Cancel experiment", exact: true })
+    .click()
+  await expect(
+    page.locator(`.react-flow__node[data-id="manual:${forkId}"]`)
+  ).toContainText("Manual · cancelled")
 })

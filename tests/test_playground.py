@@ -185,6 +185,137 @@ class PlaygroundApiTests(unittest.TestCase):
         self.assertEqual(self.manager.get(job_id)["status"], "failed")
         self.assertIn("Manual plan changed", self.manager.get(job_id)["error"])
 
+    def manual_job(self, candidate="worse"):
+        with patch.object(self.manager, "ensure_scheduler"):
+            result = self.enqueue(candidate)
+        self.assertEqual(result.status_code, 201, result.text)
+        return result.json()["job_id"]
+
+    def materialize_manual(self, job_id):
+        job = self.manager.get(job_id)
+        run = Path(job["directory"]) / "run"
+        (run / "admission").mkdir(parents=True)
+        events = [{"event": "baseline_measured", "clock_period_ns": 2, "wns_ns": -1.5}]
+        for identity, wns, parent in [("baseline", -1.5, None), ("better", -0.5, "baseline")]:
+            path = run / "admission" / f"{identity}.dcp"
+            path.write_bytes(f"{job_id} {identity}".encode())
+            if parent:
+                events.append({"event": "action_selected", "strategy": "PHYS_OPT", "source": "manual_workshop", "attempt_id": "a1", "seed_candidate_id": "baseline"})
+            events.append({"event": "candidate_admitted", "candidate_id": identity, "parent_id": parent,
+                           "attempt_id": "a1" if parent else None, "metrics": {"wns": wns},
+                           "checkpoint_path": f"admission/{identity}.dcp", "checkpoint_sha256": file_hash(path)})
+        for index, event in enumerate(events, 1):
+            event.update(schema_version=1, run_id=job_id, sequence=index)
+        (run / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+        return run
+
+    def test_manual_job_is_a_live_sibling_branch_and_preserves_root_logs(self):
+        before = (self.run / "events.jsonl").read_bytes()
+        job_id = self.manual_job()
+        head = f"manual:{job_id}"
+        data = self.client.get(f"/api/runs/{self.key}").json()
+        node = next(n for n in data["nodes"] if n["node_id"] == head)
+        self.assertEqual(node["state"], "queued")
+        self.assertFalse(node["can_run_from"])
+        edge = next(e for e in data["edges"] if e["target_id"] == head)
+        self.assertEqual(edge["source_id"], "worse")
+        self.assertTrue(edge["manual"])
+        self.manager.update(job_id, status="running")
+        self.assertEqual(next(n for n in self.client.get(f"/api/runs/{self.key}").json()["nodes"] if n["node_id"] == head)["state"], "running")
+        child = self.materialize_manual(job_id)
+        data = self.client.get(f"/api/runs/{self.key}").json()
+        node = next(n for n in data["nodes"] if n["node_id"] == head)
+        self.assertEqual(node["candidate_id"], "better")
+        self.assertTrue(node["can_run_from"])
+        self.assertEqual(node["source_run_key"], run_key(child))
+        self.assertEqual(len(data["nodes"]), 4)  # No duplicate child baseline.
+        self.assertAlmostEqual(node["fmax_improvement_mhz"], 400 - 1000 / 3)
+        self.assertIn(run_key(child), data["sources"])
+        self.assertEqual((self.run / "events.jsonl").read_bytes(), before)
+        self.manager.update(job_id, status="cancelled")
+        node = next(n for n in self.client.get(f"/api/runs/{self.key}").json()["nodes"] if n["node_id"] == head)
+        self.assertTrue(node["can_run_from"])
+        self.assertEqual(node["job_status"], "cancelled")
+
+    def test_branching_again_from_manual_result_and_restart_preserve_ancestry(self):
+        first = self.manual_job()
+        child = self.materialize_manual(first)
+        with patch.object(self.manager, "ensure_scheduler"):
+            result = self.client.post(f"/api/runs/{run_key(child)}/playground", headers=HEADERS,
+                                      json={"candidate_id": "better", "steps": PLAN})
+        self.assertEqual(result.status_code, 201, result.text)
+        second = result.json()["job_id"]
+        data = self.client.get(f"/api/runs/{self.key}").json()
+        edge = next(e for e in data["edges"] if e["target_id"] == f"manual:{second}")
+        self.assertEqual(edge["source_id"], f"manual:{first}")
+        with TestClient(create_app(self.manager.root, [self.run])) as restarted:
+            restored = restarted.get(f"/api/runs/{self.key}").json()
+            self.assertEqual(restored["edges"], data["edges"])
+
+    def test_manual_cancel_failure_and_corrupt_child_remain_visible(self):
+        job_id = self.manual_job()
+        for status in ("cancelled", "failed"):
+            self.manager.update(job_id, status=status, error="fixture failure" if status == "failed" else None)
+            node = self.client.get(f"/api/runs/{self.key}").json()["nodes"][-1]
+            self.assertEqual(node["state"], status)
+            self.assertFalse(node["can_run_from"])
+        child = Path(self.manager.get(job_id)["directory"]) / "run"
+        child.mkdir()
+        (child / "events.jsonl").write_text('{"bad":\n')
+        data = self.client.get(f"/api/runs/{self.key}").json()
+        self.assertEqual(data["nodes"][-1]["state"], "unknown")
+        self.assertEqual(len(data["nodes"]), 4)
+
+    def test_unrelated_or_mismatched_checkpoint_identity_never_grafts_a_job(self):
+        job_id = self.manual_job()
+        config = self.manager.get(job_id)["config"]
+        config["parent_checkpoint"]["checkpoint_sha256"] = "0" * 64
+        with self.manager.connect() as connection:
+            connection.execute("UPDATE jobs SET config=? WHERE id=?", (json.dumps(config), job_id))
+        data = self.client.get(f"/api/runs/{self.key}").json()
+        self.assertFalse(any(n.get("manual") for n in data["nodes"]))
+        config["parent_checkpoint"]["run_path"] = str(self.root / "unrelated")
+        with self.manager.connect() as connection:
+            connection.execute("UPDATE jobs SET config=? WHERE id=?", (json.dumps(config), job_id))
+        self.assertEqual(self.client.get(f"/api/runs/{self.key}").json()["sources"], {})
+        config["parent_checkpoint"].update(run_path=str(self.run), candidate_id=[])
+        with self.manager.connect() as connection:
+            connection.execute("UPDATE jobs SET config=? WHERE id=?", (json.dumps(config), job_id))
+        self.assertEqual(self.client.get(f"/api/runs/{self.key}").status_code, 200)
+
+    def test_stream_tracks_child_logs_even_when_root_and_job_database_do_not_change(self):
+        import asyncio
+        job_id = self.manual_job()
+        child = self.materialize_manual(job_id)
+        class Connected:
+            async def is_disconnected(self):
+                return False
+        async def exercise():
+            stream = self.app.state.stream(self.key, Connected())
+            await anext(stream)
+            event = {"event": "action_selected", "schema_version": 1, "run_id": job_id, "sequence": 5,
+                     "attempt_id": "pending-step", "seed_candidate_id": "better", "strategy": "FANOUT"}
+            with (child / "events.jsonl").open("a") as handle:
+                handle.write(json.dumps(event) + "\n")
+            chunk = await asyncio.wait_for(anext(stream), 4)
+            data = json.loads(chunk.split("data: ", 1)[1])
+            pending = next(n for n in data["nodes"] if n.get("local_node_id") == "pending-step")
+            checkpoint = child / "admission" / "second-result.dcp"
+            checkpoint.write_bytes(b"second admitted result")
+            event = {"event": "candidate_admitted", "schema_version": 1, "run_id": job_id, "sequence": 6,
+                     "candidate_id": "second-result", "attempt_id": "pending-step", "parent_id": "better",
+                     "metrics": {"wns": -.3}, "checkpoint_path": "admission/second-result.dcp",
+                     "checkpoint_sha256": file_hash(checkpoint)}
+            with (child / "events.jsonl").open("a") as handle:
+                handle.write(json.dumps(event) + "\n")
+            chunk = await asyncio.wait_for(anext(stream), 4)
+            await stream.aclose()
+            data = json.loads(chunk.split("data: ", 1)[1])
+            result = next(n for n in data["nodes"] if n.get("local_node_id") == "second-result")
+            self.assertEqual(result["node_id"], pending["node_id"])
+            self.assertTrue(result["can_run_from"])
+        asyncio.run(exercise())
+
 
 class ManualControllerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

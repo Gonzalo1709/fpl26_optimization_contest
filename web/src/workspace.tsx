@@ -122,7 +122,9 @@ function NodeInspector({
         </div>
       </aside>
     )
-  const events = linkedEvents(snapshot.events, node)
+  const evidenceSnapshot =
+    (node.source_run_key && snapshot.sources?.[node.source_run_key]) || snapshot
+  const events = linkedEvents(evidenceSnapshot.events, node)
   const event = events.find((e) => e.sequence === eventId)
   return (
     <aside className="inspector">
@@ -134,7 +136,7 @@ function NodeInspector({
         {node.strategy || "Baseline checkpoint"}
       </h3>
       <p className="mt-1 font-mono text-[10px] break-all text-muted-foreground">
-        {node.node_id}
+        {node.local_node_id || node.node_id}
       </p>
       <div className="detail-grid">
         <span>Selection source</span>
@@ -183,7 +185,11 @@ function NodeInspector({
         </p>
       )}
       {event && (
-        <EventDetail key={event.sequence} runId={snapshot.id} event={event} />
+        <EventDetail
+          key={event.sequence}
+          runId={evidenceSnapshot.id}
+          event={event}
+        />
       )}
     </aside>
   )
@@ -365,12 +371,10 @@ function RunWorkspace({
   id,
   onReuse,
   onCancel,
-  onQueued,
 }: {
   id: string
   onReuse: (config: Configuration) => void
   onCancel: (id: string) => Promise<void>
-  onQueued: (id: string) => void
 }) {
   const [live, setLive] = useState(true)
   const [selected, setSelected] = useState("")
@@ -674,7 +678,11 @@ function RunWorkspace({
                   <X />
                 </Button>
               </div>
-              <Workshop snapshot={snapshot} node={node} onOpenRun={onQueued} />
+              <Workshop
+                snapshot={snapshot}
+                node={node}
+                onShowBranch={(jobId) => setSelected(`manual:${jobId}`)}
+              />
               <details className="border-t">
                 <summary className="cursor-pointer px-4 py-3 text-xs text-muted-foreground">
                   Node details
@@ -964,10 +972,6 @@ export default function Workspace() {
               setNewRun(true)
             }}
             onCancel={cancel}
-            onQueued={(id) => {
-              setSelected(`job:${id}`)
-              void refresh()
-            }}
           />
         ) : selectedJob ? (
           <JobWorkspace

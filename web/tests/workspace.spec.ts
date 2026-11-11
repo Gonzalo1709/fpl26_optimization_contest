@@ -12,6 +12,11 @@ test("history, decisions, evidence, live reconnect, queue and cancellation", asy
     console.error(e.message)
   })
   await page.goto("/")
+  await page
+    .getByRole("navigation", { name: "Experiments" })
+    .getByRole("button")
+    .filter({ hasText: "demo-run-2" })
+    .click()
   await expect(page.getByRole("heading", { name: "demo-run-2" })).toBeVisible()
   await expect(page.getByText("Live updates connected")).toBeVisible()
   await expect(
@@ -84,6 +89,11 @@ test("history, decisions, evidence, live reconnect, queue and cancellation", asy
     page.getByText(`${before.sequence + 2} events`, { exact: true })
   ).toBeVisible()
   await page.reload()
+  await page
+    .getByRole("navigation", { name: "Experiments" })
+    .getByRole("button")
+    .filter({ hasText: "demo-run-2" })
+    .click()
   await expect(
     page.getByText(`${before.sequence + 2} events`, { exact: true })
   ).toBeVisible()
