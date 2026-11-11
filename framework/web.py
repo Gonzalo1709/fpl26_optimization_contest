@@ -22,7 +22,7 @@ from framework import JobManager, RunConfig, RunService
 from framework.config import METHODS, PROFILES, check_environment
 from framework.jobs import ACTIVE, TERMINAL
 from framework.runs import read_json
-from framework.checkpoints import checkpoint_path, node_frequencies, resolve_checkpoint
+from framework.checkpoints import checkpoint_options, checkpoint_path, node_frequencies, resolve_checkpoint
 from src.recipe_catalog import load_catalog, validate_plan
 from tools.run_bundle import MAX_ARCHIVE_BYTES, export_bundle, import_bundle
 
@@ -81,6 +81,7 @@ def present_snapshot(service, run, job=None):
                 if e["event"] in {"recipe_attempt", "attempt_aborted", "attempt_returned"}}
     nodes = []
     frequency, initial_fmax = node_frequencies(snapshot)
+    checkpoints = {c["candidate_id"]: c for c in checkpoint_options(run, snapshot)}
     for item in snapshot["tables"]["tree_nodes"]:
         node = dict(item)
         if node["node_type"] == "candidate":
@@ -95,8 +96,11 @@ def present_snapshot(service, run, job=None):
         else:
             state = "unknown"
         fmax = frequency(node.get("wns_ns"))
+        checkpoint = checkpoints.get(node["node_id"], {})
         nodes.append(node | {"fmax_mhz": fmax,
                              "fmax_improvement_mhz": fmax - initial_fmax if fmax is not None and initial_fmax is not None else None,
+                             "can_run_from": checkpoint.get("available", False),
+                             "checkpoint_unavailable_reason": checkpoint.get("reason"),
                              "state": state, "in_beam": node["node_id"] in beam,
                              "is_best": node["node_id"] == best})
     # Start/finish pairs also expose the current tool or planner without a candidate yet.
@@ -187,27 +191,7 @@ def create_app(workspace=None, run_roots=None, repository=None, static_dir=None)
     @app.get("/api/runs/{key}/checkpoints")
     def checkpoints(key: str):
         run = resolve_run(key)
-        data = service.snapshot(run)
-        entries = []
-        for event in data["events"]:
-            if event["event"] != "candidate_admitted":
-                continue
-            reason = None
-            try:
-                if (run / ".imported.json").is_file():
-                    raise ValueError("Analysis ZIPs do not include checkpoint binaries")
-                if data["summary"].get("config", {}).get("demo"):
-                    raise ValueError("This demo has no saved checkpoints")
-                checkpoint_path(run, event)
-                if not event.get("checkpoint_sha256"):
-                    raise ValueError("Checkpoint has no recorded checksum")
-                if event.get("equivalence_proof_ref"):
-                    checkpoint_path(run, event, "golden_checkpoint_path")
-            except ValueError as exc:
-                reason = str(exc)
-            entries.append({"candidate_id": event["candidate_id"], "available": reason is None,
-                            "reason": reason, "checkpoint_sha256": event.get("checkpoint_sha256")})
-        return {"checkpoints": entries}
+        return {"checkpoints": checkpoint_options(run, service.snapshot(run))}
 
     @app.post("/api/runs/{key}/playground", status_code=201)
     def manual_experiment(key: str, body: ManualExperiment):

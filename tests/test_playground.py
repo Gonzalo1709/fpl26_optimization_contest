@@ -110,6 +110,22 @@ class PlaygroundApiTests(unittest.TestCase):
         self.assertEqual(manifest["manual_plan_sha256"], file_hash(directory / "manual-plan.json"))
         self.assertEqual((self.run / "admission/worse.dcp").read_bytes(), b"worse")
 
+    def test_graph_run_action_requires_a_local_saved_candidate(self):
+        self.events.append({"event": "action_selected", "attempt_id": "attempt-only",
+                            "seed_candidate_id": "baseline", "strategy": "FANOUT"})
+        self.save_events()
+        data = self.client.get(f"/api/runs/{self.key}").json()
+        nodes = {n["node_id"]: n for n in data["nodes"]}
+        self.assertTrue(nodes["worse"]["can_run_from"])
+        self.assertFalse(nodes["attempt-only"]["can_run_from"])
+        (self.run / "admission/worse.dcp").unlink()
+        nodes = self.client.get(f"/api/runs/{self.key}").json()["nodes"]
+        worse = next(n for n in nodes if n["node_id"] == "worse")
+        self.assertFalse(worse["can_run_from"])
+        self.assertIn("missing", worse["checkpoint_unavailable_reason"])
+        (self.run / ".imported.json").write_text('{"snapshot":true}')
+        self.assertFalse(any(n["can_run_from"] for n in self.client.get(f"/api/runs/{self.key}").json()["nodes"]))
+
     def test_missing_changed_imported_and_unsafe_checkpoints_cannot_enqueue(self):
         self.assertEqual(self.enqueue("attempt-id").status_code, 400)
         self.assertEqual(self.enqueue(steps=[{"strategy": "FANOUT", "args": {"top_n_nets": 0}}]).status_code, 400)
@@ -122,13 +138,20 @@ class PlaygroundApiTests(unittest.TestCase):
         self.assertEqual(self.enqueue("better").status_code, 400)
         self.assertEqual(self.manager.list(), [])
 
-    def test_legacy_logs_report_unavailable_without_guessing_checkpoint(self):
+    def test_legacy_checkpoint_is_located_by_hash_without_guessing_its_filename(self):
         self.events[1].pop("checkpoint_path")
         self.save_events()
         entries = self.client.get(f"/api/runs/{self.key}/checkpoints").json()["checkpoints"]
         baseline = next(c for c in entries if c["candidate_id"] == "baseline")
-        self.assertFalse(baseline["available"])
-        self.assertIn("legacy", baseline["reason"])
+        self.assertTrue(baseline["available"])
+        with patch.object(self.manager, "ensure_scheduler"):
+            result = self.enqueue()
+        self.assertEqual(result.status_code, 201, result.text)
+        job = self.manager.get(result.json()["job_id"])
+        self.assertEqual(Path(job["config"]["input_dcp"]), self.run / "admission/baseline.dcp")
+        self.events[1]["checkpoint_sha256"] = "0" * 64
+        self.save_events()
+        self.assertEqual(self.enqueue().status_code, 400)
 
     def test_retimed_seed_carries_and_checks_original_golden(self):
         golden = self.run / "admission/golden.dcp"

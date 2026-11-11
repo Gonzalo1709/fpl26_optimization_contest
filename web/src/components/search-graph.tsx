@@ -12,12 +12,15 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react"
-import { GitBranch, LoaderCircle, Trophy } from "lucide-react"
+import { GitBranch, LoaderCircle, Play, Trophy } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { number, type SearchNode, type Snapshot } from "@/lib/api"
 import "@xyflow/react/dist/style.css"
 
-type CandidateNode = Node<{ record: SearchNode }, "candidate">
+type CandidateNode = Node<
+  { record: SearchNode; onRun: (id: string) => void },
+  "candidate"
+>
 
 function Candidate({ data, selected }: NodeProps<CandidateNode>) {
   const n = data.record
@@ -27,13 +30,32 @@ function Candidate({ data, selected }: NodeProps<CandidateNode>) {
     >
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <div className="flex items-center justify-between gap-2">
-        <span className="node-label">{n.strategy || "Baseline"}</span>
+        <span className="node-label min-w-0 flex-1">
+          {n.strategy || "Baseline"}
+        </span>
         {n.is_best ? (
           <Trophy className="size-3.5 text-emerald-700" />
         ) : n.state === "running" ? (
           <LoaderCircle className="size-3.5 animate-spin text-primary" />
         ) : (
           <GitBranch className="size-3.5 text-muted-foreground" />
+        )}
+        {n.node_type === "candidate" && (
+          <button
+            type="button"
+            className="nodrag nopan rounded p-1 text-primary hover:bg-muted disabled:opacity-30"
+            aria-label={`Run from ${n.node_id}`}
+            title={
+              n.checkpoint_unavailable_reason || "Run from this checkpoint"
+            }
+            disabled={!n.can_run_from}
+            onClick={(event) => {
+              event.stopPropagation()
+              data.onRun(n.node_id)
+            }}
+          >
+            <Play className="size-3.5" />
+          </button>
         )}
       </div>
       <div
@@ -77,10 +99,12 @@ export function SearchGraph({
   snapshot,
   selected,
   onSelect,
+  onRun,
 }: {
   snapshot: Snapshot
   selected: string
   onSelect: (id: string) => void
+  onRun: (id: string) => void
 }) {
   // Metric-only updates do not move the layout or reset the user's viewport.
   const topology = JSON.stringify({
@@ -114,7 +138,7 @@ export function SearchGraph({
     id: record.node_id,
     type: "candidate",
     position: positions[record.node_id],
-    data: { record },
+    data: { record, onRun },
     selected: record.node_id === selected,
     ariaLabel: `${record.strategy || "Baseline"} ${record.node_id} ${record.state}`,
   }))

@@ -10,6 +10,9 @@ test("frequency cards and compact manual recipe orchestration", async ({
   await expect(candidate).toContainText("+23.81")
   await expect(candidate).toContainText("MHz ΔFmax")
   await expect(candidate).not.toContainText("ns WNS")
+  await expect(
+    candidate.getByRole("button", { name: "Run from c1", exact: true })
+  ).toBeDisabled()
   await page.getByRole("tab", { name: "Playground", exact: true }).click()
   await expect(
     page.getByRole("button", { name: "Run sequence" })
@@ -20,10 +23,15 @@ test("frequency cards and compact manual recipe orchestration", async ({
     .getByRole("button")
     .filter({ hasText: "a-playground-fixture" })
     .click()
-  await page.getByRole("tab", { name: "Playground", exact: true }).click()
+  await page
+    .getByRole("button", { name: "Run from alternate", exact: true })
+    .click()
   await expect(page.getByLabel("Checkpoint", { exact: true })).toHaveValue(
-    "baseline"
+    "alternate"
   )
+  await expect(
+    page.getByRole("tab", { name: "Playground", exact: true })
+  ).toHaveAttribute("aria-selected", "true")
   await page.getByLabel("Recipe", { exact: true }).selectOption("phys-opt")
   await page.getByRole("button", { name: "Add recipe", exact: true }).click()
   await page.getByLabel("directive", { exact: true }).selectOption("Explore")
@@ -45,7 +53,23 @@ test("frequency cards and compact manual recipe orchestration", async ({
     "Physical optimization"
   )
   await page.getByRole("tab", { name: "Search explorer", exact: true }).click()
-  await page.getByRole("tab", { name: "Playground", exact: true }).click()
+  await page.screenshot({
+    path: "test-results/playground-tree-actions.png",
+    fullPage: true,
+  })
+  await page
+    .getByRole("button", { name: "Run from baseline", exact: true })
+    .click()
+  await expect(page.getByLabel("Checkpoint", { exact: true })).toHaveValue(
+    "baseline"
+  )
+  await page.getByRole("tab", { name: "Search explorer", exact: true }).click()
+  await page
+    .getByRole("button", { name: "Run from alternate", exact: true })
+    .click()
+  await expect(page.getByLabel("Checkpoint", { exact: true })).toHaveValue(
+    "alternate"
+  )
   await expect(list.getByRole("listitem")).toHaveCount(2)
   await expect(page.getByLabel("directive", { exact: true })).toHaveValue(
     "Explore"
@@ -53,6 +77,7 @@ test("frequency cards and compact manual recipe orchestration", async ({
   await page.screenshot({
     path: "test-results/playground-desktop.png",
     fullPage: true,
+    animations: "disabled",
   })
   await page.setViewportSize({ width: 390, height: 844 })
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(
@@ -73,7 +98,7 @@ test("frequency cards and compact manual recipe orchestration", async ({
   const jobs = (await (await request.get("/api/jobs")).json()).jobs
   const job = jobs.find((j: { id: string }) => j.id === id)
   expect(job.config.mode).toBe("manual")
-  expect(job.config.parent_checkpoint.candidate_id).toBe("baseline")
+  expect(job.config.parent_checkpoint.candidate_id).toBe("alternate")
   expect(job.config.manual_plan).toEqual([
     { strategy: "PHYS_OPT", args: { directive: "Explore" } },
     { strategy: "FANOUT", args: { top_n_nets: 2 } },

@@ -21,14 +21,24 @@ def main():
         (run / "admission").mkdir(parents=True)
         checkpoint = run / "admission" / "baseline.dcp"
         checkpoint.write_bytes(b"synthetic checkpoint; test scheduler is disabled")
-        (run / "events.jsonl").write_text(json.dumps({
+        events = [{
             "schema_version": 1, "run_id": "synthetic-playground", "sequence": 1,
             "event": "candidate_admitted", "candidate_id": "baseline", "parent_id": None,
             "metrics": {"wns": -1}, "checkpoint_path": "admission/baseline.dcp",
             "checkpoint_sha256": file_hash(checkpoint),
-        }) + "\n")
+        }]
+        alternate = run / "admission" / "alternate.dcp"
+        alternate.write_bytes(b"synthetic intermediate checkpoint")
+        events.append({
+            "schema_version": 1, "run_id": "synthetic-playground", "sequence": 2,
+            "event": "candidate_admitted", "candidate_id": "alternate", "parent_id": "baseline",
+            "metrics": {"wns": -1.5}, "checkpoint_path": "admission/alternate.dcp",
+            "checkpoint_sha256": file_hash(alternate),
+        })
+        (run / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
         (run / "run_summary.json").write_text(json.dumps({
             "schema_version": 1, "status": "completed", "config": {"fixture": True},
+            "best_candidate_id": "baseline",
             "metrics": {"clock_period_ns": 2, "initial_wns_ns": -1},
         }))
         app = create_app(root / "jobs", [root / "history"])

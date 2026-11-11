@@ -6,6 +6,11 @@ drop or the arrow buttons, and choose **Run sequence**. Each sequence creates a
 separate managed run; its configuration records the source run, candidate and
 checkpoint checksum. The original run and published output are preserved.
 
+The play icon on a tree node opens the playground with that exact checkpoint
+selected. Switching nodes this way preserves the recipe draft. The Playground
+tab uses the same laboratory icon styling as the other tabs. Attempts without a
+saved candidate, missing DCPs and imported analysis snapshots cannot start runs.
+
 The tree shows theoretical frequency improvement in MHz relative to the run's
 initial checkpoint: `1000 / (period - node WNS) - 1000 / (period - initial WNS)`.
 Negative gains remain negative; missing or invalid timing is shown as unavailable.
@@ -33,9 +38,12 @@ Retimed seeds retain the original golden identity and must be re-proven with an
 `equivalence_command` file configured in Advanced settings. New retiming steps
 also require `enable_retiming: true`, as in normal optimizer runs.
 
-Legacy logs without checkpoint paths remain viewable but cannot safely map their
-events to DCP files. Imported analysis ZIPs intentionally exclude DCPs and remain
-analysis-only. Run the playground on the host containing the saved checkpoints.
+For legacy logs that recorded hashes but no paths, execution locates the exact
+matching DCP in `run/admission/` on demand. Discovery never guesses from candidate
+names or timing, and enqueue re-verifies the selected bytes. Missing hashes or
+matching files leave the run unavailable. Imported analysis ZIPs intentionally
+exclude DCPs and remain analysis-only. Run the playground on the host containing
+the saved checkpoints.
 
 ## Recipe files
 
@@ -103,6 +111,9 @@ Verified locally on 2026-11-11:
   drag-and-drop reordering, draft retention across tabs, queueing, mobile overflow,
   live reconnect, cancellation and cloud-import compatibility. Desktop and mobile
   captures are under ignored `web/test-results/`.
+- The direct-node follow-up passed 29 affected backend tests and the three
+  browser workflows. It also verifies exact intermediate-node selection, retained
+  recipe drafts, legacy hash-based DCP lookup and the active Playground tab.
 - The broader `test_phys_opt_portfolio` suite has five pre-existing errors: four
   reference the removed `_run_generation_branch` method and one expects the old
   planner schema. The same five errors were independently reproduced from a clean

@@ -21,19 +21,15 @@ type Catalog = {
   parameters: Record<string, Record<string, Parameter>>
   errors: { file: string; error: string }[]
 }
-type Checkpoint = {
-  candidate_id: string
-  available: boolean
-  reason: string | null
-}
-
 export function Playground({
   snapshot,
   selected,
+  onCheckpointChange,
   onQueued,
 }: {
   snapshot: Snapshot
   selected: string
+  onCheckpointChange: (id: string) => void
   onQueued: (id: string) => void
 }) {
   const saved = snapshot.manifest.config as
@@ -45,8 +41,6 @@ export function Playground({
       }
     | undefined
   const [catalog, setCatalog] = useState<Catalog>()
-  const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([])
-  const [checkpoint, setCheckpoint] = useState("")
   const [recipe, setRecipe] = useState("")
   const [steps, setSteps] = useState<(Step & { key: string })[]>(() =>
     structuredClone(saved?.manual_plan || []).map((s) => ({
@@ -64,14 +58,10 @@ export function Playground({
   const [dragged, setDragged] = useState<number | null>(null)
   useEffect(() => {
     let current = true
-    Promise.all([
-      api<Catalog>("/recipes"),
-      api<{ checkpoints: Checkpoint[] }>(`/runs/${snapshot.id}/checkpoints`),
-    ])
-      .then(([recipes, result]) => {
+    api<Catalog>("/recipes")
+      .then((recipes) => {
         if (current) {
           setCatalog(recipes)
-          setCheckpoints(result.checkpoints)
         }
       })
       .catch((e: Error) => {
@@ -80,9 +70,16 @@ export function Playground({
     return () => {
       current = false
     }
-  }, [snapshot.id, snapshot.sequence])
+  }, [snapshot.id])
+  const checkpoints = snapshot.nodes
+    .filter((node) => node.node_type === "candidate")
+    .map((node) => ({
+      candidate_id: node.node_id,
+      available: !!node.can_run_from,
+      reason: node.checkpoint_unavailable_reason,
+    }))
   const chosen =
-    checkpoints.find((c) => c.candidate_id === (checkpoint || selected)) ||
+    checkpoints.find((c) => c.candidate_id === selected) ||
     checkpoints.find((c) => c.available) ||
     checkpoints[0]
   const chosenRecipe =
@@ -136,7 +133,7 @@ export function Playground({
           id="playground-checkpoint"
           className="h-9 w-full border bg-background px-2 text-xs"
           value={chosen?.candidate_id || ""}
-          onChange={(e) => setCheckpoint(e.target.value)}
+          onChange={(e) => onCheckpointChange(e.target.value)}
         >
           {!checkpoints.length && <option value="">No checkpoints</option>}
           {checkpoints.map((c) => {

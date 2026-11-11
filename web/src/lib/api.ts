@@ -20,6 +20,8 @@ export type SearchNode = Fields & {
   wns_ns?: number | null
   fmax_mhz?: number | null
   fmax_improvement_mhz?: number | null
+  can_run_from?: boolean
+  checkpoint_unavailable_reason?: string | null
   delta_wns_ns?: number | null
   search_generation?: number
   search_branch?: number

@@ -7,6 +7,7 @@ import {
   Clock3,
   Cpu,
   FolderOpen,
+  FlaskConical,
   GitBranch,
   LoaderCircle,
   Plus,
@@ -376,6 +377,7 @@ function RunWorkspace({
   const [busy, setBusy] = useState(false)
   const { snapshot, connection, error: readError } = useRun(id, live)
   const [tab, setTab] = useState("search")
+  const [playgroundCheckpoint, setPlaygroundCheckpoint] = useState("")
   async function reuse() {
     setBusy(true)
     try {
@@ -563,7 +565,10 @@ function RunWorkspace({
               <ArrowUpRight />
               Output & validation
             </TabsTrigger>
-            <TabsTrigger value="playground">Playground</TabsTrigger>
+            <TabsTrigger value="playground">
+              <FlaskConical />
+              Playground
+            </TabsTrigger>
           </TabsList>
           <span className="hidden text-[10px] text-muted-foreground md:block">
             {snapshot.nodes.length} nodes · {snapshot.edges.length} branches
@@ -576,6 +581,11 @@ function RunWorkspace({
                 snapshot={snapshot}
                 selected={selectedId}
                 onSelect={setSelected}
+                onRun={(candidateId) => {
+                  setSelected(candidateId)
+                  setPlaygroundCheckpoint(candidateId)
+                  setTab("playground")
+                }}
               />
               <div className="chart-section">
                 <div className="section-heading">
@@ -643,7 +653,8 @@ function RunWorkspace({
         <TabsContent value="playground" keepMounted>
           <Playground
             snapshot={snapshot}
-            selected={selectedId}
+            selected={playgroundCheckpoint || selectedId}
+            onCheckpointChange={setPlaygroundCheckpoint}
             onQueued={onQueued}
           />
         </TabsContent>
