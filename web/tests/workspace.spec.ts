@@ -19,6 +19,7 @@ test("history, decisions, evidence, live reconnect, queue and cancellation", asy
   ).toBeVisible()
   const c1 = page.locator(".react-flow__node").filter({ hasText: "c1" })
   await c1.click()
+  await page.getByText("Node details", { exact: true }).click()
   await expect(page.locator(".inspector")).toContainText("demo")
   await page
     .locator(".inspector")
@@ -202,6 +203,7 @@ test("upload cloud analysis ZIP and retain imported evidence after refresh", asy
     page.getByRole("button", { name: "Reuse configuration" })
   ).toBeDisabled()
   await page.locator(".react-flow__node").filter({ hasText: "c1" }).click()
+  await page.getByText("Node details", { exact: true }).click()
   await page
     .locator(".inspector")
     .getByRole("button", { name: "#3 action selected", exact: true })

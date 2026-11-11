@@ -15,6 +15,7 @@ import {
   Square,
   Terminal,
   Workflow,
+  X,
 } from "lucide-react"
 import {
   Line,
@@ -33,7 +34,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { SearchGraph } from "@/components/search-graph"
 import { RunForm } from "@/components/run-form"
 import { ImportRuns } from "@/components/import-runs"
-import { Playground } from "@/components/playground"
+import { Workshop } from "@/components/workshop"
 import {
   activeStatuses,
   api,
@@ -377,13 +378,15 @@ function RunWorkspace({
   const [busy, setBusy] = useState(false)
   const { snapshot, connection, error: readError } = useRun(id, live)
   const [tab, setTab] = useState("search")
-  const [playgroundCheckpoint, setPlaygroundCheckpoint] = useState("")
+  const [workshopOpen, setWorkshopOpen] = useState(false)
   async function reuse() {
     setBusy(true)
     try {
       const config = await api<Configuration>(`/runs/${id}/configuration`)
-      if (config.mode === "manual") setTab("playground")
-      else onReuse(config)
+      if (config.mode === "manual") {
+        setWorkshopOpen(true)
+        setTab("search")
+      } else onReuse(config)
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -565,26 +568,34 @@ function RunWorkspace({
               <ArrowUpRight />
               Output & validation
             </TabsTrigger>
-            <TabsTrigger value="playground">
-              <FlaskConical />
-              Playground
-            </TabsTrigger>
           </TabsList>
-          <span className="hidden text-[10px] text-muted-foreground md:block">
-            {snapshot.nodes.length} nodes · {snapshot.edges.length} branches
-          </span>
+          <div className="flex shrink-0 items-center gap-3">
+            <span className="hidden text-[10px] text-muted-foreground md:block">
+              {snapshot.nodes.length} nodes · {snapshot.edges.length} branches
+            </span>
+            <Button
+              variant={workshopOpen && tab === "search" ? "secondary" : "ghost"}
+              aria-expanded={workshopOpen && tab === "search"}
+              aria-controls="workshop-panel"
+              onClick={() => {
+                setSelected(selectedId)
+                setWorkshopOpen(tab === "search" ? !workshopOpen : true)
+                setTab("search")
+              }}
+            >
+              <FlaskConical /> Workshop
+            </Button>
+          </div>
         </div>
-        <TabsContent value="search">
+        <TabsContent value="search" keepMounted>
           <div className="search-layout">
             <div className="min-w-0">
               <SearchGraph
                 snapshot={snapshot}
                 selected={selectedId}
-                onSelect={setSelected}
-                onRun={(candidateId) => {
+                onSelect={(candidateId) => {
                   setSelected(candidateId)
-                  setPlaygroundCheckpoint(candidateId)
-                  setTab("playground")
+                  setWorkshopOpen(true)
                 }}
               />
               <div className="chart-section">
@@ -641,7 +652,45 @@ function RunWorkspace({
                 )}
               </div>
             </div>
-            <NodeInspector key={selectedId} snapshot={snapshot} node={node} />
+            <aside
+              id="workshop-panel"
+              className="workshop-panel"
+              hidden={!workshopOpen}
+              aria-labelledby="workshop-title"
+            >
+              <div className="workshop-header">
+                <h2
+                  id="workshop-title"
+                  className="flex items-center gap-2 text-xs font-semibold"
+                >
+                  <FlaskConical className="size-4" /> Workshop
+                </h2>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Close Workshop"
+                  onClick={() => setWorkshopOpen(false)}
+                >
+                  <X />
+                </Button>
+              </div>
+              <Workshop snapshot={snapshot} node={node} onOpenRun={onQueued} />
+              <details className="border-t">
+                <summary className="cursor-pointer px-4 py-3 text-xs text-muted-foreground">
+                  Node details
+                </summary>
+                {workshopOpen && (
+                  <NodeInspector
+                    key={selectedId}
+                    snapshot={snapshot}
+                    node={node}
+                  />
+                )}
+              </details>
+            </aside>
+            {!workshopOpen && (
+              <NodeInspector key={selectedId} snapshot={snapshot} node={node} />
+            )}
           </div>
         </TabsContent>
         <TabsContent value="timeline" className="p-5">
@@ -649,14 +698,6 @@ function RunWorkspace({
         </TabsContent>
         <TabsContent value="output">
           <Output snapshot={snapshot} />
-        </TabsContent>
-        <TabsContent value="playground" keepMounted>
-          <Playground
-            snapshot={snapshot}
-            selected={playgroundCheckpoint || selectedId}
-            onCheckpointChange={setPlaygroundCheckpoint}
-            onQueued={onQueued}
-          />
         </TabsContent>
       </Tabs>
     </>

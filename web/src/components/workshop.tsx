@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
-import { api, number, type Snapshot } from "@/lib/api"
+import { api, number, type SearchNode, type Snapshot } from "@/lib/api"
 
 type Step = {
   strategy: string
@@ -21,16 +21,14 @@ type Catalog = {
   parameters: Record<string, Record<string, Parameter>>
   errors: { file: string; error: string }[]
 }
-export function Playground({
+export function Workshop({
   snapshot,
-  selected,
-  onCheckpointChange,
-  onQueued,
+  node,
+  onOpenRun,
 }: {
   snapshot: Snapshot
-  selected: string
-  onCheckpointChange: (id: string) => void
-  onQueued: (id: string) => void
+  node: SearchNode | undefined
+  onOpenRun: (id: string) => void
 }) {
   const saved = snapshot.manifest.config as
     | {
@@ -55,6 +53,7 @@ export function Playground({
   )
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
+  const [createdRun, setCreatedRun] = useState("")
   const [dragged, setDragged] = useState<number | null>(null)
   useEffect(() => {
     let current = true
@@ -71,17 +70,6 @@ export function Playground({
       current = false
     }
   }, [snapshot.id])
-  const checkpoints = snapshot.nodes
-    .filter((node) => node.node_type === "candidate")
-    .map((node) => ({
-      candidate_id: node.node_id,
-      available: !!node.can_run_from,
-      reason: node.checkpoint_unavailable_reason,
-    }))
-  const chosen =
-    checkpoints.find((c) => c.candidate_id === selected) ||
-    checkpoints.find((c) => c.available) ||
-    checkpoints[0]
   const chosenRecipe =
     catalog?.recipes.find((r) => r.id === recipe) || catalog?.recipes[0]
   function move(from: number, to: number) {
@@ -111,14 +99,14 @@ export function Playground({
       const result = await api<{ job_id: string }>(
         `/runs/${snapshot.id}/playground`,
         {
-          candidate_id: chosen?.candidate_id,
+          candidate_id: node?.node_id,
           steps: steps.map(({ strategy, args }) => ({ strategy, args })),
           max_runtime_minutes: runtime,
           ...(python.trim() ? { python: python.trim() } : {}),
           advanced: JSON.parse(advanced),
         }
       )
-      onQueued(result.job_id)
+      setCreatedRun(result.job_id)
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -126,38 +114,36 @@ export function Playground({
     }
   }
   return (
-    <div className="mx-auto max-w-3xl space-y-5 p-5">
-      <div className="space-y-2">
-        <Label htmlFor="playground-checkpoint">Checkpoint</Label>
-        <select
-          id="playground-checkpoint"
-          className="h-9 w-full border bg-background px-2 text-xs"
-          value={chosen?.candidate_id || ""}
-          onChange={(e) => onCheckpointChange(e.target.value)}
+    <div className="space-y-4 p-4">
+      <div className="space-y-1 border-b pb-3">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="truncate text-xs font-medium">
+            {node?.strategy ||
+              (node?.parent_node_id ? "Checkpoint" : "Baseline")}
+          </span>
+          <span className="shrink-0 font-mono text-xs">
+            {number(node?.fmax_mhz, 1)} MHz
+          </span>
+        </div>
+        <p
+          className="truncate font-mono text-[10px] text-muted-foreground"
+          data-testid="workshop-source"
+          title={node?.node_id}
         >
-          {!checkpoints.length && <option value="">No checkpoints</option>}
-          {checkpoints.map((c) => {
-            const node = snapshot.nodes.find(
-              (n) => n.node_id === c.candidate_id
-            )
-            return (
-              <option key={c.candidate_id} value={c.candidate_id}>
-                {node?.strategy || "Baseline"} · {c.candidate_id} ·{" "}
-                {number(node?.fmax_improvement_mhz, 2)} MHz
-                {!c.available ? " · unavailable" : ""}
-              </option>
-            )
-          })}
-        </select>
-        {chosen && !chosen.available && (
-          <p className="text-xs text-muted-foreground">{chosen.reason}</p>
+          {node?.node_id || "No node selected"}
+        </p>
+        {!node?.can_run_from && (
+          <p className="text-xs text-muted-foreground">
+            {node?.checkpoint_unavailable_reason ||
+              "This node has no saved checkpoint"}
+          </p>
         )}
       </div>
       <div className="flex items-end gap-2">
-        <div className="flex-1 space-y-2">
-          <Label htmlFor="playground-recipe">Recipe</Label>
+        <div className="min-w-0 flex-1 space-y-2">
+          <Label htmlFor="workshop-recipe">Recipe</Label>
           <select
-            id="playground-recipe"
+            id="workshop-recipe"
             className="h-9 w-full border bg-background px-2 text-xs"
             value={chosenRecipe?.id || ""}
             onChange={(e) => setRecipe(e.target.value)}
@@ -171,6 +157,9 @@ export function Playground({
         </div>
         <Button
           variant="outline"
+          size="icon"
+          aria-label="Add recipe"
+          title="Add recipe"
           disabled={
             !chosenRecipe ||
             steps.length + (chosenRecipe?.steps.length || 0) > 32
@@ -185,7 +174,7 @@ export function Playground({
             ])
           }
         >
-          <Plus /> Add recipe
+          <Plus />
         </Button>
         <Button
           variant="ghost"
@@ -256,7 +245,7 @@ export function Playground({
                 <Trash2 />
               </Button>
             </div>
-            <div className="grid gap-3 sm:grid-cols-2">
+            <div className="grid gap-3">
               {Object.entries(catalog?.parameters[step.strategy] || {}).map(
                 ([name, spec]) => {
                   const id = `${step.key}-${name}`
@@ -325,9 +314,9 @@ export function Playground({
       </ol>
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="w-32 space-y-2">
-          <Label htmlFor="playground-runtime">Time limit (min)</Label>
+          <Label htmlFor="workshop-runtime">Time limit (min)</Label>
           <Input
-            id="playground-runtime"
+            id="workshop-runtime"
             type="number"
             min="1"
             value={runtime}
@@ -335,27 +324,40 @@ export function Playground({
           />
         </div>
         <Button
-          disabled={busy || !steps.length || !chosen?.available || runtime <= 0}
+          disabled={
+            busy || !steps.length || !node?.can_run_from || runtime <= 0
+          }
           onClick={() => void run()}
         >
           <Play /> {busy ? "Queuing…" : "Run sequence"}
         </Button>
       </div>
+      {createdRun && (
+        <div
+          role="status"
+          className="flex items-center justify-between text-xs text-muted-foreground"
+        >
+          <span>Run created</span>
+          <Button variant="link" onClick={() => onOpenRun(createdRun)}>
+            Open run
+          </Button>
+        </div>
+      )}
       <details className="text-xs">
         <summary className="cursor-pointer text-muted-foreground">
           Advanced
         </summary>
         <div className="mt-3 space-y-3">
-          <Label htmlFor="playground-python">Optimizer Python executable</Label>
+          <Label htmlFor="workshop-python">Optimizer Python executable</Label>
           <Input
-            id="playground-python"
+            id="workshop-python"
             value={python}
             placeholder="Default"
             onChange={(e) => setPython(e.target.value)}
           />
-          <Label htmlFor="playground-advanced">Optimizer settings (JSON)</Label>
+          <Label htmlFor="workshop-advanced">Optimizer settings (JSON)</Label>
           <Textarea
-            id="playground-advanced"
+            id="workshop-advanced"
             value={advanced}
             onChange={(e) => setAdvanced(e.target.value)}
             className="font-mono"

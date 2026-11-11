@@ -1,19 +1,21 @@
-# Manual recipe playground
+# Manual recipe workshop
 
-The Web Workspace now includes a **Playground** tab on each run. Select a saved
-checkpoint, add recipes, edit their parameters, reorder the steps with drag and
-drop or the arrow buttons, and choose **Run sequence**. Each sequence creates a
+The Web Workspace includes **Workshop**, a side panel beside the tree. Click a
+node to select its saved checkpoint, add recipes, edit their parameters, reorder
+the steps with drag and drop or the arrow buttons, and choose **Run sequence**. Each sequence creates a
 separate managed run; its configuration records the source run, candidate and
 checkpoint checksum. The original run and published output are preserved.
 
-The play icon on a tree node opens the playground with that exact checkpoint
-selected. Switching nodes this way preserves the recipe draft. The Playground
-tab uses the same laboratory icon styling as the other tabs. Attempts without a
+The selected node is the Workshop's only checkpoint context; there is no separate
+checkpoint selector or play button. Switching nodes, closing the panel or visiting
+another tab preserves the recipe draft. The **Workshop** toolbar button toggles
+the panel, while **Node details** exposes evidence on demand. Attempts without a
 saved candidate, missing DCPs and imported analysis snapshots cannot start runs.
 
-The tree shows theoretical frequency improvement in MHz relative to the run's
-initial checkpoint: `1000 / (period - node WNS) - 1000 / (period - initial WNS)`.
-Negative gains remain negative; missing or invalid timing is shown as unavailable.
+The main tree-node value is theoretical Fmax in MHz: `1000 / (period - node WNS)`.
+Its secondary label reports the percentage higher or lower than the initial Fmax.
+The WNS remains visible in smaller muted text. Regressions are labelled as lower
+frequency instead of a negative improvement; unavailable timing remains unavailable.
 This is an estimate from target-clock timing, independent of final validation.
 
 ## Saved checkpoints
@@ -25,7 +27,7 @@ clock period and original golden identity. These files remain after cleanup,
 failed steps, cancellation, or exclusion from the beam. Failed admission may
 leave diagnostic bytes, but does not make a checkpoint selectable.
 
-The playground verifies the selected checkpoint checksum before queuing. The
+Workshop verifies the selected checkpoint checksum before queuing. The
 worker verifies it again before execution, together with the saved plan checksum.
 Manual steps retain implementation, constraint and equivalence admission, tool
 capability checks, cancellation and runtime limits. They bypass learned ranking
@@ -42,8 +44,14 @@ For legacy logs that recorded hashes but no paths, execution locates the exact
 matching DCP in `run/admission/` on demand. Discovery never guesses from candidate
 names or timing, and enqueue re-verifies the selected bytes. Missing hashes or
 matching files leave the run unavailable. Imported analysis ZIPs intentionally
-exclude DCPs and remain analysis-only. Run the playground on the host containing
+exclude DCPs and remain analysis-only. Run Workshop on the host containing
 the saved checkpoints.
+
+Queuing a sequence preserves the source tree and the editor. **Run created**
+provides an **Open run** action; the operator chooses when to switch to the
+new execution. Desktop uses the existing side column; narrow screens retain
+the tree above the editor. Graph resizing fits the tree to the available canvas
+without changing the viewport on ordinary metric updates.
 
 ## Recipe files
 
@@ -63,7 +71,7 @@ into that folder to add a recipe, or compose several existing operations:
 }
 ```
 
-The selector loads the catalog when opening the playground. Reload recipes to
+The recipe selector loads the catalog when opening Workshop. Reload recipes to
 pick up file changes. Invalid files are listed under Advanced while other recipes
 remain usable. Files declare compositions of the existing supported strategies;
 arbitrary Python, Tcl, shell commands and constraint changes are not plugins.
@@ -113,7 +121,12 @@ Verified locally on 2026-11-11:
   captures are under ignored `web/test-results/`.
 - The direct-node follow-up passed 29 affected backend tests and the three
   browser workflows. It also verifies exact intermediate-node selection, retained
-  recipe drafts, legacy hash-based DCP lookup and the active Playground tab.
+  recipe drafts, legacy hash-based DCP lookup and the selected checkpoint context.
+- The Workshop sidebar passed build, lint and the three browser workflows.
+  Coverage includes direct node selection, implicit source identity, persistence
+  across closing/reopening and tab changes, visible tree while editing and
+  queuing, an explicit switch to the created run, frequency/gain/loss labels,
+  desktop geometry and mobile tree fitting. Backend contracts are unchanged.
 - The broader `test_phys_opt_portfolio` suite has five pre-existing errors: four
   reference the removed `_run_generation_branch` method and one expects the old
   planner schema. The same five errors were independently reproduced from a clean

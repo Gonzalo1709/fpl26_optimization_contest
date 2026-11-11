@@ -1,4 +1,4 @@
-import { useMemo } from "react"
+import { useEffect, useMemo } from "react"
 import dagre from "@dagrejs/dagre"
 import {
   Background,
@@ -9,21 +9,28 @@ import {
   Panel,
   Position,
   ReactFlow,
+  useReactFlow,
+  useStore,
   type Node,
   type NodeProps,
 } from "@xyflow/react"
-import { GitBranch, LoaderCircle, Play, Trophy } from "lucide-react"
+import { GitBranch, LoaderCircle, Trophy } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { number, type SearchNode, type Snapshot } from "@/lib/api"
 import "@xyflow/react/dist/style.css"
 
-type CandidateNode = Node<
-  { record: SearchNode; onRun: (id: string) => void },
-  "candidate"
->
+type CandidateNode = Node<{ record: SearchNode }, "candidate">
 
 function Candidate({ data, selected }: NodeProps<CandidateNode>) {
   const n = data.record
+  const initialFmax =
+    n.fmax_mhz != null && n.fmax_improvement_mhz != null
+      ? n.fmax_mhz - n.fmax_improvement_mhz
+      : null
+  const change =
+    initialFmax && initialFmax > 0 && n.fmax_improvement_mhz != null
+      ? (n.fmax_improvement_mhz / initialFmax) * 100
+      : null
   return (
     <div
       className={`candidate-card ${selected ? "is-selected" : ""} ${n.is_best ? "is-best" : ""} ${n.state === "failed" ? "is-failed" : ""}`}
@@ -31,7 +38,7 @@ function Candidate({ data, selected }: NodeProps<CandidateNode>) {
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <div className="flex items-center justify-between gap-2">
         <span className="node-label min-w-0 flex-1">
-          {n.strategy || "Baseline"}
+          {n.strategy || (n.parent_node_id ? "Checkpoint" : "Baseline")}
         </span>
         {n.is_best ? (
           <Trophy className="size-3.5 text-emerald-700" />
@@ -40,36 +47,32 @@ function Candidate({ data, selected }: NodeProps<CandidateNode>) {
         ) : (
           <GitBranch className="size-3.5 text-muted-foreground" />
         )}
-        {n.node_type === "candidate" && (
-          <button
-            type="button"
-            className="nodrag nopan rounded p-1 text-primary hover:bg-muted disabled:opacity-30"
-            aria-label={`Run from ${n.node_id}`}
-            title={
-              n.checkpoint_unavailable_reason || "Run from this checkpoint"
-            }
-            disabled={!n.can_run_from}
-            onClick={(event) => {
-              event.stopPropagation()
-              data.onRun(n.node_id)
-            }}
-          >
-            <Play className="size-3.5" />
-          </button>
-        )}
       </div>
       <div
-        className="mt-2 flex items-baseline gap-1 font-mono text-lg font-semibold"
-        title="Theoretical Fmax improvement over the initial checkpoint"
+        className="mt-2 flex items-center gap-3"
+        title="Theoretical Fmax from target-clock timing"
       >
-        {typeof n.fmax_improvement_mhz === "number" &&
-        n.fmax_improvement_mhz > 0
-          ? "+"
-          : ""}
-        {number(n.fmax_improvement_mhz, 2)}
-        <span className="text-[10px] font-normal text-muted-foreground">
-          MHz ΔFmax
-        </span>
+        <div className="min-w-0 flex-1 text-center">
+          <div className="flex items-baseline justify-center gap-1 font-mono text-xl font-semibold">
+            {number(n.fmax_mhz, 1)}
+            <span className="text-[9px] font-normal text-muted-foreground">
+              MHz
+            </span>
+          </div>
+          <div
+            className={`mt-0.5 text-[9px] ${change != null && change > 0 ? "text-emerald-600" : "text-muted-foreground"}`}
+          >
+            {change == null
+              ? "Fmax"
+              : change === 0
+                ? "Initial Fmax"
+                : `${number(Math.abs(change), 1)}% ${change > 0 ? "higher" : "lower"}`}
+          </div>
+        </div>
+        <div className="shrink-0 text-right font-mono text-[9px] text-muted-foreground">
+          <span className="block">WNS</span>
+          <span>{number(n.wns_ns)} ns</span>
+        </div>
       </div>
       <div className="mt-2 flex items-center justify-between gap-2">
         <span
@@ -95,16 +98,24 @@ function Candidate({ data, selected }: NodeProps<CandidateNode>) {
 }
 const nodeTypes = { candidate: Candidate }
 
+function FitOnResize() {
+  const width = useStore((state) => state.width)
+  const height = useStore((state) => state.height)
+  const { fitView } = useReactFlow()
+  useEffect(() => {
+    if (width && height) void fitView({ padding: 0.22, maxZoom: 1 })
+  }, [width, height, fitView])
+  return null
+}
+
 export function SearchGraph({
   snapshot,
   selected,
   onSelect,
-  onRun,
 }: {
   snapshot: Snapshot
   selected: string
   onSelect: (id: string) => void
-  onRun: (id: string) => void
 }) {
   // Metric-only updates do not move the layout or reset the user's viewport.
   const topology = JSON.stringify({
@@ -138,9 +149,9 @@ export function SearchGraph({
     id: record.node_id,
     type: "candidate",
     position: positions[record.node_id],
-    data: { record, onRun },
+    data: { record },
     selected: record.node_id === selected,
-    ariaLabel: `${record.strategy || "Baseline"} ${record.node_id} ${record.state}`,
+    ariaLabel: `${record.strategy || (record.parent_node_id ? "Checkpoint" : "Baseline")} ${record.node_id} ${record.state}`,
   }))
   const edges = snapshot.edges.map((e) => ({
     id: `${e.source_id}-${e.target_id}`,
@@ -190,6 +201,7 @@ export function SearchGraph({
             onSelect(selection.id)
         }}
       >
+        <FitOnResize />
         <Background gap={20} size={1} color="var(--border)" />
         <Controls showInteractive={false} />
         <MiniMap<CandidateNode>

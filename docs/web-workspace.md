@@ -116,7 +116,7 @@ from uploading a snapshot; opening a path in the local UI does not reach the clo
 
 ## Workflow
 
-The [manual recipe playground](manual-playground.md) branches from retained
+The [manual recipe workshop](manual-workshop.md) branches from retained
 checkpoints and runs editable recipe sequences without LLM planning.
 
 - Open previous runs from the sidebar or **Import / open runs**. Choose upload
