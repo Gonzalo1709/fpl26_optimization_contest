@@ -10,6 +10,8 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from src.recipe_catalog import validate_plan
+
 PROFILES = ("fast", "balanced", "cost", "quality")
 METHODS = ("PHYS_OPT", "PHYS_OPT_REROUTE", "FANOUT", "PBLOCK", "CELL_RELOCATE", "HARD_BLOCK",
            "PLACEMENT_SHOT", "FULL_PLACE_ROUTE", "CRITICAL_PIN", "ROUTE_PRESERVE",
@@ -45,6 +47,8 @@ class RunConfig:
     max_cost: float | None = None
     method: str = "PHYS_OPT"
     advanced: dict = field(default_factory=dict)
+    manual_plan: list = field(default_factory=list)
+    parent_checkpoint: dict = field(default_factory=dict)
     schema_version: int = 1
 
     def validate(self, *, check_files=True):
@@ -54,8 +58,14 @@ class RunConfig:
             raise ValueError("Checkpoint, executable, and model must be strings")
         if self.schema_version != 1:
             raise ValueError("Unsupported configuration schema")
-        if self.mode not in {"llm", "deterministic", "test", "single"}:
+        if self.mode not in {"llm", "deterministic", "test", "single", "manual"}:
             raise ValueError("Unknown run mode")
+        if self.mode == "manual":
+            self.manual_plan = validate_plan(self.manual_plan)
+        elif self.manual_plan or self.parent_checkpoint:
+            raise ValueError("Manual plans and checkpoint lineage require manual mode")
+        if not isinstance(self.parent_checkpoint, dict):
+            raise ValueError("Checkpoint lineage must be an object")
         if self.profile not in PROFILES or self.method not in METHODS:
             raise ValueError("Unknown profile or optimization method")
         if self.mode == "llm" and not self.model.strip():
@@ -116,6 +126,8 @@ class RunConfig:
             args.append("--test")
         elif self.mode == "single":
             args.extend(["--single-method", self.method])
+        elif self.mode == "manual":
+            args.extend(["--manual-plan", str(output.parent / "manual-plan.json")])
         if self.model:
             args.extend(["--model", self.model])
         if self.max_cost is not None:

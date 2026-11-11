@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "partial-replace",
+  "name": "Partial replacement",
+  "description": "Re-place a bounded subset of movable fabric cells.",
+  "steps": [
+    {
+      "strategy": "PARTIAL_REPLACE",
+      "args": {}
+    }
+  ]
+}

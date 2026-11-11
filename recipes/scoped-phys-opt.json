@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "scoped-phys-opt",
+  "name": "Scoped physical optimization",
+  "description": "Optimize measured timing endpoints.",
+  "steps": [
+    {
+      "strategy": "SCOPED_PHYS_OPT",
+      "args": {}
+    }
+  ]
+}

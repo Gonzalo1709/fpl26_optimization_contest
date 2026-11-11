@@ -22,6 +22,8 @@ from framework import JobManager, RunConfig, RunService
 from framework.config import METHODS, PROFILES, check_environment
 from framework.jobs import ACTIVE, TERMINAL
 from framework.runs import read_json
+from framework.checkpoints import checkpoint_path, node_frequencies, resolve_checkpoint
+from src.recipe_catalog import load_catalog, validate_plan
 from tools.run_bundle import MAX_ARCHIVE_BYTES, export_bundle, import_bundle
 
 
@@ -40,9 +42,20 @@ class Configuration(BaseModel):
     max_cost: float | None = None
     method: str = "PHYS_OPT"
     advanced: dict = {}
+    manual_plan: list = []
+    parent_checkpoint: dict = {}
 
     def config(self):
         return RunConfig.from_dict(self.model_dump())
+
+
+class ManualExperiment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    candidate_id: str
+    steps: list[dict]
+    python: str = sys.executable
+    max_runtime_minutes: float = 60
+    advanced: dict = {}
 
 
 def run_key(path: Path) -> str:
@@ -67,6 +80,7 @@ def present_snapshot(service, run, job=None):
     finished = {e.get("attempt_id"): e for e in events
                 if e["event"] in {"recipe_attempt", "attempt_aborted", "attempt_returned"}}
     nodes = []
+    frequency, initial_fmax = node_frequencies(snapshot)
     for item in snapshot["tables"]["tree_nodes"]:
         node = dict(item)
         if node["node_type"] == "candidate":
@@ -80,7 +94,10 @@ def present_snapshot(service, run, job=None):
             state = "interrupted"
         else:
             state = "unknown"
-        nodes.append(node | {"state": state, "in_beam": node["node_id"] in beam,
+        fmax = frequency(node.get("wns_ns"))
+        nodes.append(node | {"fmax_mhz": fmax,
+                             "fmax_improvement_mhz": fmax - initial_fmax if fmax is not None and initial_fmax is not None else None,
+                             "state": state, "in_beam": node["node_id"] in beam,
                              "is_best": node["node_id"] == best})
     # Start/finish pairs also expose the current tool or planner without a candidate yet.
     open_calls = {}
@@ -162,6 +179,55 @@ def create_app(workspace=None, run_roots=None, repository=None, static_dir=None)
     def settings():
         return {"workspace": str(manager.root), "roots": [str(r) for r in roots],
                 "defaults": RunConfig("").to_dict(), "profiles": PROFILES, "methods": METHODS}
+
+    @app.get("/api/recipes")
+    def recipes():
+        return load_catalog(repository / "recipes")
+
+    @app.get("/api/runs/{key}/checkpoints")
+    def checkpoints(key: str):
+        run = resolve_run(key)
+        data = service.snapshot(run)
+        entries = []
+        for event in data["events"]:
+            if event["event"] != "candidate_admitted":
+                continue
+            reason = None
+            try:
+                if (run / ".imported.json").is_file():
+                    raise ValueError("Analysis ZIPs do not include checkpoint binaries")
+                if data["summary"].get("config", {}).get("demo"):
+                    raise ValueError("This demo has no saved checkpoints")
+                checkpoint_path(run, event)
+                if not event.get("checkpoint_sha256"):
+                    raise ValueError("Checkpoint has no recorded checksum")
+                if event.get("equivalence_proof_ref"):
+                    checkpoint_path(run, event, "golden_checkpoint_path")
+            except ValueError as exc:
+                reason = str(exc)
+            entries.append({"candidate_id": event["candidate_id"], "available": reason is None,
+                            "reason": reason, "checkpoint_sha256": event.get("checkpoint_sha256")})
+        return {"checkpoints": entries}
+
+    @app.post("/api/runs/{key}/playground", status_code=201)
+    def manual_experiment(key: str, body: ManualExperiment):
+        run = resolve_run(key)
+        data = service.snapshot(run)
+        path, event = resolve_checkpoint(run, data, body.candidate_id)
+        plan = validate_plan(body.steps)
+        source = {"run_id": data["events"][0].get("run_id"), "run_path": str(run),
+                  "candidate_id": body.candidate_id, "checkpoint_sha256": event["checkpoint_sha256"]}
+        if event.get("equivalence_proof_ref"):
+            if not body.advanced.get("equivalence_command"):
+                raise ValueError("This checkpoint requires an equivalence_command in Advanced settings")
+            source.update(requires_equivalence=True,
+                          golden_path=str(checkpoint_path(run, event, "golden_checkpoint_path")),
+                          golden_sha256=event["golden_checkpoint_sha256"])
+        config = RunConfig(str(path), python=body.python, mode="manual", manual_plan=plan,
+                           max_runtime_minutes=body.max_runtime_minutes, advanced=body.advanced,
+                           parent_checkpoint=source)
+        job_id = manager.enqueue([config])[0]
+        return {"job_id": job_id}
 
     @app.get("/api/runs")
     def runs():

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "route-preserve",
+  "name": "Preserved reroute",
+  "description": "Reroute a bounded set of measured critical nets.",
+  "steps": [
+    {
+      "strategy": "ROUTE_PRESERVE",
+      "args": {}
+    }
+  ]
+}

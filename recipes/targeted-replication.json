@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "targeted-replication",
+  "name": "Targeted replication",
+  "description": "Replicate drivers of measured critical fanout nets.",
+  "steps": [
+    {
+      "strategy": "TARGETED_REPLICATION",
+      "args": {}
+    }
+  ]
+}

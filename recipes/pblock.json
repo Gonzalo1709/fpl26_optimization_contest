@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "pblock",
+  "name": "Pblock placement",
+  "description": "Optimize placement within a bounded region.",
+  "steps": [
+    {
+      "strategy": "PBLOCK",
+      "args": {}
+    }
+  ]
+}

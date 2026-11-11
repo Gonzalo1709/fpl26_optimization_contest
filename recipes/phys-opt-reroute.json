@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "phys-opt-reroute",
+  "name": "Physical optimization + reroute",
+  "description": "Physical optimization followed by rerouting.",
+  "steps": [
+    {
+      "strategy": "PHYS_OPT_REROUTE",
+      "args": {}
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "hard-block",
+  "name": "Hard-block relocation",
+  "description": "Relocate supported DSP, BRAM and URAM blocks.",
+  "steps": [
+    {
+      "strategy": "HARD_BLOCK",
+      "args": {}
+    }
+  ]
+}

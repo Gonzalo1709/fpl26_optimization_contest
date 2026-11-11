@@ -144,6 +144,8 @@ def run_job(manager, job_id, *, cancellation_grace=120, interrupt_grace=15):
             return
         if file_hash(Path(manifest["config"]["input_dcp"])) != manifest["input_sha256"]:
             raise ValueError("Input checkpoint changed after enqueue; create a new job")
+        if manifest.get("manual_plan_sha256") and file_hash(directory / "manual-plan.json") != manifest["manual_plan_sha256"]:
+            raise ValueError("Manual plan changed after enqueue; create a new job")
         manifest["environment"] = check_environment(manifest["config"]["python"], manager.repository)
         try:
             revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=manager.repository, capture_output=True, text=True, timeout=5)

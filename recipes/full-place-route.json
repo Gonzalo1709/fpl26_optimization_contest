@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "full-place-route",
+  "name": "Full place and route",
+  "description": "Re-place and route a supported small design.",
+  "steps": [
+    {
+      "strategy": "FULL_PLACE_ROUTE",
+      "args": {}
+    }
+  ]
+}

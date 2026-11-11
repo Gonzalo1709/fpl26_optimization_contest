@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "granular-phys-opt",
+  "name": "Granular physical optimization",
+  "description": "Select one physical optimization pass.",
+  "steps": [
+    {
+      "strategy": "GRANULAR_PHYS_OPT",
+      "args": {}
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "retime",
+  "name": "Retiming",
+  "description": "Requires explicit retiming enablement and sequential equivalence.",
+  "steps": [
+    {
+      "strategy": "RETIME",
+      "args": {}
+    }
+  ]
+}

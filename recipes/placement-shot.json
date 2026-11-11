@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "placement-shot",
+  "name": "Alternate placement",
+  "description": "Try another bounded placement directive.",
+  "steps": [
+    {
+      "strategy": "PLACEMENT_SHOT",
+      "args": {}
+    }
+  ]
+}

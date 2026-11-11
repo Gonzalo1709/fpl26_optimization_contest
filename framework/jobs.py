@@ -85,9 +85,19 @@ class JobManager:
             directory = self.root / job_id
             directory.mkdir()
             argv = config.argv(self.repository, directory / "optimized.dcp")
+            if config.mode == "manual":
+                (directory / "manual-plan.json").write_text(json.dumps({
+                    "schema_version": 1, "steps": config.manual_plan,
+                    "source": config.parent_checkpoint,
+                }, indent=2), encoding="utf-8")
+            input_digest = file_hash(Path(config.input_dcp))
+            if config.parent_checkpoint and config.parent_checkpoint.get("checkpoint_sha256") != input_digest:
+                raise ValueError("Checkpoint changed while queuing the manual experiment")
             manifest = {"schema_version": 1, "job_id": job_id, "config": payload,
-                        "input_sha256": file_hash(Path(config.input_dcp)), "argv": argv,
+                        "input_sha256": input_digest, "argv": argv,
                         "repository": str(self.repository), "created": time.time()}
+            if config.mode == "manual":
+                manifest["manual_plan_sha256"] = file_hash(directory / "manual-plan.json")
             (directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             prepared.append((job_id, time.time(), "queued", json.dumps(payload), str(directory), batch_id))
         with self.connect() as connection:

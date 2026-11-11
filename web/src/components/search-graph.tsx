@@ -36,10 +36,17 @@ function Candidate({ data, selected }: NodeProps<CandidateNode>) {
           <GitBranch className="size-3.5 text-muted-foreground" />
         )}
       </div>
-      <div className="mt-2 flex items-baseline gap-1 font-mono text-lg font-semibold">
-        {number(n.wns_ns)}
+      <div
+        className="mt-2 flex items-baseline gap-1 font-mono text-lg font-semibold"
+        title="Theoretical Fmax improvement over the initial checkpoint"
+      >
+        {typeof n.fmax_improvement_mhz === "number" &&
+        n.fmax_improvement_mhz > 0
+          ? "+"
+          : ""}
+        {number(n.fmax_improvement_mhz, 2)}
         <span className="text-[10px] font-normal text-muted-foreground">
-          ns WNS
+          MHz ΔFmax
         </span>
       </div>
       <div className="mt-2 flex items-center justify-between gap-2">

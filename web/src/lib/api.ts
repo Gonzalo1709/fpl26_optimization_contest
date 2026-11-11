@@ -18,6 +18,8 @@ export type SearchNode = Fields & {
   decision_id?: string
   strategy?: string
   wns_ns?: number | null
+  fmax_mhz?: number | null
+  fmax_improvement_mhz?: number | null
   delta_wns_ns?: number | null
   search_generation?: number
   search_branch?: number

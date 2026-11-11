@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "cell-relocate",
+  "name": "Cell relocation",
+  "description": "Relocate measured critical fabric cells.",
+  "steps": [
+    {
+      "strategy": "CELL_RELOCATE",
+      "args": {}
+    }
+  ]
+}

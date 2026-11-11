@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "critical-pin",
+  "name": "Critical pin optimization",
+  "description": "Optimize critical pin assignments.",
+  "steps": [
+    {
+      "strategy": "CRITICAL_PIN",
+      "args": {}
+    }
+  ]
+}

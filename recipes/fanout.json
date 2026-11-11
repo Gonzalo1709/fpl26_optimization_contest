@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "fanout",
+  "name": "Fanout optimization",
+  "description": "Optimize measured high-fanout nets.",
+  "steps": [
+    {
+      "strategy": "FANOUT",
+      "args": {}
+    }
+  ]
+}

@@ -21,6 +21,7 @@ from src.llm_optimizer import DCPOptimizer, DEFAULT_MODEL, SUPPORTED_SINGLE_METH
 from src.search import GenerationSearchConfig
 from src.test_modes import run_test_mode
 from src.run_logging import RunRecorder, new_run_dir
+from src.recipe_catalog import validate_plan
 
 SEARCH_PROFILE_DEFAULTS = {
     "fast": {
@@ -249,6 +250,7 @@ Examples:
     parser.add_argument("--equivalence-timeout-seconds", type=float, default=300, help="Maximum sequential-equivalence time per candidate")
     parser.add_argument("--no-refresh-evidence", action="store_true", help="Ablation: clear physical evidence on changed checkpoints instead of refreshing")
     parser.add_argument("--no-llm", action="store_true", help="Run the generic deterministic portfolio without an API key")
+    parser.add_argument("--manual-plan", type=Path, help="Execute a JSON recipe sequence without LLM planning")
     parser.add_argument(
         "--wall-clock-limit-seconds",
         type=float,
@@ -310,6 +312,8 @@ Examples:
     )
 
     args = parser.parse_args()
+    if args.manual_plan and (args.single_method or args.test):
+        parser.error("--manual-plan cannot be combined with --single-method or --test")
     if args.run_dir:
         args.run_dir = args.run_dir.expanduser().resolve()
         if args.run_dir.exists() and (not args.run_dir.is_dir() or any(args.run_dir.iterdir())):
@@ -381,15 +385,21 @@ Examples:
         )
         sys.exit(exit_code)
 
-    if args.single_method:
+    if args.single_method or args.manual_plan:
+        manual = None
+        if args.manual_plan:
+            manual = json.loads(args.manual_plan.read_text(encoding="utf-8"))
+            if not isinstance(manual, dict) or manual.get("schema_version") != 1:
+                raise ValueError("Manual plan requires schema_version 1")
+            manual["steps"] = validate_plan(manual.get("steps"))
         run_dir = args.run_dir or new_run_dir()
 
-        print("FPGA Design Optimization - SINGLE METHOD MODE")
+        print("FPGA Design Optimization - MANUAL MODE" if manual else "FPGA Design Optimization - SINGLE METHOD MODE")
         print("==============================================")
         print(f"Input:        {args.input_dcp.resolve()}")
         print(f"Output:       {args.output_dcp.resolve()}")
         print(f"Run dir:      {run_dir}")
-        print(f"Method:       {args.single_method}")
+        print(f"Steps:        {len(manual['steps'])}" if manual else f"Method:       {args.single_method}")
         if args.single_method == "FANOUT":
             print(f"Top nets:     {args.top_n_nets}")
         elif args.single_method in {"PHYS_OPT", "PHYS_OPT_REROUTE"}:
@@ -410,8 +420,9 @@ Examples:
             run_dir=run_dir,
             generation_config=generation_config,
         )
-        recorder = RunRecorder(run_dir, "single_method", args.input_dcp, args.output_dcp,
+        recorder = RunRecorder(run_dir, "manual" if manual else "single_method", args.input_dcp, args.output_dcp,
                                {"model": args.model, "method": args.single_method,
+                                "manual_plan": manual,
                                 "top_n_nets": args.top_n_nets,
                                 "phys_opt_directive": args.phys_opt_directive,
                                 "generation_config": asdict(generation_config)},
@@ -422,22 +433,24 @@ Examples:
 
         try:
             await optimizer.start_servers()
-            success = await optimizer.run_single_method(
-                args.input_dcp,
-                args.output_dcp,
-                args.single_method,
-                top_n_nets=max(1, args.top_n_nets),
-                phys_opt_directive=args.phys_opt_directive,
-            )
+            if manual:
+                success = await optimizer.run_manual_plan(args.input_dcp, args.output_dcp,
+                                                          manual["steps"], manual.get("source"))
+            else:
+                success = await optimizer.run_single_method(
+                    args.input_dcp, args.output_dcp, args.single_method,
+                    top_n_nets=max(1, args.top_n_nets),
+                    phys_opt_directive=args.phys_opt_directive,
+                )
 
             if success:
                 run_status = "completed"
-                print("\n✓ Single-method optimization completed successfully")
+                print("\n✓ Manual sequence completed successfully" if manual else "\n✓ Single-method optimization completed successfully")
                 print("\nOutput files:")
                 print(f"  Optimized DCP: {args.output_dcp.name}")
                 sys.exit(0)
 
-            print("\n✗ Single-method optimization did not complete successfully")
+            print("\n✗ Manual sequence did not complete successfully" if manual else "\n✗ Single-method optimization did not complete successfully")
             print(f"\nRun directory preserved at: {run_dir}")
             sys.exit(1)
         except KeyboardInterrupt:

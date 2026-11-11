@@ -186,6 +186,10 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                     generation=candidate.generation, steps_taken=candidate.steps_taken,
                     branch_index=candidate.branch_index, summary=candidate.summary,
                     checkpoint_sha256=digest, constraint_sha256=constraints,
+                    checkpoint_path=path.relative_to(self.run_dir).as_posix(),
+                    clock_period_ns=self.clock_period,
+                    golden_checkpoint_path=self._golden_dcp.relative_to(self.run_dir).as_posix() if self._golden_dcp else None,
+                    golden_checkpoint_sha256=getattr(self, "_golden_sha256", None),
                     metrics=metrics, validation=asdict(status),
                     projected_score=candidate.projected_score,
                     validated_score=candidate.validated_score,
@@ -413,15 +417,67 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
                     logger.warning("Persistent memory unavailable; run-local outcomes retained: %s", exc)
         return child or parent
 
+    async def run_manual_plan(self, input_dcp: Path, output_dcp: Path, plan: list, source=None) -> bool:
+        """Execute the operator's exact sequence, preserving each admitted state.
+
+        Manual choices bypass learned ranking, never admission or tool gates.
+        A failed step stops the sequence instead of silently substituting a recipe.
+        """
+        from src.recipe_catalog import validate_plan
+        completed = False
+        try:
+            plan = validate_plan(plan)
+            self._manual_source = source or {}
+            self._trace("manual_plan_started", steps=plan, source=source or {})
+            await self._initialize_search(input_dcp, output_dcp)
+            current = self._baseline_candidate
+            for index, step in enumerate(plan):
+                reason = self._budget_stop_reason()
+                if reason:
+                    raise ValueError(reason)
+                await self._restore_candidate_state(current)
+                action = next((a for a in self._eligible_actions(manual=True)
+                               if a.strategy == step["strategy"]), None)
+                if action is None:
+                    raise ValueError(f"Step {index + 1}: {step['strategy']} is unavailable for the current evidence or budget")
+                for name, choices in action.allowed_args.items():
+                    if isinstance(choices, (list, tuple)) and step["args"].get(name) not in choices:
+                        raise ValueError(f"Step {index + 1}: {name} is not supported for this checkpoint and budget")
+                before = len(self.search_candidates)
+                returned = await self._attempt(current, step["strategy"], step["args"],
+                                               decision_context={"source": "manual_playground", "step": index + 1})
+                outcome = self.history[-1]
+                if outcome.get("error") or not outcome.get("implementation_passed"):
+                    raise ValueError(f"Step {index + 1} failed: {outcome.get('error', 'no admitted checkpoint')}")
+                # A valid neutral candidate is still a state the operator can
+                # explore. Automatic-search cooldowns must not erase it here.
+                current = self.search_candidates[-1] if len(self.search_candidates) > before else returned
+                self._trace("manual_step_finished", step=index + 1, candidate_id=current.candidate_id)
+            completed = True
+            self._stop_reason = "manual plan completed"
+        except Exception as exc:
+            self._stop_reason = f"stopped: {exc}"
+            self._trace("manual_plan_failed", error=str(exc))
+        valid_output = self._finish_search()
+        return completed and valid_output
+
     async def _initialize_search(self, input_dcp: Path, output_dcp: Path) -> str:
         self.start_time = time.time()
         self.output_dcp = output_dcp.resolve()
         if self.output_dcp == input_dcp.resolve():
             raise ValueError("Output must differ from the original input checkpoint")
         self._input_sha256 = sha256_file(input_dcp)
+        source = getattr(self, "_manual_source", {})
+        golden_source = Path(source["golden_path"]) if source.get("requires_equivalence") else input_dcp
+        golden_digest = source.get("golden_sha256") if source.get("requires_equivalence") else self._input_sha256
+        if source.get("requires_equivalence") and not self.generation_config.equivalence_command:
+            raise ValueError("Resuming a retimed checkpoint requires a sequential equivalence checker")
+        if sha256_file(golden_source) != golden_digest:
+            raise ValueError("Original equivalence checkpoint changed")
         self._golden_dcp = self._admission_dir / f"golden-{self._run_id}.dcp"
-        shutil.copyfile(input_dcp, self._golden_dcp)
-        if sha256_file(self._golden_dcp) != self._input_sha256:
+        shutil.copyfile(golden_source, self._golden_dcp)
+        self._golden_sha256 = golden_digest
+        if sha256_file(self._golden_dcp) != golden_digest:
             raise ValueError("Golden checkpoint copy did not preserve the original bytes")
         if self.generation_config.outcome_memory_path:
             try:
@@ -452,7 +508,7 @@ puts "FPL26_PORTS_HEX=[binary encode hex [lsort $rows]]"
         self._baseline_constraint_digest = await self._constraint_digest()
         self._initial_port_digest = await self._port_digest()
         self._initial_port_count = await self._current_port_count()
-        baseline = await self._snapshot_candidate("baseline")
+        baseline = await self._snapshot_candidate("baseline", retimed=bool(source.get("requires_equivalence")))
         self._baseline_candidate = baseline
         self.initial_wns, self.initial_tns, self.initial_failing_endpoints = baseline.wns, baseline.tns, baseline.failing_endpoints
         baseline.projected_score = 0.0

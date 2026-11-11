@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "phys-opt",
+  "name": "Physical optimization",
+  "description": "Bounded physical optimization.",
+  "steps": [
+    {
+      "strategy": "PHYS_OPT",
+      "args": {}
+    }
+  ]
+}

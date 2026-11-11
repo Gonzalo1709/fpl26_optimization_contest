@@ -1134,7 +1134,7 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             validation_reserve_seconds=self.generation_config.validation_reserve_seconds,
         )
 
-    def _eligible_actions(self) -> tuple[EligibleAction, ...]:
+    def _eligible_actions(self, *, manual=False) -> tuple[EligibleAction, ...]:
         """Return the single authoritative allow-list for the current state."""
         recorder = getattr(self, "run_recorder", None)
         policy_eval_id = recorder.new_id("policy") if recorder else None
@@ -1160,7 +1160,7 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
         actions = gate_actions(
             self.design_signature,
             budget=self._current_budget_state(),
-            history=self._planning_history if self._planning_history is not None else self.history,
+            history=() if manual else self._planning_history if self._planning_history is not None else self.history,
             validation=self.validation_status,
             enable_retiming=self.generation_config.enable_retiming,
             equivalence_ready=bool(self.generation_config.equivalence_command and self._retiming_directives),
@@ -1185,7 +1185,7 @@ class DCPOptimizer(AdaptiveController, DCPOptimizerBase):
             }
             if not available_fanout_names:
                 actions = tuple(action for action in actions if action.strategy not in {"FANOUT", "TARGETED_REPLICATION"})
-        selected = self._adaptive_actions(actions)
+        selected = actions if manual else self._adaptive_actions(actions)
         self._trace("policy_evaluated", policy_eval_id=policy_eval_id,
                     candidate_id=getattr(state, "candidate_id", None),
                     checkpoint_sha256=getattr(state, "checkpoint_sha256", None),

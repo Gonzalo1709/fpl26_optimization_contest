@@ -116,6 +116,9 @@ from uploading a snapshot; opening a path in the local UI does not reach the clo
 
 ## Workflow
 
+The [manual recipe playground](manual-playground.md) branches from retained
+checkpoints and runs editable recipe sequences without LLM planning.
+
 - Open previous runs from the sidebar or **Import / open runs**. Choose upload
   for cloud ZIPs, or host-folder access for existing files on the UI machine.
 - Select graph nodes or edges to follow candidate ancestry. Cards distinguish

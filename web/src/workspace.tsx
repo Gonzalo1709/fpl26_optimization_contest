@@ -32,6 +32,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { SearchGraph } from "@/components/search-graph"
 import { RunForm } from "@/components/run-form"
 import { ImportRuns } from "@/components/import-runs"
+import { Playground } from "@/components/playground"
 import {
   activeStatuses,
   api,
@@ -362,20 +363,25 @@ function RunWorkspace({
   id,
   onReuse,
   onCancel,
+  onQueued,
 }: {
   id: string
   onReuse: (config: Configuration) => void
   onCancel: (id: string) => Promise<void>
+  onQueued: (id: string) => void
 }) {
   const [live, setLive] = useState(true)
   const [selected, setSelected] = useState("")
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
   const { snapshot, connection, error: readError } = useRun(id, live)
+  const [tab, setTab] = useState("search")
   async function reuse() {
     setBusy(true)
     try {
-      onReuse(await api<Configuration>(`/runs/${id}/configuration`))
+      const config = await api<Configuration>(`/runs/${id}/configuration`)
+      if (config.mode === "manual") setTab("playground")
+      else onReuse(config)
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -542,9 +548,9 @@ function RunWorkspace({
           {String(monitor.current_action.strategy || "No strategy recorded")}
         </span>
       </div>
-      <Tabs defaultValue="search" className="run-tabs">
-        <div className="flex items-center justify-between border-b px-6">
-          <TabsList variant="line">
+      <Tabs value={tab} onValueChange={setTab} className="run-tabs">
+        <div className="flex items-center justify-between overflow-x-auto border-b px-6">
+          <TabsList variant="line" className="shrink-0">
             <TabsTrigger value="search">
               <GitBranch />
               Search explorer
@@ -557,6 +563,7 @@ function RunWorkspace({
               <ArrowUpRight />
               Output & validation
             </TabsTrigger>
+            <TabsTrigger value="playground">Playground</TabsTrigger>
           </TabsList>
           <span className="hidden text-[10px] text-muted-foreground md:block">
             {snapshot.nodes.length} nodes · {snapshot.edges.length} branches
@@ -632,6 +639,13 @@ function RunWorkspace({
         </TabsContent>
         <TabsContent value="output">
           <Output snapshot={snapshot} />
+        </TabsContent>
+        <TabsContent value="playground" keepMounted>
+          <Playground
+            snapshot={snapshot}
+            selected={selectedId}
+            onQueued={onQueued}
+          />
         </TabsContent>
       </Tabs>
     </>
@@ -898,6 +912,10 @@ export default function Workspace() {
               setNewRun(true)
             }}
             onCancel={cancel}
+            onQueued={(id) => {
+              setSelected(`job:${id}`)
+              void refresh()
+            }}
           />
         ) : selectedJob ? (
           <JobWorkspace
